@@ -28,12 +28,14 @@ pub const Color = enum {
     hyperlink, // light blue
     semantic_prompt, // orange/gold
     semantic_input, // cyan
+    block_separator, // dim gray
 
     pub fn rgb(self: Color) z2d.pixel.RGB {
         return switch (self) {
             .hyperlink => .{ .r = 180, .g = 180, .b = 255 },
             .semantic_prompt => .{ .r = 255, .g = 200, .b = 64 },
             .semantic_input => .{ .r = 64, .g = 200, .b = 255 },
+            .block_separator => .{ .r = 128, .g = 128, .b = 128 },
         };
     }
 
@@ -69,6 +71,7 @@ cell_size: CellSize,
 pub const Feature = union(enum) {
     highlight_hyperlinks,
     semantic_prompts,
+    command_block_separators,
 };
 
 pub const InitError = Allocator.Error || error{
@@ -140,6 +143,10 @@ pub fn applyFeatures(
             state,
         ),
         .semantic_prompts => self.highlightSemanticPrompts(
+            alloc,
+            state,
+        ),
+        .command_block_separators => self.drawCommandBlockSeparators(
             alloc,
             state,
         ),
@@ -291,6 +298,50 @@ fn highlightSemanticPrompts(
                 log.warn("Error drawing semantic content highlight: {}", .{err});
             };
         }
+    }
+}
+
+/// Draw horizontal separator lines above prompt rows to visually
+/// separate command blocks.
+fn drawCommandBlockSeparators(
+    self: *Overlay,
+    alloc: Allocator,
+    state: *const terminal.RenderState,
+) void {
+    const row_slice = state.row_data.slice();
+    const row_raw = row_slice.items(.raw);
+
+    const sep_color = Color.block_separator.alphaPixel(160);
+    const line_height_px: usize = 2;
+
+    // Width of the terminal in pixels.
+    const width_px: usize = self.cell_size.width * state.cols;
+
+    for (row_raw, 0..) |row, y| {
+        if (row.semantic_prompt != .prompt) continue;
+        // Don't draw a separator above the very first row.
+        if (y == 0) continue;
+
+        // Draw a thin horizontal line at the top of this row.
+        const px_y = y * self.cell_size.height;
+
+        var ctx: z2d.Context = .init(alloc, &self.surface);
+        defer ctx.deinit();
+        ctx.setAntiAliasingMode(.none);
+
+        const start_x: f64 = 0;
+        const end_x: f64 = @floatFromInt(width_px);
+        const start_y: f64 = @floatFromInt(px_y);
+        const end_y: f64 = @floatFromInt(px_y + line_height_px);
+
+        ctx.moveTo(start_x, start_y) catch return;
+        ctx.lineTo(end_x, start_y) catch return;
+        ctx.lineTo(end_x, end_y) catch return;
+        ctx.lineTo(start_x, end_y) catch return;
+        ctx.closePath() catch return;
+
+        ctx.setSourceToPixel(sep_color);
+        ctx.fill() catch return;
     }
 }
 

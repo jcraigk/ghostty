@@ -569,6 +569,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             colorspace: configpkg.Config.WindowColorspace,
             blending: configpkg.Config.AlphaBlending,
             background_blur: configpkg.Config.BackgroundBlur,
+            command_blocks: bool,
             scroll_to_bottom_on_output: bool,
 
             pub fn init(
@@ -643,6 +644,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .colorspace = config.@"window-colorspace",
                     .blending = config.@"alpha-blending",
                     .background_blur = config.@"background-blur",
+                    .command_blocks = config.@"command-blocks",
                     .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
                     .arena = arena,
                 };
@@ -1263,11 +1265,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
 
                 const overlay_features: []const Overlay.Feature = overlay: {
-                    const insp = state.inspector orelse break :overlay &.{};
-                    const renderer_info = insp.rendererInfo();
-                    break :overlay renderer_info.overlayFeatures(
-                        arena_alloc,
-                    ) catch &.{};
+                    // Collect features from various sources.
+                    var features: std.ArrayList(Overlay.Feature) = .empty;
+
+                    // Inspector-driven overlays.
+                    if (state.inspector) |insp| {
+                        const renderer_info = insp.rendererInfo();
+                        const insp_features = renderer_info.overlayFeatures(
+                            arena_alloc,
+                        ) catch &.{};
+                        for (insp_features) |f| features.append(arena_alloc, f) catch {};
+                    }
+
+                    // Command blocks separator overlay.
+                    if (self.config.command_blocks) {
+                        features.append(arena_alloc, .command_block_separators) catch {};
+                    }
+
+                    break :overlay features.items;
                 };
 
                 break :critical .{

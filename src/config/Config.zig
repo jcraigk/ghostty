@@ -2828,6 +2828,20 @@ keybind: Keybinds = .{},
 /// `xterm-256color` with environment variables if terminfo installation fails.
 @"shell-integration-features": ShellIntegrationFeatures = .{},
 
+/// Enable command blocks mode. When enabled, terminal output is visually
+/// segmented into discrete blocks, one per command interaction. Each block
+/// contains a prompt, user input, and command output, separated by visual
+/// dividers with padding. Blocks support interactions like click-to-select,
+/// copy command/output, collapse/expand, and scoped search.
+///
+/// This feature requires shell integration to be active for block boundary
+/// detection via OSC 133 sequences. When shell integration is not available
+/// (e.g. SSH sessions), the terminal gracefully degrades to a single
+/// unsegmented view.
+///
+/// Default is `false`.
+@"command-blocks": bool = false,
+
 /// Custom entries into the command palette.
 ///
 /// Each entry requires the title, the corresponding action, and an optional
