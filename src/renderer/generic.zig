@@ -240,6 +240,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             row_count: u16,
             screen_y_px: u32,
             height_px: u32,
+            /// Offset into the fg cell buffer for this block's instances.
+            instance_offset: usize = 0,
+            /// Number of fg cell instances in this block.
+            instance_count: usize = 0,
         };
 
         const HighlightTag = enum(u8) {
@@ -1593,6 +1597,28 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             try frame.cells_bg.sync(self.cells.bg_cells);
             const fg_count = try frame.cells.syncFromArrayLists(self.cells.fg_rows.lists);
 
+            // Compute per-block instance offsets/counts for the fg cell buffer.
+            // The fg buffer is ordered: lists[0]=cursor, lists[1]=row0, lists[2]=row1, ...
+            // We accumulate cell counts per row and map them to block regions.
+            if (self.block_regions.items.len > 1) {
+                const lists = self.cells.fg_rows.lists;
+                // Offset starts after the cursor list (lists[0]).
+                var cursor_cells: usize = if (lists.len > 0) lists[0].items.len else 0;
+                for (self.block_regions.items) |*region| {
+                    var count: usize = 0;
+                    var row: usize = region.first_row;
+                    while (row < region.first_row + region.row_count) : (row += 1) {
+                        const list_idx = row + 1; // lists[0] is cursor
+                        if (list_idx < lists.len) {
+                            count += lists[list_idx].items.len;
+                        }
+                    }
+                    region.instance_offset = cursor_cells;
+                    region.instance_count = count;
+                    cursor_cells += count;
+                }
+            }
+
             // If our background image buffer has changed, sync it.
             if (frame.bg_image_buffer_modified != self.bg_image_buffer_modified) {
                 try frame.bg_image_buffer.sync(&.{self.bg_image_buffer});
@@ -1669,44 +1695,110 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .kitty_below_bg,
                 );
 
-                // Draw cell backgrounds and text.
-                // Per-block scissored rendering with block_params is ready
-                // in the infrastructure but requires cell buffer splitting
-                // (sorting fg cells by block and using instance_offset per
-                // draw call) to avoid rendering all cells in every block's
-                // draw call. Until then, single draw call mode.
+                // Draw cell backgrounds and text per block region.
                 const padding_top: f32 = @floatFromInt(self.size.padding.top);
                 const default_bp: @TypeOf(pass).Step.BlockParams = .{
                     .block_y_offset = padding_top,
                     .block_first_row = 0,
                 };
 
-                pass.step(.{
-                    .pipeline = self.shaders.pipelines.cell_bg,
-                    .uniforms = frame.uniforms.buffer,
-                    .buffers = &.{ null, frame.cells_bg.buffer },
-                    .draw = .{ .type = .triangle, .vertex_count = 3 },
-                    .block_params = default_bp,
-                });
+                if (self.block_regions.items.len > 1) {
+                    for (self.block_regions.items) |region| {
+                        const bp: @TypeOf(pass).Step.BlockParams = .{
+                            .block_y_offset = @floatFromInt(region.screen_y_px),
+                            .block_first_row = @floatFromInt(region.first_row),
+                        };
+                        const scissor: @TypeOf(pass).Step.ScissorRect = .{
+                            .x = 0,
+                            .y = region.screen_y_px,
+                            .width = self.size.screen.width,
+                            .height = region.height_px,
+                        };
 
-                pass.step(.{
-                    .pipeline = self.shaders.pipelines.cell_text,
-                    .uniforms = frame.uniforms.buffer,
-                    .buffers = &.{
-                        frame.cells.buffer,
-                        frame.cells_bg.buffer,
-                    },
-                    .textures = &.{
-                        frame.grayscale,
-                        frame.color,
-                    },
-                    .draw = .{
-                        .type = .triangle_strip,
-                        .vertex_count = 4,
-                        .instance_count = fg_count,
-                    },
-                    .block_params = default_bp,
-                });
+                        pass.step(.{
+                            .pipeline = self.shaders.pipelines.cell_bg,
+                            .uniforms = frame.uniforms.buffer,
+                            .buffers = &.{ null, frame.cells_bg.buffer },
+                            .draw = .{ .type = .triangle, .vertex_count = 3 },
+                            .scissor = scissor,
+                            .block_params = bp,
+                        });
+
+                        if (region.instance_count > 0) {
+                            pass.step(.{
+                                .pipeline = self.shaders.pipelines.cell_text,
+                                .uniforms = frame.uniforms.buffer,
+                                .buffers = &.{
+                                    frame.cells.buffer,
+                                    frame.cells_bg.buffer,
+                                },
+                                .textures = &.{
+                                    frame.grayscale,
+                                    frame.color,
+                                },
+                                .draw = .{
+                                    .type = .triangle_strip,
+                                    .vertex_count = 4,
+                                    .instance_count = region.instance_count,
+                                    .base_instance = region.instance_offset,
+                                },
+                                .scissor = scissor,
+                                .block_params = bp,
+                            });
+                        }
+                    }
+
+                    // Draw cursor cells (at the start of the fg buffer,
+                    // not included in any block's instance range).
+                    const cursor_count = self.cells.fg_rows.lists[0].items.len;
+                    if (cursor_count > 0) {
+                        pass.step(.{
+                            .pipeline = self.shaders.pipelines.cell_text,
+                            .uniforms = frame.uniforms.buffer,
+                            .buffers = &.{
+                                frame.cells.buffer,
+                                frame.cells_bg.buffer,
+                            },
+                            .textures = &.{
+                                frame.grayscale,
+                                frame.color,
+                            },
+                            .draw = .{
+                                .type = .triangle_strip,
+                                .vertex_count = 4,
+                                .instance_count = cursor_count,
+                            },
+                            .block_params = default_bp,
+                        });
+                    }
+                } else {
+                    pass.step(.{
+                        .pipeline = self.shaders.pipelines.cell_bg,
+                        .uniforms = frame.uniforms.buffer,
+                        .buffers = &.{ null, frame.cells_bg.buffer },
+                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                        .block_params = default_bp,
+                    });
+
+                    pass.step(.{
+                        .pipeline = self.shaders.pipelines.cell_text,
+                        .uniforms = frame.uniforms.buffer,
+                        .buffers = &.{
+                            frame.cells.buffer,
+                            frame.cells_bg.buffer,
+                        },
+                        .textures = &.{
+                            frame.grayscale,
+                            frame.color,
+                        },
+                        .draw = .{
+                            .type = .triangle_strip,
+                            .vertex_count = 4,
+                            .instance_count = fg_count,
+                        },
+                        .block_params = default_bp,
+                    });
+                }
 
                 // Kitty images between cell backgrounds and text.
                 self.images.draw(

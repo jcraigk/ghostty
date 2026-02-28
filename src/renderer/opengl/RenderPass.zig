@@ -56,6 +56,7 @@ pub const Step = struct {
         type: gl.Primitive,
         vertex_count: usize,
         instance_count: usize = 1,
+        base_instance: usize = 0,
     };
 };
 

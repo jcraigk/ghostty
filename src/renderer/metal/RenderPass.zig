@@ -64,6 +64,7 @@ pub const Step = struct {
         type: mtl.MTLPrimitiveType,
         vertex_count: usize,
         instance_count: usize = 1,
+        base_instance: usize = 0,
     };
 };
 
@@ -260,16 +261,30 @@ pub fn step(self: *const Self, s: Step) void {
     }
 
     // Draw!
-    self.encoder.msgSend(
-        void,
-        objc.sel("drawPrimitives:vertexStart:vertexCount:instanceCount:"),
-        .{
-            @intFromEnum(s.draw.type),
-            @as(c_ulong, 0),
-            @as(c_ulong, s.draw.vertex_count),
-            @as(c_ulong, s.draw.instance_count),
-        },
-    );
+    if (s.draw.base_instance > 0) {
+        self.encoder.msgSend(
+            void,
+            objc.sel("drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:"),
+            .{
+                @intFromEnum(s.draw.type),
+                @as(c_ulong, 0),
+                @as(c_ulong, s.draw.vertex_count),
+                @as(c_ulong, s.draw.instance_count),
+                @as(c_ulong, s.draw.base_instance),
+            },
+        );
+    } else {
+        self.encoder.msgSend(
+            void,
+            objc.sel("drawPrimitives:vertexStart:vertexCount:instanceCount:"),
+            .{
+                @intFromEnum(s.draw.type),
+                @as(c_ulong, 0),
+                @as(c_ulong, s.draw.vertex_count),
+                @as(c_ulong, s.draw.instance_count),
+            },
+        );
+    }
 }
 
 /// Complete this render pass.
