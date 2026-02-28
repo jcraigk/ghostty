@@ -459,10 +459,9 @@ fragment float4 cell_bg_fragment(
   constant uchar4 *cells [[buffer(2)]],
   constant BlockParams& block_params [[buffer(3)]]
 ) {
-  // Compute grid position. When block rendering is active,
-  // use block_y_offset as the Y origin and offset the row index
-  // by block_first_row to index into the correct bg_cells.
-  float2 origin = float2(uniforms.grid_padding.w, block_params.block_y_offset);
+  // Compute grid position. block_y_offset is grid-relative (excludes padding),
+  // so add it to the padding top to get the screen-space Y origin.
+  float2 origin = float2(uniforms.grid_padding.w, uniforms.grid_padding.x + block_params.block_y_offset);
   int2 grid_pos = int2(floor((in.position.xy - origin) / uniforms.cell_size));
   grid_pos.y += int(block_params.block_first_row);
 

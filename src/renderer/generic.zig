@@ -238,8 +238,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         const BlockRegion = struct {
             first_row: u16,
             row_count: u16,
+            /// Screen Y position (includes window padding) for scissor rects.
             screen_y_px: u32,
             height_px: u32,
+            /// Grid-relative Y offset (excludes padding) for shader block_y_offset.
+            grid_y_offset: f32 = 0,
             /// Offset into the fg cell buffer for this block's instances.
             instance_offset: usize = 0,
             /// Number of fg cell instances in this block.
@@ -1700,16 +1703,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 );
 
                 // Draw cell backgrounds and text per block region.
-                const padding_top: f32 = @floatFromInt(self.size.padding.top);
                 const default_bp: @TypeOf(pass).Step.BlockParams = .{
-                    .block_y_offset = padding_top,
+                    .block_y_offset = 0.0,
                     .block_first_row = 0,
                 };
 
                 if (self.block_regions.items.len > 1) {
                     for (self.block_regions.items) |region| {
                         const bp: @TypeOf(pass).Step.BlockParams = .{
-                            .block_y_offset = @floatFromInt(region.screen_y_px),
+                            .block_y_offset = region.grid_y_offset,
                             .block_first_row = @floatFromInt(region.first_row),
                         };
                         const scissor: @TypeOf(pass).Step.ScissorRect = .{
@@ -2530,32 +2532,39 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const sep_px: u32 = 2;
                     const gap_px = footer_px + sep_px + header_px;
                     const padding_top = self.size.padding.top;
+                    const descender_margin = cell_h / 4;
 
                     var region_start: u16 = 0;
                     var screen_y: u32 = padding_top;
+                    var grid_y: u32 = 0;
                     var yi: u16 = 0;
                     while (yi < row_len) : (yi += 1) {
                         if (yi > 0 and yi < block_indices.len and
                             block_indices[yi] != block_indices[yi - 1])
                         {
                             const rc: u16 = yi - region_start;
+                            const h = @as(u32, rc) * cell_h;
                             self.block_regions.append(self.alloc, .{
                                 .first_row = region_start,
                                 .row_count = rc,
                                 .screen_y_px = screen_y,
-                                .height_px = @as(u32, rc) * cell_h,
+                                .height_px = h + descender_margin,
+                                .grid_y_offset = @floatFromInt(grid_y),
                             }) catch {};
-                            screen_y += @as(u32, rc) * cell_h + gap_px;
+                            screen_y += h + gap_px;
+                            grid_y += h + gap_px;
                             region_start = yi;
                         }
                     }
                     // Final block
                     const rc: u16 = @intCast(row_len - @as(usize, region_start));
+                    const h = @as(u32, rc) * cell_h;
                     self.block_regions.append(self.alloc, .{
                         .first_row = region_start,
                         .row_count = rc,
                         .screen_y_px = screen_y,
-                        .height_px = @as(u32, rc) * cell_h,
+                        .height_px = h + descender_margin,
+                        .grid_y_offset = @floatFromInt(grid_y),
                     }) catch {};
                 }
             }
