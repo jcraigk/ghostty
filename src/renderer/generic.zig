@@ -1220,8 +1220,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     state.terminal.scrollViewport(.bottom);
                 }
 
-                // Enable block metadata computation if command-blocks is on.
-                self.terminal_state.command_blocks_gap = if (self.config.command_blocks) 1 else 0;
+                // Set the block gap pixel size for block metadata computation.
+                self.terminal_state.command_blocks_gap = if (self.config.command_blocks) gap: {
+                    const footer: u8 = @intCast(@min(255, self.config.command_blocks_padding_footer));
+                    const header: u8 = @intCast(@min(255, self.config.command_blocks_padding_header));
+                    break :gap footer + 2 + header;
+                } else 0;
 
                 // Update our terminal state
                 try self.terminal_state.update(self.alloc, state.terminal);

@@ -301,9 +301,8 @@ fn highlightSemanticPrompts(
     }
 }
 
-/// Draw thin separator lines between command blocks. Padding is handled
-/// by the GPU per-row Y offset buffer; this overlay just draws the
-/// 2px separator line in the gap.
+/// Draw thin separator lines in the gaps between command blocks.
+/// The line is drawn at the midpoint of each gap.
 fn drawCommandBlockSeparators(
     self: *Overlay,
     alloc: Allocator,
@@ -315,16 +314,21 @@ fn drawCommandBlockSeparators(
     const sep_color = Color.block_separator.alphaPixel(200);
     const sep_height_px: usize = 2;
     const width_px: usize = self.cell_size.width * state.cols;
+    const gap_px = state.command_blocks_gap;
+    if (gap_px == 0) return;
 
+    var gap_count: usize = 0;
     for (1..@min(block_indices.len, state.rows)) |y| {
         if (block_indices[y] == block_indices[y - 1]) continue;
+        gap_count += 1;
 
-        // The separator line sits in the gap created by the GPU Y offset.
-        // The gap is positioned just above this row's shifted position.
-        // The overlay draws at the original grid position, but the text
-        // is shifted down. The line goes at the original grid Y of this
-        // row (which is now in the gap space).
-        const px_y = y * self.cell_size.height;
+        // The gap is between the end of the previous block and the
+        // start of this block. With per-block rendering, each block
+        // is positioned at: first_row * cell_height + gap_count * gap_px.
+        // The gap space starts at: y * cell_height + (gap_count - 1) * gap_px
+        // The midpoint of the gap is where we draw the separator.
+        const gap_start = y * self.cell_size.height + (gap_count - 1) * @as(usize, gap_px);
+        const gap_mid = gap_start + @as(usize, gap_px) / 2;
 
         var ctx: z2d.Context = .init(alloc, &self.surface);
         defer ctx.deinit();
@@ -332,8 +336,8 @@ fn drawCommandBlockSeparators(
 
         const sx: f64 = 0;
         const ex: f64 = @floatFromInt(width_px);
-        const sy: f64 = @floatFromInt(px_y);
-        const ey: f64 = @floatFromInt(px_y + sep_height_px);
+        const sy: f64 = @floatFromInt(gap_mid);
+        const ey: f64 = @floatFromInt(gap_mid + sep_height_px);
 
         ctx.moveTo(sx, sy) catch return;
         ctx.lineTo(ex, sy) catch return;
