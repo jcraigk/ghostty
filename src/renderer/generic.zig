@@ -247,7 +247,48 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             instance_offset: usize = 0,
             /// Number of fg cell instances in this block.
             instance_count: usize = 0,
+            /// Exit code: 0 = success, >0 = error, -1 = running/unknown.
+            exit_code: i32 = -1,
         };
+
+        /// Map a block exit code to an RGBA stripe color.
+        fn stripeColor(exit_code: i32) [4]u8 {
+            return switch (exit_code) {
+                0 => .{ 95, 175, 95, 255 },
+                -1 => .{ 0, 0, 0, 0 },
+                else => .{ 255, 95, 95, 255 },
+            };
+        }
+
+        /// Blend a cell bg color with a visible red tint for error blocks.
+        fn blendErrorTint(bg: [4]u8) [4]u8 {
+            const tint_r: u16 = 45;
+            const tint_g: u16 = 6;
+            const tint_b: u16 = 6;
+            const factor: u16 = 180; // out of 256
+            const inv: u16 = 256 - factor;
+            return .{
+                @intCast((@as(u16, bg[0]) * inv + tint_r * factor) >> 8),
+                @intCast((@as(u16, bg[1]) * inv + tint_g * factor) >> 8),
+                @intCast((@as(u16, bg[2]) * inv + tint_b * factor) >> 8),
+                if (bg[3] == 0) 255 else bg[3],
+            };
+        }
+
+        /// Blend a cell bg color with a subtle green tint for success blocks.
+        fn blendSuccessTint(bg: [4]u8) [4]u8 {
+            const tint_r: u16 = 6;
+            const tint_g: u16 = 25;
+            const tint_b: u16 = 6;
+            const factor: u16 = 100; // out of 256
+            const inv: u16 = 256 - factor;
+            return .{
+                @intCast((@as(u16, bg[0]) * inv + tint_r * factor) >> 8),
+                @intCast((@as(u16, bg[1]) * inv + tint_g * factor) >> 8),
+                @intCast((@as(u16, bg[2]) * inv + tint_b * factor) >> 8),
+                if (bg[3] == 0) 255 else bg[3],
+            };
+        }
 
         const HighlightTag = enum(u8) {
             search_match,
@@ -590,6 +631,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             command_blocks: bool,
             command_blocks_padding_footer: u16,
             command_blocks_padding_header: u16,
+            command_blocks_padding_left: u16,
+            command_blocks_padding_right: u16,
+            command_blocks_stripe_width: u16,
             scroll_to_bottom_on_output: bool,
 
             pub fn init(
@@ -667,6 +711,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .command_blocks = config.@"command-blocks",
                     .command_blocks_padding_footer = config.@"command-blocks-padding-footer",
                     .command_blocks_padding_header = config.@"command-blocks-padding-header",
+                    .command_blocks_padding_left = config.@"command-blocks-padding-left",
+                    .command_blocks_padding_right = config.@"command-blocks-padding-right",
+                    .command_blocks_stripe_width = config.@"command-blocks-stripe-width",
                     .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
                     .arena = arena,
                 };
@@ -1709,7 +1756,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
 
                 if (self.block_regions.items.len > 1) {
-                    for (self.block_regions.items) |region| {
+                    const ts = &self.terminal_state;
+                    const sep_row: f32 = @floatFromInt(ts.rows);
+                    const pad_left: f32 = @floatFromInt(self.size.padding.left);
+                    const stripe_w: u32 = self.config.command_blocks_stripe_width;
+                    const num_blocks: u16 = if (ts.block_indices.len > 0)
+                        ts.block_indices[ts.block_indices.len - 1] + 1
+                    else
+                        0;
+
+                    for (self.block_regions.items, 0..) |region, ri| {
                         const bp: @TypeOf(pass).Step.BlockParams = .{
                             .block_y_offset = region.grid_y_offset,
                             .block_first_row = @floatFromInt(region.first_row),
@@ -1721,6 +1777,51 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .height = region.height_px,
                         };
 
+                        // Compute visual block extent (header padding to footer padding).
+                        const header_h: u32 = self.config.command_blocks_padding_header;
+                        const vis_top: u32 = if (ri > 0) blk: {
+                            const prev = self.block_regions.items[ri - 1];
+                            const prev_end = prev.screen_y_px + prev.height_px;
+                            const gap_mid = prev_end + (region.screen_y_px - prev_end) / 2;
+                            break :blk gap_mid + 2;
+                        } else if (region.screen_y_px > header_h)
+                            region.screen_y_px - header_h
+                        else
+                            0;
+
+                        const vis_bottom: u32 = if (ri + 1 < self.block_regions.items.len) blk: {
+                            const next = self.block_regions.items[ri + 1];
+                            const this_end = region.screen_y_px + region.height_px;
+                            const gap_mid = this_end + (next.screen_y_px - this_end) / 2;
+                            break :blk gap_mid;
+                        } else self.size.screen.height;
+
+                        // Block tint: full-block background layer drawn BEFORE content.
+                        if (region.exit_code >= 0 and num_blocks > 0 and vis_bottom > vis_top) {
+                            const block_idx = ts.block_indices[region.first_row];
+                            const tint_base: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(num_blocks));
+                            const tint_row: f32 = tint_base + @as(f32, @floatFromInt(block_idx));
+
+                            pass.step(.{
+                                .pipeline = self.shaders.pipelines.cell_bg,
+                                .uniforms = frame.uniforms.buffer,
+                                .buffers = &.{ null, frame.cells_bg.buffer },
+                                .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                .scissor = .{
+                                    .x = 0,
+                                    .y = vis_top,
+                                    .width = self.size.screen.width,
+                                    .height = vis_bottom - vis_top,
+                                },
+                                .block_params = .{
+                                    .block_y_offset = 0,
+                                    .block_first_row = tint_row,
+                                    .block_y_flat = 1.0,
+                                },
+                            });
+                        }
+
+                        // Content background
                         pass.step(.{
                             .pipeline = self.shaders.pipelines.cell_bg,
                             .uniforms = frame.uniforms.buffer,
@@ -1730,6 +1831,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .block_params = bp,
                         });
 
+                        // Content text
                         if (region.instance_count > 0) {
                             pass.step(.{
                                 .pipeline = self.shaders.pipelines.cell_text,
@@ -1752,23 +1854,43 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                 .block_params = bp,
                             });
                         }
-                    }
 
-                    // Draw separator lines in the gaps between blocks.
-                    // Fill row 0 of bg_cells with separator color, re-sync
-                    // to GPU, then draw cell_bg with 2px scissor at each gap.
-                    {
-                        const cols = self.cells.size.columns;
-                        var x: usize = 0;
-                        while (x < cols) : (x += 1) {
-                            self.cells.bgCell(0, x).* = .{ 80, 80, 80, 255 };
+                        // Stripe: spans the full visual block extent (header to footer).
+                        if (stripe_w > 0 and vis_bottom > vis_top) {
+                            const block_idx = ts.block_indices[region.first_row];
+                            const stripe_scratch: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(block_idx));
+                            const sc = stripeColor(region.exit_code);
+                            if (sc[3] > 0) {
+                                pass.step(.{
+                                    .pipeline = self.shaders.pipelines.cell_bg,
+                                    .uniforms = frame.uniforms.buffer,
+                                    .buffers = &.{ null, frame.cells_bg.buffer },
+                                    .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                    .scissor = .{
+                                        .x = 0,
+                                        .y = vis_top,
+                                        .width = stripe_w,
+                                        .height = vis_bottom - vis_top,
+                                    },
+                                    .block_params = .{
+                                        .block_y_offset = 0,
+                                        .block_first_row = stripe_scratch,
+                                        .block_x_offset = -pad_left,
+                                        .block_y_flat = 1.0,
+                                    },
+                                });
+                            }
                         }
-                        try frame.cells_bg.sync(self.cells.bg_cells);
 
-                        var prev_end: u32 = 0;
-                        for (self.block_regions.items, 0..) |region, ri| {
-                            if (ri > 0 and region.screen_y_px > prev_end + 2) {
+                        // Separator + stripe through gap to next block.
+                        if (ri > 0) {
+                            const prev = self.block_regions.items[ri - 1];
+                            const prev_end = prev.screen_y_px + prev.height_px;
+                            if (region.screen_y_px > prev_end + 2) {
                                 const gap_mid = prev_end + (region.screen_y_px - prev_end) / 2;
+
+                                // Separator line (scratch row filled with gray, flat).
+                                // Uses block_x_offset=0 so padding_extend covers edges.
                                 pass.step(.{
                                     .pipeline = self.shaders.pipelines.cell_bg,
                                     .uniforms = frame.uniforms.buffer,
@@ -1781,12 +1903,65 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                         .height = 2,
                                     },
                                     .block_params = .{
-                                        .block_y_offset = @as(f32, @floatFromInt(gap_mid)) - @as(f32, @floatFromInt(self.size.padding.top)),
-                                        .block_first_row = 0,
+                                        .block_y_offset = 0,
+                                        .block_first_row = sep_row,
+                                        .block_y_flat = 1.0,
                                     },
                                 });
+
+                                // Stripe through gap: footer half uses previous
+                                // block's color, header half uses current block's.
+                                if (stripe_w > 0) {
+                                    // Footer stripe (prev_end to gap_mid).
+                                    const prev_sc = stripeColor(prev.exit_code);
+                                    if (prev_sc[3] > 0 and gap_mid > prev_end) {
+                                        const prev_bi = ts.block_indices[prev.first_row];
+                                        const prev_stripe: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(prev_bi));
+                                        pass.step(.{
+                                            .pipeline = self.shaders.pipelines.cell_bg,
+                                            .uniforms = frame.uniforms.buffer,
+                                            .buffers = &.{ null, frame.cells_bg.buffer },
+                                            .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                            .scissor = .{
+                                                .x = 0,
+                                                .y = prev_end,
+                                                .width = stripe_w,
+                                                .height = gap_mid - prev_end,
+                                            },
+                                            .block_params = .{
+                                                .block_y_offset = 0,
+                                                .block_first_row = prev_stripe,
+                                                .block_x_offset = -pad_left,
+                                                .block_y_flat = 1.0,
+                                            },
+                                        });
+                                    }
+                                    // Header stripe (gap_mid+2 to region start).
+                                    const cur_sc = stripeColor(region.exit_code);
+                                    if (cur_sc[3] > 0 and region.screen_y_px > gap_mid + 2) {
+                                        const cur_bi = ts.block_indices[region.first_row];
+                                        const cur_stripe: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(cur_bi));
+                                        pass.step(.{
+                                            .pipeline = self.shaders.pipelines.cell_bg,
+                                            .uniforms = frame.uniforms.buffer,
+                                            .buffers = &.{ null, frame.cells_bg.buffer },
+                                            .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                            .scissor = .{
+                                                .x = 0,
+                                                .y = gap_mid + 2,
+                                                .width = stripe_w,
+                                                .height = region.screen_y_px - gap_mid - 2,
+                                            },
+                                            .block_params = .{
+                                                .block_y_offset = 0,
+                                                .block_first_row = cur_stripe,
+                                                .block_x_offset = -pad_left,
+                                                .block_y_flat = 1.0,
+                                            },
+                                        });
+                                    }
+                                }
                             }
-                            prev_end = region.screen_y_px + region.height_px;
                         }
                     }
 
@@ -2499,18 +2674,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             //     std.log.warn("[rebuildCells time] {}\t{}", .{start_micro, end.since(start) / std.time.ns_per_us});
             // }
 
+            // Count visible blocks for scratch row allocation.
+            const num_blocks: u16 = blk: {
+                if (!self.config.command_blocks or state.block_indices.len == 0)
+                    break :blk 0;
+                break :blk state.block_indices[state.block_indices.len - 1] + 1;
+            };
+            // Extra rows: 1 separator + num_blocks stripe + num_blocks tint.
+            const scratch_rows: u16 = if (num_blocks > 0) 1 + num_blocks * 2 else 0;
+            const total_rows = state.rows + scratch_rows;
+
             const grid_size_diff =
-                self.cells.size.rows != state.rows or
+                self.cells.size.rows != total_rows or
                 self.cells.size.columns != state.cols;
 
             if (grid_size_diff) {
                 var new_size = self.cells.size;
-                new_size.rows = state.rows;
+                new_size.rows = total_rows;
                 new_size.columns = state.cols;
                 try self.cells.resize(self.alloc, new_size);
 
-                // Update our uniforms accordingly, otherwise
-                // our background cells will be out of place.
+                // grid_size tells the shader the valid cell range.
                 self.uniforms.grid_size = .{ new_size.columns, new_size.rows };
             }
 
@@ -2533,6 +2717,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .right = true,
                         };
                     },
+                }
+
+                // Command blocks always extend padding so separators,
+                // stripes, and error tints reach the screen edges.
+                if (self.config.command_blocks) {
+                    self.uniforms.padding_extend = .{
+                        .up = true,
+                        .down = true,
+                        .left = true,
+                        .right = true,
+                    };
                 }
             }
 
@@ -2561,6 +2756,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             {
                 self.block_regions.clearRetainingCapacity();
                 const block_indices = state.block_indices;
+                const block_exit_codes = state.block_exit_codes;
                 if (block_indices.len > 0 and self.config.command_blocks) {
                     const cell_h = self.grid_metrics.cell_height;
                     const footer_px: u32 = self.config.command_blocks_padding_footer;
@@ -2569,7 +2765,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const gap_px = footer_px + sep_px + header_px;
                     const padding_top = self.size.padding.top;
                     const descender_margin = cell_h / 4;
-                    // Total gap includes descender margin so visuals are symmetric.
                     const total_gap = gap_px + descender_margin;
 
                     var region_start: u16 = 0;
@@ -2582,13 +2777,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         {
                             const rc: u16 = yi - region_start;
                             const h = @as(u32, rc) * cell_h;
+                            const bi = block_indices[region_start];
+                            const ec: i32 = if (bi < block_exit_codes.len) block_exit_codes[bi] else -1;
                             self.block_regions.append(self.alloc, .{
                                 .first_row = region_start,
                                 .row_count = rc,
                                 .screen_y_px = screen_y,
                                 .height_px = h + descender_margin,
                                 .grid_y_offset = @floatFromInt(grid_y),
+                                .exit_code = ec,
                             }) catch {};
+
                             screen_y += h + total_gap;
                             grid_y += h + total_gap;
                             region_start = yi;
@@ -2597,12 +2796,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // Final block
                     const rc: u16 = @intCast(row_len - @as(usize, region_start));
                     const h = @as(u32, rc) * cell_h;
+                    const final_bi = block_indices[region_start];
+                    const final_ec: i32 = if (final_bi < block_exit_codes.len) block_exit_codes[final_bi] else -1;
                     self.block_regions.append(self.alloc, .{
                         .first_row = region_start,
                         .row_count = rc,
                         .screen_y_px = screen_y,
                         .height_px = h + descender_margin,
                         .grid_y_offset = @floatFromInt(grid_y),
+                        .exit_code = final_ec,
                     }) catch {};
                 }
             }
@@ -2669,6 +2871,51 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     log.warn("error building row y={} err={}", .{ y, err });
                     self.cells.clear(y);
                 };
+
+                // Block tint is applied as a draw-level background layer,
+                // not per-cell, so it covers gaps and supports hover/click.
+            }
+
+            // Populate scratch rows for separator and per-row stripes.
+            if (scratch_rows > 0) {
+                const sep_row: usize = state.rows;
+                const cols_u: usize = state.cols;
+
+                // Scratch row for separator: all columns gray.
+                var sx: usize = 0;
+                while (sx < cols_u) : (sx += 1) {
+                    self.cells.bgCell(@intCast(sep_row), @intCast(sx)).* = .{ 80, 80, 80, 255 };
+                }
+
+                // Per-block scratch rows: stripe colors and tint colors.
+                var bi: u16 = 0;
+                while (bi < num_blocks) : (bi += 1) {
+                    const ec: i32 = if (bi < state.block_exit_codes.len)
+                        state.block_exit_codes[bi]
+                    else
+                        -1;
+
+                    // Stripe scratch row.
+                    const stripe_row: usize = sep_row + 1 + bi;
+                    const sc = stripeColor(ec);
+                    var scx: usize = 0;
+                    while (scx < cols_u) : (scx += 1) {
+                        self.cells.bgCell(@intCast(stripe_row), @intCast(scx)).* = sc;
+                    }
+
+                    // Tint scratch row (full-width block bg tint).
+                    const tint_row: usize = sep_row + 1 + num_blocks + bi;
+                    const tc: [4]u8 = if (ec > 0)
+                        blendErrorTint(.{ 0, 0, 0, 255 })
+                    else if (ec == 0)
+                        blendSuccessTint(.{ 0, 0, 0, 255 })
+                    else
+                        .{ 0, 0, 0, 0 };
+                    var tcx: usize = 0;
+                    while (tcx < cols_u) : (tcx += 1) {
+                        self.cells.bgCell(@intCast(tint_row), @intCast(tcx)).* = tc;
+                    }
+                }
             }
 
             // Setup our cursor rendering information.

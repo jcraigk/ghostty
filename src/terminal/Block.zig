@@ -95,13 +95,14 @@ fn readPinRangeText(pages: *PageList, start: Pin, limit: Pin, buf: []u8) []const
 
 /// Manages an ordered list of Blocks backed by tracked pins.
 pub const BlockList = struct {
-    blocks: std.ArrayList(Block),
+    blocks: std.ArrayListUnmanaged(Block) = .empty,
     pages: *PageList,
+    alloc: Allocator,
 
     pub fn init(allocator: Allocator, pages: *PageList) BlockList {
         return .{
-            .blocks = std.ArrayList(Block).init(allocator),
             .pages = pages,
+            .alloc = allocator,
         };
     }
 
@@ -112,7 +113,7 @@ pub const BlockList = struct {
             if (block.output_start) |p| self.pages.untrackPin(p);
             if (block.end) |p| self.pages.untrackPin(p);
         }
-        self.blocks.deinit();
+        self.blocks.deinit(self.alloc);
     }
 
     /// Create a new block starting at `prompt_pin`. The pin is tracked so
@@ -132,7 +133,7 @@ pub const BlockList = struct {
             }
         }
 
-        try self.blocks.append(.{ .prompt_start = tracked });
+        try self.blocks.append(self.alloc, .{ .prompt_start = tracked });
         return &self.blocks.items[self.blocks.items.len - 1];
     }
 

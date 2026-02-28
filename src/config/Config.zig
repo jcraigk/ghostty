@@ -2852,6 +2852,21 @@ keybind: Keybinds = .{},
 /// `command-blocks` is enabled.
 @"command-blocks-padding-header": u16 = 25,
 
+/// Left padding in points within command blocks. Text is indented from
+/// the window edge by this amount, while separators remain edge-to-edge.
+/// The status stripe is drawn within this space. Only applies when
+/// `command-blocks` is enabled.
+@"command-blocks-padding-left": u16 = 12,
+
+/// Right padding in points within command blocks. Only applies when
+/// `command-blocks` is enabled.
+@"command-blocks-padding-right": u16 = 8,
+
+/// Width in points of the status stripe on the left edge of each command
+/// block. The stripe color indicates exit status. Set to 0 to disable.
+/// Must be less than `command-blocks-padding-left`.
+@"command-blocks-stripe-width": u16 = 4,
+
 /// Custom entries into the command palette.
 ///
 /// Each entry requires the title, the corresponding action, and an optional
@@ -4642,10 +4657,23 @@ pub fn finalize(self: *Config) !void {
     if (self.@"window-width" > 0) self.@"window-width" = @max(10, self.@"window-width");
     if (self.@"window-height" > 0) self.@"window-height" = @max(4, self.@"window-height");
 
-    // Command blocks: force zero horizontal padding so block separators
-    // extend edge-to-edge.
+    // Command blocks: left padding indents text from the stripe area.
+    // Right padding is zero so separators extend to the right edge.
+    // Top padding includes header padding so the first prompt has
+    // breathing room from the start (no jump when blocks appear).
     if (self.@"command-blocks") {
-        self.@"window-padding-x" = .{ .top_left = 0, .bottom_right = 0 };
+        self.@"window-padding-x" = .{
+            .top_left = self.@"command-blocks-padding-left",
+            .bottom_right = 0,
+        };
+        const current_top = self.@"window-padding-y".top_left;
+        const header = self.@"command-blocks-padding-header";
+        if (current_top < header) {
+            self.@"window-padding-y" = .{
+                .top_left = header,
+                .bottom_right = self.@"window-padding-y".bottom_right,
+            };
+        }
     }
 
     // If URLs are disabled, cut off the first link. The first link is

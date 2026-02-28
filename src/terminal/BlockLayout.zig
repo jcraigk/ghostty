@@ -51,7 +51,7 @@ padding_header_px: u16 = 8,
 show_separators: bool = true,
 
 /// Cached per-block layout info for efficient lookups.
-block_offsets: std.ArrayList(BlockLayoutInfo),
+block_offsets: std.ArrayListUnmanaged(BlockLayoutInfo) = .empty,
 
 /// Whether the cache needs recomputation.
 dirty: bool = true,
@@ -72,12 +72,11 @@ pub fn init(allocator: Allocator, block_list: *Block.BlockList) BlockLayout {
     return .{
         .allocator = allocator,
         .block_list = block_list,
-        .block_offsets = std.ArrayList(BlockLayoutInfo).init(allocator),
     };
 }
 
 pub fn deinit(self: *BlockLayout) void {
-    self.block_offsets.deinit();
+    self.block_offsets.deinit(self.allocator);
 }
 
 /// Recompute `block_offsets` from the current block list state.
@@ -101,7 +100,7 @@ pub fn rebuild(self: *BlockLayout) void {
         const trailing = if (i + 1 < blocks.len) inter_block_rows else 0;
         const total = content + trailing;
 
-        self.block_offsets.append(.{
+        self.block_offsets.append(self.allocator, .{
             .virtual_start = cumulative,
             .content_rows = content,
             .total_virtual_rows = total,

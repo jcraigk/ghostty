@@ -29,6 +29,7 @@ const ReadonlyStream = @import("stream_readonly.zig").Stream;
 const size = @import("size.zig");
 const pagepkg = @import("page.zig");
 const style = @import("style.zig");
+const Block = @import("Block.zig");
 const Screen = @import("Screen.zig");
 const ScreenSet = @import("ScreenSet.zig");
 const Page = pagepkg.Page;
@@ -64,6 +65,10 @@ scrolling_region: ScrollingRegion,
 
 /// The last reported pwd, if any.
 pwd: std.ArrayList(u8),
+
+/// Ordered list of command blocks, built incrementally from OSC 133
+/// sequences. Only populated when command-blocks is enabled.
+block_list: ?Block.BlockList = null,
 
 /// The color state for this terminal.
 colors: Colors,
@@ -251,6 +256,7 @@ pub fn init(
 }
 
 pub fn deinit(self: *Terminal, alloc: Allocator) void {
+    if (self.block_list) |*bl| bl.deinit();
     self.tabstops.deinit(alloc);
     self.screens.deinit(alloc);
     self.pwd.deinit(alloc);
@@ -1187,8 +1193,10 @@ pub fn semanticPrompt(
                 }
             }
 
-            // The "aid" and "cl" options are also valid for this
-            // command but we don't yet handle these in any meaningful way.
+            // Track this as a new command block.
+            if (self.screens.active_key == .primary) {
+                self.blockListAddBlock() catch {};
+            }
         },
 
         .new_command => {
@@ -1226,6 +1234,7 @@ pub fn semanticPrompt(
             self.screens.active.cursorSetSemanticContent(.{
                 .input = .clear_explicit,
             });
+            self.blockListSetInputStart() catch {};
         },
 
         .end_prompt_start_input_terminate_eol => {
@@ -1233,6 +1242,7 @@ pub fn semanticPrompt(
             self.screens.active.cursorSetSemanticContent(.{
                 .input = .clear_eol,
             });
+            self.blockListSetInputStart() catch {};
         },
 
         .end_input_start_output => {
@@ -1253,6 +1263,7 @@ pub fn semanticPrompt(
             {
                 self.screens.active.cursor.page_row.semantic_prompt = .none;
             }
+            self.blockListSetOutputStart() catch {};
         },
 
         .end_command => {
@@ -1261,6 +1272,12 @@ pub fn semanticPrompt(
             // its reasonable at this point to reset our semantic content
             // state but the spec doesn't really say what to do.
             self.screens.active.cursorSetSemanticContent(.output);
+
+            if (self.block_list) |*bl| {
+                if (bl.activeBlock()) |active| {
+                    active.exit_code = cmd.readOption(.exit_code);
+                }
+            }
         },
     }
 }
@@ -1283,6 +1300,38 @@ fn semanticPromptFreshLine(self: *Terminal) !void {
 
     self.carriageReturn();
     try self.index();
+}
+
+/// Lazily initialize the block list and add a new block at the current
+/// cursor position. Called on OSC 133 A (new prompt).
+fn blockListAddBlock(self: *Terminal) !void {
+    const screen = self.screens.get(.primary) orelse return;
+    const bl = &(self.block_list orelse init: {
+        self.block_list = Block.BlockList.init(self.gpa(), &screen.pages);
+        break :init self.block_list.?;
+    });
+    bl.pruneGarbage();
+    _ = try bl.addBlock(screen.cursor.page_pin.*);
+}
+
+/// Set input_start on the active block at the current cursor position.
+/// Called on OSC 133 B/I.
+fn blockListSetInputStart(self: *Terminal) !void {
+    const bl = &(self.block_list orelse return);
+    const active = bl.activeBlock() orelse return;
+    if (active.input_start != null) return;
+    const screen = self.screens.get(.primary) orelse return;
+    active.input_start = try bl.pages.trackPin(screen.cursor.page_pin.*);
+}
+
+/// Set output_start on the active block at the current cursor position.
+/// Called on OSC 133 C.
+fn blockListSetOutputStart(self: *Terminal) !void {
+    const bl = &(self.block_list orelse return);
+    const active = bl.activeBlock() orelse return;
+    if (active.output_start != null) return;
+    const screen = self.screens.get(.primary) orelse return;
+    active.output_start = try bl.pages.trackPin(screen.cursor.page_pin.*);
 }
 
 /// The semantic prompt type. This is used when tracking a line type and

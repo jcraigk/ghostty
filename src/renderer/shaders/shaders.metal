@@ -446,6 +446,8 @@ fragment float4 bg_image_fragment(
 struct BlockParams {
   float block_y_offset;
   float block_first_row;
+  float block_x_offset;
+  float block_y_flat;
 };
 
 //-------------------------------------------------------------------
@@ -459,11 +461,16 @@ fragment float4 cell_bg_fragment(
   constant uchar4 *cells [[buffer(2)]],
   constant BlockParams& block_params [[buffer(3)]]
 ) {
-  // Compute grid position. block_y_offset is grid-relative (excludes padding),
-  // so add it to the padding top to get the screen-space Y origin.
-  float2 origin = float2(uniforms.grid_padding.w, uniforms.grid_padding.x + block_params.block_y_offset);
+  // Compute grid position. block_y_offset/block_x_offset are grid-relative
+  // (excludes padding), added to the padding to get the screen-space origin.
+  float2 origin = float2(uniforms.grid_padding.w + block_params.block_x_offset, uniforms.grid_padding.x + block_params.block_y_offset);
   int2 grid_pos = int2(floor((in.position.xy - origin) / uniforms.cell_size));
-  grid_pos.y += int(block_params.block_first_row);
+  // When block_y_flat is set, all pixels read from the same row (for solid fills).
+  if (block_params.block_y_flat != 0.0) {
+    grid_pos.y = int(block_params.block_first_row);
+  } else {
+    grid_pos.y += int(block_params.block_first_row);
+  }
 
   float4 bg = float4(0.0);
 

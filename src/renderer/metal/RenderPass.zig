@@ -50,6 +50,8 @@ pub const Step = struct {
     pub const BlockParams = extern struct {
         block_y_offset: f32,
         block_first_row: f32,
+        block_x_offset: f32 = 0,
+        block_y_flat: f32 = 0,
     };
 
     pub const ScissorRect = struct {

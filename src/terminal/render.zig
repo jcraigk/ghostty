@@ -92,6 +92,10 @@ pub const RenderState = struct {
     block_indices: []u16 = &.{},
     command_blocks_gap: u8 = 0,
 
+    /// Per-block exit code, indexed by block index from block_indices.
+    /// Values: 0 = success, positive = error, -1 = still running / unknown.
+    block_exit_codes: []i32 = &.{},
+
     /// The cached selection so we can avoid expensive selection calculations
     /// if possible.
     selection_cache: ?SelectionCache = null,
@@ -268,6 +272,7 @@ pub const RenderState = struct {
         self.row_data.deinit(alloc);
         if (self.block_gaps.len > 0) alloc.free(self.block_gaps);
         if (self.block_indices.len > 0) alloc.free(self.block_indices);
+        if (self.block_exit_codes.len > 0) alloc.free(self.block_exit_codes);
     }
 
     /// Update the render state to the latest terminal state.
@@ -584,6 +589,26 @@ pub const RenderState = struct {
                 if (row.semantic_prompt == .prompt and saw_prompt) blk += 1;
                 if (row.semantic_prompt == .prompt) saw_prompt = true;
                 self.block_indices[yi] = blk;
+            }
+
+            // Populate per-block exit codes from the Terminal's block list.
+            const num_blocks: usize = @as(usize, blk) + 1;
+            if (self.block_exit_codes.len < num_blocks) {
+                if (self.block_exit_codes.len > 0) alloc.free(self.block_exit_codes);
+                self.block_exit_codes = try alloc.alloc(i32, num_blocks);
+            }
+            @memset(self.block_exit_codes[0..num_blocks], -1);
+            if (t.block_list) |*bl| {
+                var prev_blk_idx: u16 = std.math.maxInt(u16);
+                for (self.block_indices[0..self.rows], 0..) |bi, yi| {
+                    if (bi == prev_blk_idx) continue;
+                    prev_blk_idx = bi;
+                    if (yi < row_pins.len) {
+                        if (bl.blockAtPin(row_pins[yi])) |block| {
+                            self.block_exit_codes[bi] = block.exit_code orelse -1;
+                        }
+                    }
+                }
             }
         }
 

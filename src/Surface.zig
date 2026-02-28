@@ -4712,6 +4712,32 @@ pub fn cursorPosCallback(
         try self.mouseRefreshLinks(pos, pos_vp, over_link);
     }
 
+    // Command blocks: arrow cursor on completed blocks, text cursor on active.
+    if (self.io.terminal.block_list != null and !self.mouse.over_link) {
+        const t: *terminal.Terminal = self.renderer_state.terminal;
+        if (t.block_list) |*bl| {
+            if (bl.activeBlock()) |active| {
+                if (active.exit_code == null) {
+                    const screen = t.screens.get(.primary);
+                    if (screen) |s| {
+                        const pin = s.pages.pin(.{ .viewport = .{
+                            .x = pos_vp.x,
+                            .y = pos_vp.y,
+                        } });
+                        if (pin) |p| {
+                            const in_history = p.before(active.prompt_start.*);
+                            _ = try self.rt_app.performAction(
+                                .{ .surface = self },
+                                .mouse_shape,
+                                if (in_history) .default else .text,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Do a mouse report
     if (self.isMouseReporting()) report: {
         // Shift overrides mouse "grabbing" in the window, taken from Kitty.
