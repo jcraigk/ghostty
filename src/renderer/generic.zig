@@ -1754,6 +1754,42 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         }
                     }
 
+                    // Draw separator lines in the gaps between blocks.
+                    // Fill row 0 of bg_cells with separator color, re-sync
+                    // to GPU, then draw cell_bg with 2px scissor at each gap.
+                    {
+                        const cols = self.cells.size.columns;
+                        var x: usize = 0;
+                        while (x < cols) : (x += 1) {
+                            self.cells.bgCell(0, x).* = .{ 80, 80, 80, 255 };
+                        }
+                        try frame.cells_bg.sync(self.cells.bg_cells);
+
+                        var prev_end: u32 = 0;
+                        for (self.block_regions.items, 0..) |region, ri| {
+                            if (ri > 0 and region.screen_y_px > prev_end + 2) {
+                                const gap_mid = prev_end + (region.screen_y_px - prev_end) / 2;
+                                pass.step(.{
+                                    .pipeline = self.shaders.pipelines.cell_bg,
+                                    .uniforms = frame.uniforms.buffer,
+                                    .buffers = &.{ null, frame.cells_bg.buffer },
+                                    .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                    .scissor = .{
+                                        .x = 0,
+                                        .y = gap_mid,
+                                        .width = self.size.screen.width,
+                                        .height = 2,
+                                    },
+                                    .block_params = .{
+                                        .block_y_offset = @as(f32, @floatFromInt(gap_mid)) - @as(f32, @floatFromInt(self.size.padding.top)),
+                                        .block_first_row = 0,
+                                    },
+                                });
+                            }
+                            prev_end = region.screen_y_px + region.height_px;
+                        }
+                    }
+
                     // Draw cursor cells (at the start of the fg buffer,
                     // not included in any block's instance range).
                     const cursor_count = self.cells.fg_rows.lists[0].items.len;
