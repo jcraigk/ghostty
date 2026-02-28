@@ -2867,6 +2867,41 @@ keybind: Keybinds = .{},
 /// Must be less than `command-blocks-padding-left`.
 @"command-blocks-stripe-width": u16 = 4,
 
+/// Color of the separator line drawn between command blocks. Only applies
+/// when `command-blocks` is enabled.
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"command-blocks-separator-color": Color = .{ .r = 0x50, .g = 0x50, .b = 0x50 },
+
+/// Stripe color for commands that exited successfully (exit code 0).
+/// Set to empty to hide the stripe on success. Only applies when
+/// `command-blocks` is enabled.
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"command-blocks-stripe-success": ?Color = .{ .r = 0x5f, .g = 0xaf, .b = 0x5f },
+
+/// Stripe color for commands that failed (non-zero exit code).
+/// Only applies when `command-blocks` is enabled.
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"command-blocks-stripe-error": ?Color = .{ .r = 0xff, .g = 0x5f, .b = 0x5f },
+
+/// Stripe color for blocks that are still running (no exit code yet).
+/// Set to empty to hide the stripe while running. Only applies when
+/// `command-blocks` is enabled.
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"command-blocks-stripe-running": ?Color = null,
+
+/// Background tint color blended over error blocks (non-zero exit code).
+/// The tint is applied at low opacity so text remains readable. Set to
+/// empty to disable the error tint. Only applies when `command-blocks`
+/// is enabled.
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"command-blocks-tint-error": ?Color = .{ .r = 0x2d, .g = 0x06, .b = 0x06 },
+
+/// Background tint color blended over success blocks (exit code 0).
+/// Set to empty to disable the success tint. Only applies when
+/// `command-blocks` is enabled.
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"command-blocks-tint-success": ?Color = .{ .r = 0x06, .g = 0x19, .b = 0x06 },
+
 /// Custom entries into the command palette.
 ///
 /// Each entry requires the title, the corresponding action, and an optional

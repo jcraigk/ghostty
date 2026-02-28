@@ -235,6 +235,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Populated in rebuildCells from block_indices.
         block_regions: std.ArrayListUnmanaged(BlockRegion) = .empty,
 
+        /// Gap overflow in pixels — how many pixels inter-block gaps push
+        /// content past the viewport. Used to adjust the scrollbar.
+        gap_overflow_px: u32 = 0,
+
         const BlockRegion = struct {
             first_row: u16,
             row_count: u16,
@@ -1471,8 +1475,41 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // The scrollbar is only emitted during draws so we also
                 // check the scrollbar cache here and update if needed.
                 // This is pretty fast.
-                if (!self.scrollbar.eql(critical.scrollbar)) {
-                    self.scrollbar = critical.scrollbar;
+                //
+                // In block mode, we need to adjust the scrollbar to account
+                // for gap_overflow pixels. The PageList doesn't know about
+                // inter-block gaps, so without adjustment the scrollbar
+                // won't appear when gaps push content off the viewport.
+                var adjusted_scrollbar = critical.scrollbar;
+                if (self.config.command_blocks and self.gap_overflow_px > 0) {
+                    // The PageList doesn't know about inter-block gaps, so we
+                    // inflate the scrollbar to create a virtual document that
+                    // includes gap-equivalent rows.
+                    //
+                    // Virtual document model:
+                    //   total = pagelist.total + gap_rows
+                    //   len   = pagelist.len (unchanged)
+                    //   offset = pagelist.offset + (gap_rows - gap_rows_consumed)
+                    //
+                    // gap_rows_consumed represents how many gap-rows the user
+                    // has scrolled through. At the bottom (following), none are
+                    // consumed so offset is at its maximum. At the top, all are
+                    // consumed so offset contribution from gaps is 0.
+                    const cell_h = self.grid_metrics.cell_height;
+                    if (cell_h > 0) {
+                        const gap_rows = (self.gap_overflow_px + cell_h - 1) / cell_h;
+                        const scroll_px: u32 = if (self.terminal_state.block_scroll_px > 0)
+                            @intCast(self.terminal_state.block_scroll_px)
+                        else
+                            0;
+                        const consumed_px = @min(scroll_px, self.gap_overflow_px);
+                        const gap_rows_consumed = consumed_px / cell_h;
+                        adjusted_scrollbar.total += gap_rows;
+                        adjusted_scrollbar.offset += gap_rows - gap_rows_consumed;
+                    }
+                }
+                if (!self.scrollbar.eql(adjusted_scrollbar)) {
+                    self.scrollbar = adjusted_scrollbar;
                     self.scrollbar_dirty = true;
                 }
 
@@ -1654,7 +1691,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Compute per-block instance offsets/counts for the fg cell buffer.
             // The fg buffer is ordered: lists[0]=cursor, lists[1]=row0, lists[2]=row1, ...
             // We accumulate cell counts per row and map them to block regions.
-            if (self.block_regions.items.len > 1) {
+            if (self.block_regions.items.len >= 1) {
                 const lists = self.cells.fg_rows.lists;
                 // Offset starts after the cursor list (lists[0]).
                 var cursor_cells: usize = if (lists.len > 0) lists[0].items.len else 0;
@@ -1755,7 +1792,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .block_first_row = 0,
                 };
 
-                if (self.block_regions.items.len > 1) {
+                if (self.block_regions.items.len >= 1) {
                     const ts = &self.terminal_state;
                     const sep_row: f32 = @floatFromInt(ts.rows);
                     const pad_left: f32 = @floatFromInt(self.size.padding.left);
@@ -1782,6 +1819,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         const vis_top: u32 = if (ri > 0) blk: {
                             const prev = self.block_regions.items[ri - 1];
                             const prev_end = prev.screen_y_px + prev.height_px;
+                            if (region.screen_y_px <= prev_end) break :blk prev_end;
                             const gap_mid = prev_end + (region.screen_y_px - prev_end) / 2;
                             break :blk gap_mid + 2;
                         } else if (region.screen_y_px > header_h)
@@ -1792,6 +1830,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         const vis_bottom: u32 = if (ri + 1 < self.block_regions.items.len) blk: {
                             const next = self.block_regions.items[ri + 1];
                             const this_end = region.screen_y_px + region.height_px;
+                            if (next.screen_y_px <= this_end) break :blk this_end;
                             const gap_mid = this_end + (next.screen_y_px - this_end) / 2;
                             break :blk gap_mid;
                         } else self.size.screen.height;
@@ -2767,45 +2806,125 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const descender_margin = cell_h / 4;
                     const total_gap = gap_px + descender_margin;
 
+                    // --- Unified scroll model ---
+                    // Step 1: Compute block regions from natural (unshifted) positions.
+                    // Blocks start at padding_top and accumulate gaps between them.
+                    // No scroll offset is applied yet.
                     var region_start: u16 = 0;
-                    var screen_y: u32 = padding_top;
-                    var grid_y: u32 = 0;
+                    var screen_y_i: i32 = @intCast(padding_top);
+                    var grid_y_i: i32 = 0;
                     var yi: u16 = 0;
                     while (yi < row_len) : (yi += 1) {
                         if (yi > 0 and yi < block_indices.len and
                             block_indices[yi] != block_indices[yi - 1])
                         {
                             const rc: u16 = yi - region_start;
-                            const h = @as(u32, rc) * cell_h;
+                            const h: i32 = @intCast(@as(u32, rc) * cell_h);
                             const bi = block_indices[region_start];
                             const ec: i32 = if (bi < block_exit_codes.len) block_exit_codes[bi] else -1;
+                            const sy: u32 = if (screen_y_i >= 0) @intCast(screen_y_i) else 0;
                             self.block_regions.append(self.alloc, .{
                                 .first_row = region_start,
                                 .row_count = rc,
-                                .screen_y_px = screen_y,
-                                .height_px = h + descender_margin,
-                                .grid_y_offset = @floatFromInt(grid_y),
+                                .screen_y_px = sy,
+                                .height_px = @intCast(h + @as(i32, @intCast(descender_margin))),
+                                .grid_y_offset = @floatFromInt(grid_y_i),
                                 .exit_code = ec,
                             }) catch {};
 
-                            screen_y += h + total_gap;
-                            grid_y += h + total_gap;
+                            screen_y_i += h + @as(i32, @intCast(total_gap));
+                            grid_y_i += h + @as(i32, @intCast(total_gap));
                             region_start = yi;
                         }
                     }
                     // Final block
-                    const rc: u16 = @intCast(row_len - @as(usize, region_start));
-                    const h = @as(u32, rc) * cell_h;
-                    const final_bi = block_indices[region_start];
-                    const final_ec: i32 = if (final_bi < block_exit_codes.len) block_exit_codes[final_bi] else -1;
-                    self.block_regions.append(self.alloc, .{
-                        .first_row = region_start,
-                        .row_count = rc,
-                        .screen_y_px = screen_y,
-                        .height_px = h + descender_margin,
-                        .grid_y_offset = @floatFromInt(grid_y),
-                        .exit_code = final_ec,
-                    }) catch {};
+                    {
+                        const rc: u16 = @intCast(row_len - @as(usize, region_start));
+                        const h: i32 = @intCast(@as(u32, rc) * cell_h);
+                        const final_bi = block_indices[region_start];
+                        const final_ec: i32 = if (final_bi < block_exit_codes.len) block_exit_codes[final_bi] else -1;
+                        const final_sy: u32 = if (screen_y_i >= 0) @intCast(screen_y_i) else 0;
+                        self.block_regions.append(self.alloc, .{
+                            .first_row = region_start,
+                            .row_count = rc,
+                            .screen_y_px = final_sy,
+                            .height_px = @intCast(h + @as(i32, @intCast(descender_margin))),
+                            .grid_y_offset = @floatFromInt(grid_y_i),
+                            .exit_code = final_ec,
+                        }) catch {};
+                    }
+
+                    // Step 2: Compute gap_overflow — how many pixels the inter-block
+                    // gaps push content past the viewport bottom. Use content-aware
+                    // bottom: when following the cursor, only count rows up to the
+                    // cursor so empty rows below don't cause premature scrolling.
+                    // This gives a "document" feel — blocks start at the top and
+                    // only scroll when real content fills the viewport.
+                    const gap_overflow: u32 = gap_overflow: {
+                        if (self.block_regions.items.len < 2) break :gap_overflow 0;
+
+                        const content_bottom: u32 = content_bottom: {
+                            if (state.cursor.viewport) |cursor_vp| {
+                                // Cursor is in the viewport — compute the bottom
+                                // of the content based on the cursor's position
+                                // within its block, ignoring empty rows below.
+                                for (self.block_regions.items) |region| {
+                                    const region_end = region.first_row + region.row_count;
+                                    if (cursor_vp.y >= region.first_row and cursor_vp.y < region_end) {
+                                        const rows_in_block: u32 = cursor_vp.y - region.first_row + 1;
+                                        break :content_bottom region.screen_y_px + rows_in_block * cell_h;
+                                    }
+                                }
+                            }
+                            // Cursor not in viewport (scrolled into history) or
+                            // not found — use the full last block extent.
+                            const last = self.block_regions.items[self.block_regions.items.len - 1];
+                            break :content_bottom last.screen_y_px + last.height_px;
+                        };
+                        const viewport_bottom = padding_top + @as(u32, @intCast(row_len)) * cell_h;
+
+                        if (content_bottom > viewport_bottom) {
+                            break :gap_overflow content_bottom - viewport_bottom;
+                        }
+                        break :gap_overflow 0;
+                    };
+
+                    // Step 3: Apply effective_shift = max(0, gap_overflow - scroll_offset).
+                    // - When following (block_scroll_px=0): shift = gap_overflow → cursor visible.
+                    // - When user scrolls up (block_scroll_px increases): shift decreases,
+                    //   revealing content at the top.
+                    // - At block_scroll_px = gap_overflow: shift = 0, first block at top.
+                    const scroll_offset: u32 = if (state.block_scroll_px > 0)
+                        @intCast(state.block_scroll_px)
+                    else
+                        0;
+                    const effective_shift: u32 = if (gap_overflow > scroll_offset)
+                        gap_overflow - scroll_offset
+                    else
+                        0;
+
+                    // Store gap_overflow for scrollbar adjustment.
+                    self.gap_overflow_px = gap_overflow;
+
+                    if (effective_shift > 0) {
+                        for (self.block_regions.items) |*region| {
+                            region.grid_y_offset -= @as(f32, @floatFromInt(effective_shift));
+                            if (effective_shift >= region.screen_y_px + region.height_px) {
+                                // Fully above viewport — zero it out.
+                                region.screen_y_px = 0;
+                                region.height_px = 0;
+                            } else if (effective_shift > region.screen_y_px) {
+                                // Partially above — clip the top.
+                                const clipped = effective_shift - region.screen_y_px;
+                                region.height_px -|= clipped;
+                                region.screen_y_px = 0;
+                            } else {
+                                region.screen_y_px -= effective_shift;
+                            }
+                        }
+                    }
+                } else {
+                    self.gap_overflow_px = 0;
                 }
             }
 

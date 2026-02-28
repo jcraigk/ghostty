@@ -70,6 +70,12 @@ pwd: std.ArrayList(u8),
 /// sequences. Only populated when command-blocks is enabled.
 block_list: ?Block.BlockList = null,
 
+/// Per-pixel scroll offset for command-blocks mode. When non-null,
+/// this is the number of pixels the viewport content is shifted up.
+/// The renderer applies this as a uniform Y offset to all block regions.
+/// Null means "follow the active area" (no scroll offset).
+block_scroll_px: ?i32 = null,
+
 /// The color state for this terminal.
 colors: Colors,
 
@@ -1736,17 +1742,85 @@ pub const ScrollViewport = union(enum) {
     /// Scroll to the bottom, i.e. the top of the active area
     bottom,
 
-    /// Scroll by some delta amount, up is negative.
+    /// Scroll by some delta amount in rows, up is negative.
     delta: isize,
+
+    /// Scroll by some delta amount in pixels, up is negative.
+    delta_px: isize,
 };
 
-/// Scroll the viewport of the terminal grid.
+/// Scroll the viewport of the terminal grid. When block_list is active,
+/// pixel deltas are tracked for smooth per-pixel scrolling.
 pub fn scrollViewport(self: *Terminal, behavior: ScrollViewport) void {
-    self.screens.active.scroll(switch (behavior) {
-        .top => .{ .top = {} },
-        .bottom => .{ .active = {} },
-        .delta => |delta| .{ .delta_row = delta },
-    });
+    switch (behavior) {
+        .top => {
+            self.block_scroll_px = null;
+            self.screens.active.scroll(.{ .top = {} });
+        },
+        .bottom => {
+            self.block_scroll_px = null;
+            self.screens.active.scroll(.{ .active = {} });
+        },
+        .delta => |delta| {
+            if (self.block_list != null) {
+                const cell_h: isize = if (self.rows > 0 and self.height_px > 0)
+                    @intCast(self.height_px / @as(u32, self.rows))
+                else
+                    16;
+                const px = delta * cell_h;
+                self.applyBlockScrollPx(px);
+            } else {
+                self.screens.active.scroll(.{ .delta_row = delta });
+            }
+        },
+        .delta_px => |px| {
+            if (self.block_list != null) {
+                self.applyBlockScrollPx(px);
+            } else {
+                self.screens.active.scroll(.{ .delta_row = if (px > 0) 1 else -1 });
+            }
+        },
+    }
+}
+
+/// Apply a pixel delta to block_scroll_px and sync the PageList viewport.
+/// delta_px follows terminal convention: negative = scroll up (towards older),
+/// positive = scroll down (towards newer). block_scroll_px tracks how far
+/// we've scrolled up from the bottom (0 = following, positive = scrolled up).
+fn applyBlockScrollPx(self: *Terminal, delta_px: isize) void {
+    const current: i64 = self.block_scroll_px orelse 0;
+    // Negate: scroll-up (negative delta) increases the offset from bottom.
+    const new_i64: i64 = current - @as(i64, delta_px);
+
+    // Cap: we use a generous upper bound here. The renderer's gap_overflow
+    // and effective_shift handle the visual bounds — when block_scroll_px
+    // exceeds gap_overflow, effective_shift is simply 0 (first block at top).
+    // The PageList handles its own row-level scroll bounds internally.
+    // We just need to prevent i32 overflow.
+    const max_scroll: i64 = std.math.maxInt(i32);
+    const new_val: i32 = @intCast(std.math.clamp(new_i64, 0, max_scroll));
+
+    if (new_val <= 0) {
+        self.block_scroll_px = null;
+        self.screens.active.scroll(.{ .active = {} });
+        return;
+    }
+
+    const cell_h: i32 = blk: {
+        if (self.rows > 0 and self.height_px > 0) {
+            break :blk @intCast(self.height_px / @as(u32, self.rows));
+        }
+        break :blk 16;
+    };
+    const old_rows = @divTrunc(@as(i32, @intCast(current)), cell_h);
+    const new_rows = @divTrunc(new_val, cell_h);
+    const row_delta: isize = @as(isize, old_rows) - @as(isize, new_rows);
+
+    self.block_scroll_px = new_val;
+
+    if (row_delta != 0) {
+        self.screens.active.scroll(.{ .delta_row = row_delta });
+    }
 }
 
 /// To be called before shifting a row (as in insertLines and deleteLines)

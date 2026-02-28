@@ -96,6 +96,10 @@ pub const RenderState = struct {
     /// Values: 0 = success, positive = error, -1 = still running / unknown.
     block_exit_codes: []i32 = &.{},
 
+    /// Pixel scroll offset for block mode. Positive = content shifted up.
+    /// The renderer applies this as a uniform Y offset to all block regions.
+    block_scroll_px: i32 = 0,
+
     /// The cached selection so we can avoid expensive selection calculations
     /// if possible.
     selection_cache: ?SelectionCache = null,
@@ -611,6 +615,9 @@ pub const RenderState = struct {
                 }
             }
         }
+
+        // Pass per-pixel scroll offset for block mode.
+        self.block_scroll_px = t.block_scroll_px orelse 0;
 
         // If our screen has a selection, then mark the rows with the
         // selection. We do this outside of the loop above because its unlikely

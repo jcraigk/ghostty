@@ -3381,6 +3381,33 @@ pub fn scrollCallback(
     // Always show the mouse again if it is hidden
     if (self.mouse.hidden) self.showMouse();
 
+    // Block-mode precision scrolling: pass pixel offsets directly
+    // without row quantization. Must happen BEFORE the row-based Y
+    // computation to avoid double-consuming pending_scroll_y.
+    if (yoff != 0 and scroll_mods.precision) {
+        const yoff_px: f64 = yoff * self.config.mouse_scroll_multiplier.precision;
+        const poff: f64 = self.mouse.pending_scroll_y + yoff_px;
+        var handled = false;
+        {
+            self.renderer_state.mutex.lock();
+            defer self.renderer_state.mutex.unlock();
+            if (self.io.terminal.block_list != null and !self.isMouseReporting()) {
+                if (@abs(poff) >= 1.0) {
+                    const delta_px: isize = @intFromFloat(@trunc(poff));
+                    self.mouse.pending_scroll_y = poff - @as(f64, @floatFromInt(delta_px));
+                    self.io.terminal.scrollViewport(.{ .delta_px = -delta_px });
+                } else {
+                    self.mouse.pending_scroll_y = poff;
+                }
+                handled = true;
+            }
+        }
+        if (handled) {
+            try self.queueRender();
+            return;
+        }
+    }
+
     const y: ScrollAmount = if (yoff == 0) .{} else y: {
         // We use cell_size to determine if we have accumulated enough to trigger a scroll
         const cell_size: f64 = @floatFromInt(self.size.cell.height);
