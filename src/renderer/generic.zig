@@ -2569,6 +2569,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const gap_px = footer_px + sep_px + header_px;
                     const padding_top = self.size.padding.top;
                     const descender_margin = cell_h / 4;
+                    // Total gap includes descender margin so visuals are symmetric.
+                    const total_gap = gap_px + descender_margin;
 
                     var region_start: u16 = 0;
                     var screen_y: u32 = padding_top;
@@ -2587,8 +2589,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                 .height_px = h + descender_margin,
                                 .grid_y_offset = @floatFromInt(grid_y),
                             }) catch {};
-                            screen_y += h + gap_px;
-                            grid_y += h + gap_px;
+                            screen_y += h + total_gap;
+                            grid_y += h + total_gap;
                             region_start = yi;
                         }
                     }

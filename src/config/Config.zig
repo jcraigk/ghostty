@@ -2845,12 +2845,12 @@ keybind: Keybinds = .{},
 /// Padding in points above the separator line between command blocks
 /// (below the last output line of the previous block). Only applies
 /// when `command-blocks` is enabled.
-@"command-blocks-padding-footer": u16 = 8,
+@"command-blocks-padding-footer": u16 = 25,
 
 /// Padding in points below the separator line between command blocks
 /// (above the prompt of the next block). Only applies when
 /// `command-blocks` is enabled.
-@"command-blocks-padding-header": u16 = 8,
+@"command-blocks-padding-header": u16 = 25,
 
 /// Custom entries into the command palette.
 ///
