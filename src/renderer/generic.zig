@@ -1670,17 +1670,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 );
 
                 // Draw cell backgrounds and text.
-                // TODO: Per-block scissored rendering requires per-block
-                // shader uniforms (block_y_offset, block_first_row) to
-                // remap grid coordinates within each scissored region.
-                // For now, render as a single draw call. The block_regions
-                // and scissor rect infrastructure are ready for when
-                // per-block uniforms are implemented.
+                // Per-block scissored rendering with block_params is ready
+                // in the infrastructure but requires cell buffer splitting
+                // (sorting fg cells by block and using instance_offset per
+                // draw call) to avoid rendering all cells in every block's
+                // draw call. Until then, single draw call mode.
+                const padding_top: f32 = @floatFromInt(self.size.padding.top);
+                const default_bp: @TypeOf(pass).Step.BlockParams = .{
+                    .block_y_offset = padding_top,
+                    .block_first_row = 0,
+                };
+
                 pass.step(.{
                     .pipeline = self.shaders.pipelines.cell_bg,
                     .uniforms = frame.uniforms.buffer,
                     .buffers = &.{ null, frame.cells_bg.buffer },
                     .draw = .{ .type = .triangle, .vertex_count = 3 },
+                    .block_params = default_bp,
                 });
 
                 pass.step(.{
@@ -1699,6 +1705,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         .vertex_count = 4,
                         .instance_count = fg_count,
                     },
+                    .block_params = default_bp,
                 });
 
                 // Kitty images between cell backgrounds and text.

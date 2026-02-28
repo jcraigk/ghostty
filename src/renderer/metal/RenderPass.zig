@@ -44,6 +44,13 @@ pub const Step = struct {
     draw: Draw,
     /// Optional scissor rect to clip rendering to a subregion.
     scissor: ?ScissorRect = null,
+    /// Optional per-draw block parameters for command block rendering.
+    block_params: ?BlockParams = null,
+
+    pub const BlockParams = extern struct {
+        block_y_offset: f32,
+        block_first_row: f32,
+    };
 
     pub const ScissorRect = struct {
         x: u32,
@@ -235,6 +242,20 @@ pub fn step(self: *const Self, s: Step) void {
                 .width = sc.width,
                 .height = sc.height,
             }},
+        );
+    }
+
+    // Set per-block parameters via inline bytes at buffer index 3.
+    if (s.block_params) |bp| {
+        self.encoder.msgSend(
+            void,
+            objc.sel("setVertexBytes:length:atIndex:"),
+            .{ @as(*const anyopaque, @ptrCast(&bp)), @as(c_ulong, @sizeOf(Step.BlockParams)), @as(c_ulong, 3) },
+        );
+        self.encoder.msgSend(
+            void,
+            objc.sel("setFragmentBytes:length:atIndex:"),
+            .{ @as(*const anyopaque, @ptrCast(&bp)), @as(c_ulong, @sizeOf(Step.BlockParams)), @as(c_ulong, 3) },
         );
     }
 

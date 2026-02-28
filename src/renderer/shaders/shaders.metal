@@ -443,6 +443,11 @@ fragment float4 bg_image_fragment(
   return rgba;
 }
 
+struct BlockParams {
+  float block_y_offset;
+  float block_first_row;
+};
+
 //-------------------------------------------------------------------
 // Cell Background Shader
 //-------------------------------------------------------------------
@@ -451,9 +456,15 @@ fragment float4 bg_image_fragment(
 fragment float4 cell_bg_fragment(
   FullScreenVertexOut in [[stage_in]],
   constant Uniforms& uniforms [[buffer(1)]],
-  constant uchar4 *cells [[buffer(2)]]
+  constant uchar4 *cells [[buffer(2)]],
+  constant BlockParams& block_params [[buffer(3)]]
 ) {
-  int2 grid_pos = int2(floor((in.position.xy - uniforms.grid_padding.wx) / uniforms.cell_size));
+  // Compute grid position. When block rendering is active,
+  // use block_y_offset as the Y origin and offset the row index
+  // by block_first_row to index into the correct bg_cells.
+  float2 origin = float2(uniforms.grid_padding.w, block_params.block_y_offset);
+  int2 grid_pos = int2(floor((in.position.xy - origin) / uniforms.cell_size));
+  grid_pos.y += int(block_params.block_first_row);
 
   float4 bg = float4(0.0);
 
@@ -557,10 +568,14 @@ vertex CellTextVertexOut cell_text_vertex(
   uint vid [[vertex_id]],
   CellTextVertexIn in [[stage_in]],
   constant Uniforms& uniforms [[buffer(1)]],
-  constant uchar4 *bg_colors [[buffer(2)]]
+  constant uchar4 *bg_colors [[buffer(2)]],
+  constant BlockParams& block_params [[buffer(3)]]
 ) {
-  // Convert the grid x, y into world space x, y by accounting for cell size
-  float2 cell_pos = uniforms.cell_size * float2(in.grid_pos);
+  // Convert the grid x, y into world space x, y by accounting for cell size.
+  // When block rendering is active, position relative to block origin.
+  float2 cell_pos;
+  cell_pos.x = uniforms.cell_size.x * float(in.grid_pos.x);
+  cell_pos.y = float(int(in.grid_pos.y) - int(block_params.block_first_row)) * uniforms.cell_size.y + block_params.block_y_offset;
 
   // We use a triangle strip with 4 vertices to render quads,
   // so we determine which corner of the cell this vertex is in
