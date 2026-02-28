@@ -42,6 +42,15 @@ pub const Step = struct {
     /// of a fragment texture, set via setFragmentSamplerState(_:index:).
     samplers: []const ?Sampler = &.{},
     draw: Draw,
+    /// Optional scissor rect to clip rendering to a subregion.
+    scissor: ?ScissorRect = null,
+
+    pub const ScissorRect = struct {
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    };
 
     /// Describes the draw call for this step.
     pub const Draw = struct {
@@ -208,6 +217,26 @@ pub fn step(self: *const Self, s: Step) void {
             .{ sampler.sampler.value, @as(c_ulong, i) },
         );
     };
+
+    // Set scissor rect if specified.
+    if (s.scissor) |sc| {
+        const MTLScissorRect = extern struct {
+            x: c_ulong,
+            y: c_ulong,
+            width: c_ulong,
+            height: c_ulong,
+        };
+        self.encoder.msgSend(
+            void,
+            objc.sel("setScissorRect:"),
+            .{MTLScissorRect{
+                .x = sc.x,
+                .y = sc.y,
+                .width = sc.width,
+                .height = sc.height,
+            }},
+        );
+    }
 
     // Draw!
     self.encoder.msgSend(

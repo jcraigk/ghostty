@@ -41,8 +41,11 @@ pub const VirtualRow = union(enum) {
 /// The block list this layout is derived from.
 block_list: *Block.BlockList,
 
-/// Number of padding rows inserted between blocks.
-padding_rows: u8 = 1,
+/// Padding in pixels above the separator (below the last output line).
+padding_footer_px: u16 = 8,
+
+/// Padding in pixels below the separator (above the next prompt).
+padding_header_px: u16 = 8,
 
 /// Whether to show separator lines between blocks.
 show_separators: bool = true,
@@ -87,7 +90,10 @@ pub fn rebuild(self: *BlockLayout) void {
         return;
     }
 
-    const inter_block_rows: u32 = self.interBlockRows();
+    // Approximate pixel gap as virtual rows for layout calculations.
+    // The renderer will use the actual pixel values directly.
+    const cell_h = if (self.block_list.pages.rows > 0) @as(u32, 16) else @as(u32, 16);
+    const inter_block_rows: u32 = (self.interBlockGapPx() + cell_h - 1) / cell_h;
 
     var cumulative: u32 = 0;
     for (blocks, 0..) |*block, i| {
@@ -141,22 +147,28 @@ pub fn virtualRowAt(self: *BlockLayout, virtual_y: u32) ?VirtualRow {
         } };
     }
 
+    // We're past the content rows, in the inter-block gap.
+    // Layout: [footer padding] [separator] [header padding]
     const past_content = offset_in_block - info.content_rows;
     const blocks = self.block_list.blocks.items;
+    const next_block = if (block_idx + 1 < blocks.len) block_idx + 1 else null;
 
-    if (self.show_separators) {
-        if (past_content == 0) {
-            return .{ .separator = .{ .block_above_index = block_idx } };
-        }
+    // For row-level layout, approximate footer as 1 virtual row if any padding exists.
+    const footer: u32 = if (self.padding_footer_px > 0) 1 else 0;
+    if (past_content < footer) {
         return .{ .padding = .{
             .block_above_index = block_idx,
-            .block_below_index = if (block_idx + 1 < blocks.len) block_idx + 1 else null,
+            .block_below_index = next_block,
         } };
+    }
+
+    if (self.show_separators and past_content == footer) {
+        return .{ .separator = .{ .block_above_index = block_idx } };
     }
 
     return .{ .padding = .{
         .block_above_index = block_idx,
-        .block_below_index = if (block_idx + 1 < blocks.len) block_idx + 1 else null,
+        .block_below_index = next_block,
     } };
 }
 
@@ -253,12 +265,12 @@ pub fn blockIndexAtScreenY(self: *BlockLayout, viewport_start: u32, screen_y: u3
 
 // ── Internal helpers ────────────────────────────────────────────────────
 
-/// Number of virtual rows inserted between two adjacent blocks
-/// (separator + padding).
-fn interBlockRows(self: *const BlockLayout) u32 {
-    var rows: u32 = self.padding_rows;
-    if (self.show_separators) rows += 1;
-    return rows;
+/// Total pixel height of the inter-block gap
+/// (footer padding + separator + header padding).
+fn interBlockGapPx(self: *const BlockLayout) u32 {
+    var px: u32 = @as(u32, self.padding_footer_px) + @as(u32, self.padding_header_px);
+    if (self.show_separators) px += 2; // 2px separator line
+    return px;
 }
 
 /// Count content rows for a block: collapsed blocks use a fixed size,

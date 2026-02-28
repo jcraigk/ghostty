@@ -34,6 +34,15 @@ pub const Step = struct {
     textures: []const ?Texture = &.{},
     samplers: []const ?Sampler = &.{},
     draw: Draw,
+    /// Optional scissor rect to clip rendering to a subregion.
+    scissor: ?ScissorRect = null,
+
+    pub const ScissorRect = struct {
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    };
 
     /// Describes the draw call for this step.
     pub const Draw = struct {
@@ -126,6 +135,18 @@ pub fn step(self: *Self, s: Step) void {
         gl.blendFunc(gl.c.GL_ONE, gl.c.GL_ONE_MINUS_SRC_ALPHA) catch return;
     } else {
         gl.disable(gl.c.GL_BLEND) catch return;
+    }
+
+    if (s.scissor) |sc| {
+        gl.enable(gl.c.GL_SCISSOR_TEST) catch return;
+        gl.c.glScissor(
+            @intCast(sc.x),
+            @intCast(sc.y),
+            @intCast(sc.width),
+            @intCast(sc.height),
+        );
+    } else {
+        gl.disable(gl.c.GL_SCISSOR_TEST) catch return;
     }
 
     gl.drawArraysInstanced(

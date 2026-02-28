@@ -86,6 +86,12 @@ pub const RenderState = struct {
     /// values for comparison.
     viewport_pin: ?PageList.Pin = null,
 
+    /// Per-row block metadata stored as side arrays, indexed by screen Y.
+    /// Only allocated when command_blocks_gap > 0.
+    block_gaps: []BlockGap = &.{},
+    block_indices: []u16 = &.{},
+    command_blocks_gap: u8 = 0,
+
     /// The cached selection so we can avoid expensive selection calculations
     /// if possible.
     selection_cache: ?SelectionCache = null,
@@ -237,6 +243,13 @@ pub const RenderState = struct {
         full,
     };
 
+    pub const BlockGap = enum(u8) {
+        none = 0,
+        footer = 1,
+        separator = 2,
+        header = 3,
+    };
+
     const SelectionCache = struct {
         selection: Selection,
         tl_pin: PageList.Pin,
@@ -253,6 +266,8 @@ pub const RenderState = struct {
             cells.deinit(alloc);
         }
         self.row_data.deinit(alloc);
+        if (self.block_gaps.len > 0) alloc.free(self.block_gaps);
+        if (self.block_indices.len > 0) alloc.free(self.block_indices);
     }
 
     /// Update the render state to the latest terminal state.
@@ -551,6 +566,26 @@ pub const RenderState = struct {
             }
         }
         assert(y == self.rows);
+
+        // Populate block metadata side arrays after the main loop so
+        // the loop itself stays untouched. This scans the already-populated
+        // row_rows to find prompt boundaries.
+        if (self.command_blocks_gap > 0) {
+            if (self.block_gaps.len != self.rows) {
+                if (self.block_gaps.len > 0) alloc.free(self.block_gaps);
+                if (self.block_indices.len > 0) alloc.free(self.block_indices);
+                self.block_gaps = try alloc.alloc(BlockGap, self.rows);
+                self.block_indices = try alloc.alloc(u16, self.rows);
+            }
+            @memset(self.block_gaps, .none);
+            var blk: u16 = 0;
+            var saw_prompt: bool = false;
+            for (row_rows, 0..) |row, yi| {
+                if (row.semantic_prompt == .prompt and saw_prompt) blk += 1;
+                if (row.semantic_prompt == .prompt) saw_prompt = true;
+                self.block_indices[yi] = blk;
+            }
+        }
 
         // If our screen has a selection, then mark the rows with the
         // selection. We do this outside of the loop above because its unlikely

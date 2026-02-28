@@ -231,6 +231,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Our overlay state, if any.
         overlay: ?Overlay = null,
 
+        /// Block regions for per-block scissored rendering.
+        /// Populated in rebuildCells from block_indices.
+        block_regions: std.ArrayListUnmanaged(BlockRegion) = .empty,
+
+        const BlockRegion = struct {
+            first_row: u16,
+            row_count: u16,
+            screen_y_px: u32,
+            height_px: u32,
+        };
+
         const HighlightTag = enum(u8) {
             search_match,
             search_match_selected,
@@ -570,6 +581,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             blending: configpkg.Config.AlphaBlending,
             background_blur: configpkg.Config.BackgroundBlur,
             command_blocks: bool,
+            command_blocks_padding_footer: u16,
+            command_blocks_padding_header: u16,
             scroll_to_bottom_on_output: bool,
 
             pub fn init(
@@ -645,6 +658,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .blending = config.@"alpha-blending",
                     .background_blur = config.@"background-blur",
                     .command_blocks = config.@"command-blocks",
+                    .command_blocks_padding_footer = config.@"command-blocks-padding-footer",
+                    .command_blocks_padding_header = config.@"command-blocks-padding-header",
                     .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
                     .arena = arena,
                 };
@@ -1201,6 +1216,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     state.terminal.scrollViewport(.bottom);
                 }
 
+                // Enable block metadata computation if command-blocks is on.
+                self.terminal_state.command_blocks_gap = if (self.config.command_blocks) 1 else 0;
+
                 // Update our terminal state
                 try self.terminal_state.update(self.alloc, state.terminal);
 
@@ -1651,7 +1669,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .kitty_below_bg,
                 );
 
-                // Then we draw any opaque cell backgrounds.
+                // Draw cell backgrounds and text.
+                // TODO: Per-block scissored rendering requires per-block
+                // shader uniforms (block_y_offset, block_first_row) to
+                // remap grid coordinates within each scissored region.
+                // For now, render as a single draw call. The block_regions
+                // and scissor rect infrastructure are ready for when
+                // per-block uniforms are implemented.
                 pass.step(.{
                     .pipeline = self.shaders.pipelines.cell_bg,
                     .uniforms = frame.uniforms.buffer,
@@ -1659,15 +1683,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .draw = .{ .type = .triangle, .vertex_count = 3 },
                 });
 
-                // Kitty images between cell backgrounds and text.
-                self.images.draw(
-                    &self.api,
-                    self.shaders.pipelines.image,
-                    &pass,
-                    .kitty_below_text,
-                );
-
-                // Text.
                 pass.step(.{
                     .pipeline = self.shaders.pipelines.cell_text,
                     .uniforms = frame.uniforms.buffer,
@@ -1685,6 +1700,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         .instance_count = fg_count,
                     },
                 });
+
+                // Kitty images between cell backgrounds and text.
+                self.images.draw(
+                    &self.api,
+                    self.shaders.pipelines.image,
+                    &pass,
+                    .kitty_below_text,
+                );
 
                 // Kitty images in front of text.
                 self.images.draw(
@@ -2392,6 +2415,47 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 state.rows,
                 self.cells.size.rows,
             );
+
+            // Compute block regions for per-block scissored rendering.
+            {
+                self.block_regions.clearRetainingCapacity();
+                const block_indices = state.block_indices;
+                if (block_indices.len > 0 and self.config.command_blocks) {
+                    const cell_h = self.grid_metrics.cell_height;
+                    const footer_px: u32 = self.config.command_blocks_padding_footer;
+                    const header_px: u32 = self.config.command_blocks_padding_header;
+                    const sep_px: u32 = 2;
+                    const gap_px = footer_px + sep_px + header_px;
+                    const padding_top = self.size.padding.top;
+
+                    var region_start: u16 = 0;
+                    var screen_y: u32 = padding_top;
+                    var yi: u16 = 0;
+                    while (yi < row_len) : (yi += 1) {
+                        if (yi > 0 and yi < block_indices.len and
+                            block_indices[yi] != block_indices[yi - 1])
+                        {
+                            const rc: u16 = yi - region_start;
+                            self.block_regions.append(self.alloc, .{
+                                .first_row = region_start,
+                                .row_count = rc,
+                                .screen_y_px = screen_y,
+                                .height_px = @as(u32, rc) * cell_h,
+                            }) catch {};
+                            screen_y += @as(u32, rc) * cell_h + gap_px;
+                            region_start = yi;
+                        }
+                    }
+                    // Final block
+                    const rc: u16 = @intCast(row_len - @as(usize, region_start));
+                    self.block_regions.append(self.alloc, .{
+                        .first_row = region_start,
+                        .row_count = rc,
+                        .screen_y_px = screen_y,
+                        .height_px = @as(u32, rc) * cell_h,
+                    }) catch {};
+                }
+            }
 
             // Determine our x/y range for preedit. We don't want to render anything
             // here because we will render the preedit separately.

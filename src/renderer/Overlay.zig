@@ -301,43 +301,44 @@ fn highlightSemanticPrompts(
     }
 }
 
-/// Draw horizontal separator lines above prompt rows to visually
-/// separate command blocks.
+/// Draw thin separator lines between command blocks. Padding is handled
+/// by the GPU per-row Y offset buffer; this overlay just draws the
+/// 2px separator line in the gap.
 fn drawCommandBlockSeparators(
     self: *Overlay,
     alloc: Allocator,
     state: *const terminal.RenderState,
 ) void {
-    const row_slice = state.row_data.slice();
-    const row_raw = row_slice.items(.raw);
+    const block_indices = state.block_indices;
+    if (block_indices.len == 0) return;
 
-    const sep_color = Color.block_separator.alphaPixel(160);
-    const line_height_px: usize = 2;
-
-    // Width of the terminal in pixels.
+    const sep_color = Color.block_separator.alphaPixel(200);
+    const sep_height_px: usize = 2;
     const width_px: usize = self.cell_size.width * state.cols;
 
-    for (row_raw, 0..) |row, y| {
-        if (row.semantic_prompt != .prompt) continue;
-        // Don't draw a separator above the very first row.
-        if (y == 0) continue;
+    for (1..@min(block_indices.len, state.rows)) |y| {
+        if (block_indices[y] == block_indices[y - 1]) continue;
 
-        // Draw a thin horizontal line at the top of this row.
+        // The separator line sits in the gap created by the GPU Y offset.
+        // The gap is positioned just above this row's shifted position.
+        // The overlay draws at the original grid position, but the text
+        // is shifted down. The line goes at the original grid Y of this
+        // row (which is now in the gap space).
         const px_y = y * self.cell_size.height;
 
         var ctx: z2d.Context = .init(alloc, &self.surface);
         defer ctx.deinit();
         ctx.setAntiAliasingMode(.none);
 
-        const start_x: f64 = 0;
-        const end_x: f64 = @floatFromInt(width_px);
-        const start_y: f64 = @floatFromInt(px_y);
-        const end_y: f64 = @floatFromInt(px_y + line_height_px);
+        const sx: f64 = 0;
+        const ex: f64 = @floatFromInt(width_px);
+        const sy: f64 = @floatFromInt(px_y);
+        const ey: f64 = @floatFromInt(px_y + sep_height_px);
 
-        ctx.moveTo(start_x, start_y) catch return;
-        ctx.lineTo(end_x, start_y) catch return;
-        ctx.lineTo(end_x, end_y) catch return;
-        ctx.lineTo(start_x, end_y) catch return;
+        ctx.moveTo(sx, sy) catch return;
+        ctx.lineTo(ex, sy) catch return;
+        ctx.lineTo(ex, ey) catch return;
+        ctx.lineTo(sx, ey) catch return;
         ctx.closePath() catch return;
 
         ctx.setSourceToPixel(sep_color);

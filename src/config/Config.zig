@@ -2842,6 +2842,16 @@ keybind: Keybinds = .{},
 /// Default is `false`.
 @"command-blocks": bool = false,
 
+/// Padding in points above the separator line between command blocks
+/// (below the last output line of the previous block). Only applies
+/// when `command-blocks` is enabled.
+@"command-blocks-padding-footer": u16 = 8,
+
+/// Padding in points below the separator line between command blocks
+/// (above the prompt of the next block). Only applies when
+/// `command-blocks` is enabled.
+@"command-blocks-padding-header": u16 = 8,
+
 /// Custom entries into the command palette.
 ///
 /// Each entry requires the title, the corresponding action, and an optional
@@ -4631,6 +4641,12 @@ pub fn finalize(self: *Config) !void {
     // Minimum window size
     if (self.@"window-width" > 0) self.@"window-width" = @max(10, self.@"window-width");
     if (self.@"window-height" > 0) self.@"window-height" = @max(4, self.@"window-height");
+
+    // Command blocks: force zero horizontal padding so block separators
+    // extend edge-to-edge.
+    if (self.@"command-blocks") {
+        self.@"window-padding-x" = .{ .top_left = 0, .bottom_right = 0 };
+    }
 
     // If URLs are disabled, cut off the first link. The first link is
     // always the URL matcher.
