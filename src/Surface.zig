@@ -5779,6 +5779,37 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 return true;
             }
 
+            // No active selection — if a block is highlighted, copy
+            // the entire block (prompt + input + output) as if the
+            // user had manually selected all the text in it.
+            if (self.io.terminal.highlighted_block_idx) |hl_idx| {
+                if (self.io.terminal.block_list) |bl| {
+                    if (hl_idx < bl.blocks.items.len) {
+                        const block = bl.blocks.items[hl_idx];
+                        const start_pin: terminal.PageList.Pin = pin: {
+                            var p = block.prompt_start.*;
+                            p.x = 0;
+                            break :pin p;
+                        };
+                        // end points to the first row of the NEXT block;
+                        // we want the last row of THIS block, so go up 1.
+                        const end_pin: terminal.PageList.Pin = pin: {
+                            const e = block.end orelse break :pin start_pin;
+                            var p = e.up(1) orelse e.*;
+                            p.x = self.io.terminal.screens.active.pages.cols - 1;
+                            break :pin p;
+                        };
+                        const sel = terminal.Selection.init(start_pin, end_pin, false);
+                        try self.copySelectionToClipboards(
+                            sel,
+                            &.{.standard},
+                            format,
+                        );
+                        return true;
+                    }
+                }
+            }
+
             return false;
         },
 
