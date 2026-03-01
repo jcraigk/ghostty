@@ -2865,7 +2865,7 @@ keybind: Keybinds = .{},
 /// Width in points of the status stripe on the left edge of each command
 /// block. The stripe color indicates exit status. Set to 0 to disable.
 /// Must be less than `command-blocks-padding-left`.
-@"command-blocks-stripe-width": u16 = 4,
+@"command-blocks-stripe-width": u16 = 9,
 
 /// Color of the separator line drawn between command blocks. Only applies
 /// when `command-blocks` is enabled.

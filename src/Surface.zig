@@ -1157,7 +1157,6 @@ fn selectionScrollTick(self: *Surface) !void {
     if (self.mouse.left_click_count == 0) return;
 
     const pos = try self.rt_surface.getCursorPos();
-    const pos_vp = self.posToViewport(pos.x, pos.y);
     const delta: isize = if (pos.y < 0) -1 else 1;
 
     // We need our locked state for the remainder
@@ -1177,6 +1176,9 @@ fn selectionScrollTick(self: *Surface) !void {
 
     // Scroll the viewport as required
     t.scrollViewport(.{ .delta = delta });
+
+    // Compute viewport position with block-gap-adjusted Y (mutex is held).
+    const pos_vp = self.posToViewport(pos.x, self.blockAdjustedY(pos.y));
 
     // Next, trigger our drag behavior
     const pin = t.screens.active.pages.pin(.{
@@ -4069,8 +4071,9 @@ pub fn mouseButtonCallback(
         const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
 
         const pos = try self.rt_surface.getCursorPos();
+        const adjusted_y = self.blockAdjustedY(pos.y);
         const pin = pin: {
-            const pt_viewport = self.posToViewport(pos.x, pos.y);
+            const pt_viewport = self.posToViewport(pos.x, adjusted_y);
             const pin = screen.pages.pin(.{
                 .viewport = .{
                     .x = pt_viewport.x,
@@ -4468,9 +4471,9 @@ fn maybePromptClick(self: *Surface) !bool {
     // our mouse state at the time of writing this doesn't support that.
     if (screen.selection != null) return false;
 
-    // Get the pin for our mouse click.
+    // Get the pin for our mouse click, using gap-adjusted Y for blocks.
     const pos = try self.rt_surface.getCursorPos();
-    const pos_vp = self.posToViewport(pos.x, pos.y);
+    const pos_vp = self.posToViewport(pos.x, self.blockAdjustedY(pos.y));
     const click_pin: terminal.Pin = pin: {
         const pin = screen.pages.pin(.{
             .viewport = .{
@@ -4573,10 +4576,10 @@ fn linkAtPos(
     self: *Surface,
     pos: apprt.CursorPos,
 ) !?Link {
-    // Convert our cursor position to a screen point.
+    // Convert our cursor position to a screen point, adjusting for block gaps.
     const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
     const mouse_pin: terminal.Pin = mouse_pin: {
-        const point = self.posToViewport(pos.x, pos.y);
+        const point = self.posToViewport(pos.x, self.blockAdjustedY(pos.y));
         const pin = screen.pages.pin(.{ .viewport = point }) orelse {
             log.warn("failed to get pin for clicked point", .{});
             return null;
@@ -5074,12 +5077,13 @@ pub fn cursorPosCallback(
             );
         }
 
-        // Convert to points
+        // Convert to points, using block-gap-adjusted Y for correct row mapping.
+        const adjusted_vp = self.posToViewport(pos.x, self.blockAdjustedY(pos.y));
         const screen: *terminal.Screen = t.screens.active;
         const pin = screen.pages.pin(.{
             .viewport = .{
-                .x = pos_vp.x,
-                .y = pos_vp.y,
+                .x = adjusted_vp.x,
+                .y = adjusted_vp.y,
             },
         }) orelse {
             if (comptime std.debug.runtime_safety) unreachable;
@@ -5360,6 +5364,135 @@ pub fn posToViewport(self: Surface, xpos: f64, ypos: f64) terminal.point.Coordin
     const coord: rendererpkg.Coordinate = .{ .surface = .{ .x = xpos, .y = ypos } };
     const grid = coord.convert(.grid, self.size).grid;
     return .{ .x = grid.x, .y = grid.y };
+}
+
+/// Adjust a raw pixel Y position to remove inter-block gap pixels, so that
+/// the resulting Y can be used with posToViewport to get the correct grid row
+/// even in command-block mode. Returns the adjusted Y.
+///
+/// Precondition: the renderer_state mutex must be held.
+fn blockAdjustedY(self: *const Surface, raw_y: f64) f64 {
+    const t: *terminal.Terminal = self.renderer_state.terminal;
+    if (t.block_list == null) return raw_y;
+
+    const gap_px = t.command_blocks_gap;
+    if (gap_px == 0) return raw_y;
+
+    const cell_h: u32 = self.size.cell.height;
+    if (cell_h == 0) return raw_y;
+
+    const padding_top: u32 = self.size.padding.top;
+    const screen: *terminal.Screen = t.screens.active;
+    const viewport_rows: u32 = @intCast(screen.pages.rows);
+
+    // Build viewport block boundaries by scanning rows for
+    // semantic_prompt == .prompt, mirroring render.zig logic.
+    const max_vp_blocks = 64;
+    var block_first_rows: [max_vp_blocks]u32 = undefined;
+    var num_vp_blocks: u32 = 1;
+    block_first_rows[0] = 0;
+
+    var row_it = screen.pages.rowIterator(
+        .right_down,
+        .{ .viewport = .{} },
+        null,
+    );
+    var ri: u32 = 0;
+    _ = row_it.next(); // skip row 0
+    ri = 1;
+    while (row_it.next()) |rp| : (ri += 1) {
+        const rac = rp.rowAndCell();
+        if (rac.row.semantic_prompt == .prompt and ri > 0) {
+            if (num_vp_blocks < max_vp_blocks) {
+                block_first_rows[num_vp_blocks] = ri;
+                num_vp_blocks += 1;
+            }
+        }
+    }
+
+    if (num_vp_blocks < 2) return raw_y;
+
+    // Cursor-aware gap_overflow, matching render.zig logic.
+    const cursor_vp_y: ?u32 = cvp: {
+        if (screen.viewportIsBottom()) {
+            break :cvp @intCast(screen.cursor.y);
+        }
+        if (screen.pages.pointFromPin(
+            .viewport,
+            screen.cursor.page_pin.*,
+        )) |cp| {
+            break :cvp @intCast(cp.viewport.y);
+        }
+        break :cvp null;
+    };
+
+    const content_bottom: u32 = cb: {
+        if (cursor_vp_y) |cvy| {
+            for (0..num_vp_blocks) |bi| {
+                const bstart = block_first_rows[bi];
+                const bend = if (bi + 1 < num_vp_blocks)
+                    block_first_rows[bi + 1]
+                else
+                    viewport_rows;
+                if (cvy >= bstart and cvy < bend) {
+                    const rows_in = cvy - bstart + 1;
+                    break :cb bstart * cell_h + @as(u32, @intCast(bi)) * gap_px + rows_in * cell_h;
+                }
+            }
+        }
+        const last_start = block_first_rows[num_vp_blocks - 1];
+        const last_rows = viewport_rows - last_start;
+        break :cb last_start * cell_h + (num_vp_blocks - 1) * gap_px + last_rows * cell_h;
+    };
+
+    const viewport_pixel_h = viewport_rows * cell_h;
+    const gap_overflow: u32 = if (content_bottom > viewport_pixel_h)
+        content_bottom - viewport_pixel_h
+    else
+        0;
+    const scroll_px: u32 = if (t.block_scroll_px) |sp|
+        if (sp > 0) @intCast(sp) else 0
+    else
+        0;
+    const effective_shift: u32 = if (gap_overflow > scroll_px)
+        gap_overflow - scroll_px
+    else
+        0;
+
+    // Convert raw pixel Y to content-relative coordinate (subtract padding,
+    // add effective_shift to get unshifted position).
+    const content_y_f: f64 = raw_y - @as(f64, @floatFromInt(padding_top));
+    if (content_y_f < 0) return raw_y;
+    const content_y: u32 = @as(u32, @intFromFloat(content_y_f)) + effective_shift;
+
+    // Walk blocks to find how many gap pixels are before content_y,
+    // and compute the gap-free grid Y.
+    var accumulated_gap: u32 = 0;
+    for (1..num_vp_blocks) |bi| {
+        const bstart = block_first_rows[bi];
+        const block_visual_start = bstart * cell_h + @as(u32, @intCast(bi)) * gap_px;
+        // If the click is before this block's visual start, it might be in a gap.
+        // The gap region is [block_visual_start - gap_px, block_visual_start).
+        const gap_start = block_visual_start - gap_px;
+        if (content_y < gap_start) {
+            // Click is before this gap; done accumulating.
+            break;
+        } else if (content_y < block_visual_start) {
+            // Click is inside the gap — clamp to the end of the previous block.
+            accumulated_gap += content_y - gap_start;
+            break;
+        } else {
+            // Click is past this gap entirely.
+            accumulated_gap += gap_px;
+        }
+    }
+
+    // The correct grid row for this screen pixel is:
+    //   grid_row = (content_y + effective_shift - accumulated_gap) / cell_h
+    // posToViewport computes: (adjusted_y - padding_top) / cell_h
+    // So: adjusted_y = raw_y + effective_shift - accumulated_gap
+    const adj_f: f64 = raw_y + @as(f64, @floatFromInt(effective_shift)) - @as(f64, @floatFromInt(accumulated_gap));
+    return @max(adj_f, @as(f64, @floatFromInt(padding_top)));
 }
 
 /// Scroll to the bottom of the viewport.

@@ -258,18 +258,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Map a block exit code to an RGBA stripe color.
         fn stripeColor(exit_code: i32) [4]u8 {
             return switch (exit_code) {
-                0 => .{ 95, 175, 95, 255 },
+                0 => .{ 78, 153, 78, 228 },
                 -1 => .{ 0, 0, 0, 0 },
-                else => .{ 255, 95, 95, 255 },
+                128...255 => .{ 180, 150, 50, 228 },
+                else => .{ 190, 65, 65, 228 },
             };
         }
 
-        /// Blend a cell bg color with a visible red tint for error blocks.
+        /// Blend a cell bg color with a subtle red tint for error blocks.
         fn blendErrorTint(bg: [4]u8) [4]u8 {
-            const tint_r: u16 = 45;
+            const tint_r: u16 = 40;
             const tint_g: u16 = 6;
             const tint_b: u16 = 6;
-            const factor: u16 = 180; // out of 256
+            const factor: u16 = 80; // out of 256
             const inv: u16 = 256 - factor;
             return .{
                 @intCast((@as(u16, bg[0]) * inv + tint_r * factor) >> 8),
@@ -282,9 +283,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Blend a cell bg color with a subtle green tint for success blocks.
         fn blendSuccessTint(bg: [4]u8) [4]u8 {
             const tint_r: u16 = 6;
-            const tint_g: u16 = 25;
+            const tint_g: u16 = 22;
             const tint_b: u16 = 6;
-            const factor: u16 = 100; // out of 256
+            const factor: u16 = 50; // out of 256
+            const inv: u16 = 256 - factor;
+            return .{
+                @intCast((@as(u16, bg[0]) * inv + tint_r * factor) >> 8),
+                @intCast((@as(u16, bg[1]) * inv + tint_g * factor) >> 8),
+                @intCast((@as(u16, bg[2]) * inv + tint_b * factor) >> 8),
+                if (bg[3] == 0) 255 else bg[3],
+            };
+        }
+
+        /// Blend a cell bg color with a subtle yellow tint for signal-killed blocks.
+        fn blendSignalTint(bg: [4]u8) [4]u8 {
+            const tint_r: u16 = 35;
+            const tint_g: u16 = 28;
+            const tint_b: u16 = 6;
+            const factor: u16 = 60; // out of 256
             const inv: u16 = 256 - factor;
             return .{
                 @intCast((@as(u16, bg[0]) * inv + tint_r * factor) >> 8),
@@ -3063,6 +3079,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         false;
                     const tc: [4]u8 = if (is_highlighted)
                         blendHighlightTint(bg_rgba)
+                    else if (ec >= 128 and ec <= 255)
+                        blendSignalTint(bg_rgba)
                     else if (ec > 0)
                         blendErrorTint(bg_rgba)
                     else if (ec == 0)
