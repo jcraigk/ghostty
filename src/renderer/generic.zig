@@ -1802,16 +1802,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     else
                         0;
 
+                    const cell_h_draw = self.grid_metrics.cell_height;
                     for (self.block_regions.items, 0..) |region, ri| {
                         const bp: @TypeOf(pass).Step.BlockParams = .{
                             .block_y_offset = region.grid_y_offset,
                             .block_first_row = @floatFromInt(region.first_row),
                         };
+                        // Content scissor uses row_count * cell_h (no descender
+                        // margin). The full height_px includes descender_margin
+                        // which extends into the next grid row — for the last
+                        // block that would be a scratch row filled with grey,
+                        // causing a visible grey line.
+                        const content_h: u32 = @as(u32, region.row_count) * cell_h_draw;
                         const scissor: @TypeOf(pass).Step.ScissorRect = .{
                             .x = 0,
                             .y = region.screen_y_px,
                             .width = self.size.screen.width,
-                            .height = region.height_px,
+                            .height = content_h,
                         };
 
                         // Compute visual block extent (header padding to footer padding).
@@ -1835,7 +1842,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             break :blk gap_mid;
                         } else self.size.screen.height;
 
-                        // Block tint: full-block background layer drawn BEFORE content.
+                        // Block tint: background layer spanning the full visual block
+                        // extent (vis_top to vis_bottom), matching the stripe coverage.
+                        // This fills the area between separator lines with the tint,
+                        // including footer/header padding within the block's visual
+                        // boundary.
                         if (region.exit_code >= 0 and num_blocks > 0 and vis_bottom > vis_top) {
                             const block_idx = ts.block_indices[region.first_row];
                             const tint_base: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(num_blocks));
@@ -2734,6 +2745,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 try self.cells.resize(self.alloc, new_size);
 
                 // grid_size tells the shader the valid cell range.
+                // This includes scratch rows because the shader needs to
+                // reference them for separator, stripe, and tint rendering.
                 self.uniforms.grid_size = .{ new_size.columns, new_size.rows };
             }
 
@@ -2758,12 +2771,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     },
                 }
 
-                // Command blocks always extend padding so separators,
-                // stripes, and error tints reach the screen edges.
+                // Command blocks: extend left/right so separators, stripes,
+                // and tints reach the screen edges horizontally. Explicitly
+                // disable up/down because scratch rows beyond the viewport
+                // (separator grey, stripe/tint colors) would bleed into the
+                // vertical padding area via extension.
                 if (self.config.command_blocks) {
                     self.uniforms.padding_extend = .{
-                        .up = true,
-                        .down = true,
+                        .up = false,
+                        .down = false,
                         .left = true,
                         .right = true,
                     };
@@ -3023,11 +3039,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     }
 
                     // Tint scratch row (full-width block bg tint).
+                    // Blend against the actual terminal background color so
+                    // the tint is visible on both light and dark themes.
                     const tint_row: usize = sep_row + 1 + num_blocks + bi;
+                    const bg = state.colors.background;
+                    const bg_rgba: [4]u8 = .{ bg.r, bg.g, bg.b, 255 };
                     const tc: [4]u8 = if (ec > 0)
-                        blendErrorTint(.{ 0, 0, 0, 255 })
+                        blendErrorTint(bg_rgba)
                     else if (ec == 0)
-                        blendSuccessTint(.{ 0, 0, 0, 255 })
+                        blendSuccessTint(bg_rgba)
                     else
                         .{ 0, 0, 0, 0 };
                     var tcx: usize = 0;

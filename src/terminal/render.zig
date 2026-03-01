@@ -588,10 +588,16 @@ pub const RenderState = struct {
             }
             @memset(self.block_gaps, .none);
             var blk: u16 = 0;
-            var saw_prompt: bool = false;
             for (row_rows, 0..) |row, yi| {
-                if (row.semantic_prompt == .prompt and saw_prompt) blk += 1;
-                if (row.semantic_prompt == .prompt) saw_prompt = true;
+                // Every primary prompt row (not continuation) after the first
+                // viewport row starts a new block. This handles:
+                // - Consecutive prompts (empty enters): each .prompt = new block
+                // - Output→prompt: new block after command output
+                // - First prompt scrolled off: output rows at top stay block 0,
+                //   next .prompt row starts block 1
+                // Multi-line prompts use .prompt_continuation for wrapped lines,
+                // so only the primary .prompt triggers a boundary.
+                if (row.semantic_prompt == .prompt and yi > 0) blk += 1;
                 self.block_indices[yi] = blk;
             }
 
