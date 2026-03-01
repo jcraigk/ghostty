@@ -76,6 +76,17 @@ block_list: ?Block.BlockList = null,
 /// Null means "follow the active area" (no scroll offset).
 block_scroll_px: ?i32 = null,
 
+/// Index into block_list.blocks of the currently highlighted block, or
+/// null if no block is highlighted. Only one block can be highlighted
+/// at a time. The active (last) block cannot be highlighted.
+highlighted_block_idx: ?usize = null,
+
+/// Total gap size (in pixels) between command blocks. This is set by
+/// the renderer so Surface can use it for click-to-block mapping.
+/// Equals footer_padding + separator(2) + header_padding, or 0 if
+/// command blocks are disabled.
+command_blocks_gap: u32 = 0,
+
 /// The color state for this terminal.
 colors: Colors,
 
@@ -1338,6 +1349,26 @@ fn blockListSetOutputStart(self: *Terminal) !void {
     if (active.output_start != null) return;
     const screen = self.screens.get(.primary) orelse return;
     active.output_start = try bl.pages.trackPin(screen.cursor.page_pin.*);
+}
+
+/// Toggle the highlighted state of a block by its index in block_list.blocks.
+/// If the block is already highlighted, un-highlight it. If a different block
+/// is highlighted, switch to the new one. The active (last) block cannot be
+/// highlighted.
+pub fn toggleBlockHighlight(self: *Terminal, block_idx: usize) void {
+    const bl = self.block_list orelse return;
+    // Don't allow highlighting the active (last) block.
+    if (block_idx >= bl.blocks.items.len) return;
+    if (block_idx == bl.blocks.items.len - 1) return;
+
+    if (self.highlighted_block_idx) |current| {
+        if (current == block_idx) {
+            // Already highlighted — un-highlight.
+            self.highlighted_block_idx = null;
+            return;
+        }
+    }
+    self.highlighted_block_idx = block_idx;
 }
 
 /// The semantic prompt type. This is used when tracking a line type and

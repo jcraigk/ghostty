@@ -100,6 +100,10 @@ pub const RenderState = struct {
     /// The renderer applies this as a uniform Y offset to all block regions.
     block_scroll_px: i32 = 0,
 
+    /// Viewport-relative block index of the highlighted block, or null
+    /// if no block is currently highlighted in the visible viewport.
+    highlighted_block_idx: ?u16 = null,
+
     /// The cached selection so we can avoid expensive selection calculations
     /// if possible.
     selection_cache: ?SelectionCache = null,
@@ -608,17 +612,35 @@ pub const RenderState = struct {
                 self.block_exit_codes = try alloc.alloc(i32, num_blocks);
             }
             @memset(self.block_exit_codes[0..num_blocks], -1);
+            const prev_highlighted = self.highlighted_block_idx;
+            self.highlighted_block_idx = null;
             if (t.block_list) |*bl| {
                 var prev_blk_idx: u16 = std.math.maxInt(u16);
                 for (self.block_indices[0..self.rows], 0..) |bi, yi| {
                     if (bi == prev_blk_idx) continue;
                     prev_blk_idx = bi;
                     if (yi < row_pins.len) {
-                        if (bl.blockAtPin(row_pins[yi])) |block| {
-                            self.block_exit_codes[bi] = block.exit_code orelse -1;
+                        const block = bl.blockAtPin(row_pins[yi]) orelse continue;
+                        self.block_exit_codes[bi] = block.exit_code orelse -1;
+
+                        // Map the Terminal's highlighted block to viewport block index.
+                        if (t.highlighted_block_idx) |hl_idx| {
+                            if (hl_idx < bl.blocks.items.len) {
+                                const hl_block = &bl.blocks.items[hl_idx];
+                                // Compare by identity: same block pointer.
+                                if (block == hl_block) {
+                                    self.highlighted_block_idx = bi;
+                                }
+                            }
                         }
                     }
                 }
+            }
+
+            // If the highlighted block changed, force a full rebuild so
+            // the tint scratch rows are updated with the correct color.
+            if (!std.meta.eql(prev_highlighted, self.highlighted_block_idx)) {
+                self.dirty = .full;
             }
         }
 

@@ -294,6 +294,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             };
         }
 
+        /// Blend a cell bg color with an off-black blue tint for highlighted blocks.
+        fn blendHighlightTint(bg: [4]u8) [4]u8 {
+            const tint_r: u16 = 6;
+            const tint_g: u16 = 13;
+            const tint_b: u16 = 45;
+            const factor: u16 = 100; // out of 256
+            const inv: u16 = 256 - factor;
+            return .{
+                @intCast((@as(u16, bg[0]) * inv + tint_r * factor) >> 8),
+                @intCast((@as(u16, bg[1]) * inv + tint_g * factor) >> 8),
+                @intCast((@as(u16, bg[2]) * inv + tint_b * factor) >> 8),
+                if (bg[3] == 0) 255 else bg[3],
+            };
+        }
+
         const HighlightTag = enum(u8) {
             search_match,
             search_match_selected,
@@ -1275,11 +1290,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
 
                 // Set the block gap pixel size for block metadata computation.
-                self.terminal_state.command_blocks_gap = if (self.config.command_blocks) gap: {
-                    const footer: u8 = @intCast(@min(255, self.config.command_blocks_padding_footer));
-                    const header: u8 = @intCast(@min(255, self.config.command_blocks_padding_header));
-                    break :gap footer + 2 + header;
+                // Also store on the terminal so Surface can use it for click mapping.
+                const blocks_gap: u32 = if (self.config.command_blocks) gap: {
+                    break :gap @as(u32, self.config.command_blocks_padding_footer) + 2 + @as(u32, self.config.command_blocks_padding_header);
                 } else 0;
+                self.terminal_state.command_blocks_gap = @intCast(@min(255, blocks_gap));
+                state.terminal.command_blocks_gap = blocks_gap;
 
                 // Update our terminal state
                 try self.terminal_state.update(self.alloc, state.terminal);
@@ -1839,9 +1855,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         // extent (vis_top to vis_bottom), matching the stripe coverage.
                         // This fills the area between separator lines with the tint,
                         // including footer/header padding within the block's visual
-                        // boundary.
-                        if (region.exit_code >= 0 and num_blocks > 0 and vis_bottom > vis_top) {
-                            const block_idx = ts.block_indices[region.first_row];
+                        // boundary. Also drawn when the block is highlighted (clicked).
+                        const block_idx = ts.block_indices[region.first_row];
+                        const is_hl = if (ts.highlighted_block_idx) |hl|
+                            hl == block_idx
+                        else
+                            false;
+                        if ((region.exit_code >= 0 or is_hl) and num_blocks > 0 and vis_bottom > vis_top) {
                             const tint_base: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(num_blocks));
                             const tint_row: f32 = tint_base + @as(f32, @floatFromInt(block_idx));
 
@@ -1900,7 +1920,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                         // Stripe: spans the full visual block extent (header to footer).
                         if (stripe_w > 0 and vis_bottom > vis_top) {
-                            const block_idx = ts.block_indices[region.first_row];
                             const stripe_scratch: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(block_idx));
                             const sc = stripeColor(region.exit_code);
                             if (sc[3] > 0) {
@@ -3033,10 +3052,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // Tint scratch row (full-width block bg tint).
                     // Blend against the actual terminal background color so
                     // the tint is visible on both light and dark themes.
+                    // When this block is highlighted, use the highlight tint
+                    // instead of the exit-code tint.
                     const tint_row: usize = sep_row + 1 + num_blocks + bi;
                     const bg = state.colors.background;
                     const bg_rgba: [4]u8 = .{ bg.r, bg.g, bg.b, 255 };
-                    const tc: [4]u8 = if (ec > 0)
+                    const is_highlighted = if (state.highlighted_block_idx) |hl|
+                        hl == bi
+                    else
+                        false;
+                    const tc: [4]u8 = if (is_highlighted)
+                        blendHighlightTint(bg_rgba)
+                    else if (ec > 0)
                         blendErrorTint(bg_rgba)
                     else if (ec == 0)
                         blendSuccessTint(bg_rgba)

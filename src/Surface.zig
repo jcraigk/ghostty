@@ -2743,6 +2743,25 @@ pub fn keyCallback(
         break :event copy;
     };
 
+    // Command blocks: when scrolled up from the bottom, Enter should
+    // scroll to bottom without sending the keystroke to the terminal.
+    if ((event.key == .enter or event.key == .numpad_enter) and
+        event.action != .release and event.mods.empty())
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        const t: *terminal.Terminal = self.renderer_state.terminal;
+        if (t.block_list != null) {
+            const scrolled_up = (t.block_scroll_px orelse 0) > 0 or
+                !t.screens.active.viewportIsBottom();
+            if (scrolled_up) {
+                t.scrollViewport(.bottom);
+                try self.queueRender();
+                return .consumed;
+            }
+        }
+    }
+
     // Encode and send our key. If we didn't encode anything, then we
     // return the effect as ignored.
     if (try self.encodeKey(
@@ -4128,6 +4147,148 @@ pub fn mouseButtonCallback(
                     try self.io.terminal.screens.active.select(null);
                     try self.queueRender();
                 }
+
+                // Command blocks: toggle block highlight on single click.
+                // We iterate viewport rows to find block boundaries (same
+                // logic as render.zig block_indices), compute visual Y
+                // extents including inter-block gaps, and match the click
+                // pixel position to the correct block.
+                if (t.block_list) |*bl| blk: {
+                    const gap_px = t.command_blocks_gap;
+                    if (gap_px == 0) break :blk;
+
+                    const cell_h: u32 = self.size.cell.height;
+                    if (cell_h == 0) break :blk;
+                    const padding_top: u32 = self.size.padding.top;
+                    const viewport_rows: u32 = @intCast(screen.pages.rows);
+
+                    // Build viewport block boundaries by scanning rows for
+                    // semantic_prompt == .prompt, mirroring render.zig logic.
+                    // Store up to 64 block boundaries (first row of each block).
+                    const max_vp_blocks = 64;
+                    var block_first_rows: [max_vp_blocks]u32 = undefined;
+                    var block_pins: [max_vp_blocks]terminal.PageList.Pin = undefined;
+                    var num_vp_blocks: u32 = 1; // Block 0 always starts at row 0
+                    block_first_rows[0] = 0;
+
+                    var row_it = screen.pages.rowIterator(
+                        .right_down,
+                        .{ .viewport = .{} },
+                        null,
+                    );
+                    var yi: u32 = 0;
+                    // Store the pin for row 0
+                    if (row_it.next()) |first_pin| {
+                        block_pins[0] = first_pin;
+                        yi = 1;
+                    }
+                    while (row_it.next()) |row_pin| : (yi += 1) {
+                        const rac = row_pin.rowAndCell();
+                        if (rac.row.semantic_prompt == .prompt and yi > 0) {
+                            if (num_vp_blocks < max_vp_blocks) {
+                                block_first_rows[num_vp_blocks] = yi;
+                                block_pins[num_vp_blocks] = row_pin;
+                                num_vp_blocks += 1;
+                            }
+                        }
+                    }
+
+                    // Compute cursor-aware gap_overflow to match the renderer.
+                    // The renderer uses content_bottom based on the cursor
+                    // position, not the full viewport. This is critical because
+                    // when following (not scrolled), the cursor might be in the
+                    // middle of the viewport, giving gap_overflow = 0.
+                    const gap_overflow: u32 = go: {
+                        if (num_vp_blocks < 2) break :go 0;
+
+                        // Find the cursor's viewport row.
+                        const cursor_vp_y: ?u32 = cvp: {
+                            if (screen.viewportIsBottom()) {
+                                break :cvp @intCast(screen.cursor.y);
+                            }
+                            if (screen.pages.pointFromPin(
+                                .viewport,
+                                screen.cursor.page_pin.*,
+                            )) |cp| {
+                                break :cvp @intCast(cp.viewport.y);
+                            }
+                            break :cvp null;
+                        };
+
+                        // Compute content_bottom in natural (unshifted) coords.
+                        const content_bottom: u32 = cb: {
+                            if (cursor_vp_y) |cvy| {
+                                // Find which viewport block the cursor is in.
+                                for (0..num_vp_blocks) |bi| {
+                                    const bstart = block_first_rows[bi];
+                                    const bend = if (bi + 1 < num_vp_blocks)
+                                        block_first_rows[bi + 1]
+                                    else
+                                        viewport_rows;
+                                    if (cvy >= bstart and cvy < bend) {
+                                        const rows_in = cvy - bstart + 1;
+                                        break :cb bstart * cell_h + @as(u32, @intCast(bi)) * gap_px + rows_in * cell_h;
+                                    }
+                                }
+                            }
+                            // Cursor not in viewport: use full extent.
+                            const last_start = block_first_rows[num_vp_blocks - 1];
+                            const last_rows = viewport_rows - last_start;
+                            break :cb last_start * cell_h + (num_vp_blocks - 1) * gap_px + last_rows * cell_h;
+                        };
+
+                        const viewport_pixel_h = viewport_rows * cell_h;
+                        break :go if (content_bottom > viewport_pixel_h)
+                            content_bottom - viewport_pixel_h
+                        else
+                            0;
+                    };
+                    const scroll_px: u32 = if (t.block_scroll_px) |sp|
+                        if (sp > 0) @intCast(sp) else 0
+                    else
+                        0;
+                    const effective_shift: u32 = if (gap_overflow > scroll_px)
+                        gap_overflow - scroll_px
+                    else
+                        0;
+
+                    // Click Y relative to content origin (padding_top),
+                    // then add effective_shift to get the unshifted position.
+                    const raw_click_y: f64 = pos.y - @as(f64, @floatFromInt(padding_top));
+                    if (raw_click_y < 0) break :blk;
+                    const click_y: u32 = @as(u32, @intFromFloat(raw_click_y)) + effective_shift;
+
+                    // Walk viewport blocks and find which one contains click_y.
+                    var found_pin: ?terminal.PageList.Pin = null;
+                    for (0..num_vp_blocks) |bi| {
+                        const start_row = block_first_rows[bi];
+                        const end_row = if (bi + 1 < num_vp_blocks)
+                            block_first_rows[bi + 1]
+                        else
+                            viewport_rows;
+                        const block_visual_start = start_row * cell_h + @as(u32, @intCast(bi)) * gap_px;
+                        const block_visual_end = block_visual_start + (end_row - start_row) * cell_h;
+
+                        if (click_y >= block_visual_start and click_y < block_visual_end) {
+                            found_pin = block_pins[bi];
+                            break;
+                        }
+                    }
+
+                    // Map the viewport pin back to a block_list index.
+                    if (found_pin) |fp| {
+                        if (bl.blockAtPin(fp)) |block_ptr| {
+                            // Find the index of this block in the list.
+                            for (bl.blocks.items, 0..) |*b, idx| {
+                                if (b == block_ptr) {
+                                    t.toggleBlockHighlight(idx);
+                                    try self.queueRender();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
             },
 
             // Double click, select the word under our mouse.
@@ -4739,27 +4900,114 @@ pub fn cursorPosCallback(
         try self.mouseRefreshLinks(pos, pos_vp, over_link);
     }
 
-    // Command blocks: arrow cursor on completed blocks, text cursor on active.
+    // Command blocks: pointer cursor on completed blocks, text cursor
+    // on the active (last) block. We use pixel Y with gap awareness to
+    // determine which visual block the mouse is over. The active block
+    // is always the last viewport block.
     if (self.io.terminal.block_list != null and !self.mouse.over_link) {
         const t: *terminal.Terminal = self.renderer_state.terminal;
         if (t.block_list) |*bl| {
             if (bl.activeBlock()) |active| {
-                if (active.exit_code == null) {
-                    const screen = t.screens.get(.primary);
-                    if (screen) |s| {
-                        const pin = s.pages.pin(.{ .viewport = .{
-                            .x = pos_vp.x,
-                            .y = pos_vp.y,
-                        } });
-                        if (pin) |p| {
-                            const in_history = p.before(active.prompt_start.*);
-                            _ = try self.rt_app.performAction(
-                                .{ .surface = self },
-                                .mouse_shape,
-                                if (in_history) .default else .text,
-                            );
+                if (!active.prompt_start.garbage) {
+                    const screen2: *terminal.Screen = t.screens.active;
+                    // Get the viewport row for the active block's start.
+                    const active_vp = screen2.pages.pointFromPin(
+                        .viewport,
+                        active.prompt_start.*,
+                    );
+                    // If the active block isn't in the viewport, the mouse is
+                    // definitely over completed blocks (pointer cursor).
+                    const in_history = if (active_vp) |avp| ih: {
+                        const cell_h: u32 = self.size.cell.height;
+                        const gap_px = t.command_blocks_gap;
+                        if (cell_h == 0 or gap_px == 0) {
+                            break :ih pos_vp.y < avp.viewport.y;
                         }
-                    }
+                        // Single pass: count prompt boundaries in viewport,
+                        // and those before the active block's row, plus
+                        // build block boundary info for gap_overflow calc.
+                        var gaps_before_active: u32 = 0;
+                        var all_gaps: u32 = 0;
+                        const viewport_rows: u32 = @intCast(screen2.pages.rows);
+                        const max_cs_blocks = 64;
+                        var cs_block_rows: [max_cs_blocks]u32 = undefined;
+                        var cs_num_blocks: u32 = 1;
+                        cs_block_rows[0] = 0;
+                        var count_it = screen2.pages.rowIterator(
+                            .right_down,
+                            .{ .viewport = .{} },
+                            null,
+                        );
+                        var ri: u32 = 0;
+                        while (count_it.next()) |rp| : (ri += 1) {
+                            if (ri > 0) {
+                                const rac = rp.rowAndCell();
+                                if (rac.row.semantic_prompt == .prompt) {
+                                    all_gaps += 1;
+                                    if (ri < avp.viewport.y) gaps_before_active += 1;
+                                    if (cs_num_blocks < max_cs_blocks) {
+                                        cs_block_rows[cs_num_blocks] = ri;
+                                        cs_num_blocks += 1;
+                                    }
+                                }
+                            }
+                        }
+                        // Active block's visual Y start (natural coords).
+                        const active_visual_y: u32 = avp.viewport.y * cell_h + gaps_before_active * gap_px;
+
+                        // Cursor-aware gap_overflow (same as click handler).
+                        const cs_gap_overflow: u32 = cgo: {
+                            if (cs_num_blocks < 2) break :cgo 0;
+                            const cs_cursor_vp_y: ?u32 = ccvp: {
+                                if (screen2.viewportIsBottom()) {
+                                    break :ccvp @intCast(screen2.cursor.y);
+                                }
+                                if (screen2.pages.pointFromPin(
+                                    .viewport,
+                                    screen2.cursor.page_pin.*,
+                                )) |ccp| {
+                                    break :ccvp @intCast(ccp.viewport.y);
+                                }
+                                break :ccvp null;
+                            };
+                            const cs_content_bottom: u32 = ccb: {
+                                if (cs_cursor_vp_y) |ccvy| {
+                                    for (0..cs_num_blocks) |cbi| {
+                                        const cbstart = cs_block_rows[cbi];
+                                        const cbend = if (cbi + 1 < cs_num_blocks)
+                                            cs_block_rows[cbi + 1]
+                                        else
+                                            viewport_rows;
+                                        if (ccvy >= cbstart and ccvy < cbend) {
+                                            const crows_in = ccvy - cbstart + 1;
+                                            break :ccb cbstart * cell_h + @as(u32, @intCast(cbi)) * gap_px + crows_in * cell_h;
+                                        }
+                                    }
+                                }
+                                const cls = cs_block_rows[cs_num_blocks - 1];
+                                break :ccb cls * cell_h + (cs_num_blocks - 1) * gap_px + (viewport_rows - cls) * cell_h;
+                            };
+                            break :cgo if (cs_content_bottom > viewport_rows * cell_h)
+                                cs_content_bottom - viewport_rows * cell_h
+                            else
+                                0;
+                        };
+                        const scroll_px2: u32 = if (t.block_scroll_px) |sp| if (sp > 0) @intCast(sp) else 0 else 0;
+                        const eff_shift: u32 = if (cs_gap_overflow > scroll_px2) cs_gap_overflow - scroll_px2 else 0;
+
+                        // Mouse pixel Y adjusted to unshifted content coordinates.
+                        const padding_top: u32 = self.size.padding.top;
+                        const mouse_content_y: f64 = pos.y - @as(f64, @floatFromInt(padding_top));
+                        if (mouse_content_y < 0) break :ih true;
+                        const adjusted_y: u32 = @as(u32, @intFromFloat(mouse_content_y)) + eff_shift;
+                        break :ih adjusted_y < active_visual_y;
+                    } else true; // Active block not in viewport
+
+                    _ = try self.rt_app.performAction(
+                        .{ .surface = self },
+                        .mouse_shape,
+                        if (in_history) .default else .text,
+                    );
                 }
             }
         }

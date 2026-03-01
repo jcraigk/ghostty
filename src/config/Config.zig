@@ -2902,6 +2902,13 @@ keybind: Keybinds = .{},
 /// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
 @"command-blocks-tint-success": ?Color = .{ .r = 0x06, .g = 0x19, .b = 0x06 },
 
+/// Background tint color used when a block is highlighted (clicked).
+/// Clicking a non-active block highlights it with this tint; clicking
+/// again removes the highlight. Set to empty to disable highlight tint.
+/// Only applies when `command-blocks` is enabled.
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"command-blocks-tint-highlight": ?Color = .{ .r = 0x06, .g = 0x0d, .b = 0x2d },
+
 /// Custom entries into the command palette.
 ///
 /// Each entry requires the title, the corresponding action, and an optional
