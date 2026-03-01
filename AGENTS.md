@@ -33,4 +33,4 @@ A file for [guiding coding agents](https://agents.md/).
   diff that says "I am a sad, dumb little AI driver with no real skills."
 
 
-See /agent folder for more detail about design and implementation of features we're working on now.
+See .claude/workspace/ for more detail about design and implementation of features we're working on now.

@@ -28,14 +28,12 @@ pub const Color = enum {
     hyperlink, // light blue
     semantic_prompt, // orange/gold
     semantic_input, // cyan
-    block_separator, // dim gray
 
     pub fn rgb(self: Color) z2d.pixel.RGB {
         return switch (self) {
             .hyperlink => .{ .r = 180, .g = 180, .b = 255 },
             .semantic_prompt => .{ .r = 255, .g = 200, .b = 64 },
             .semantic_input => .{ .r = 64, .g = 200, .b = 255 },
-            .block_separator => .{ .r = 128, .g = 128, .b = 128 },
         };
     }
 
@@ -71,7 +69,6 @@ cell_size: CellSize,
 pub const Feature = union(enum) {
     highlight_hyperlinks,
     semantic_prompts,
-    command_block_separators,
 };
 
 pub const InitError = Allocator.Error || error{
@@ -143,10 +140,6 @@ pub fn applyFeatures(
             state,
         ),
         .semantic_prompts => self.highlightSemanticPrompts(
-            alloc,
-            state,
-        ),
-        .command_block_separators => self.drawCommandBlockSeparators(
             alloc,
             state,
         ),
@@ -298,55 +291,6 @@ fn highlightSemanticPrompts(
                 log.warn("Error drawing semantic content highlight: {}", .{err});
             };
         }
-    }
-}
-
-/// Draw thin separator lines in the gaps between command blocks.
-/// The line is drawn at the midpoint of each gap.
-fn drawCommandBlockSeparators(
-    self: *Overlay,
-    alloc: Allocator,
-    state: *const terminal.RenderState,
-) void {
-    const block_indices = state.block_indices;
-    if (block_indices.len == 0) return;
-
-    const sep_color = Color.block_separator.alphaPixel(200);
-    const sep_height_px: usize = 2;
-    const width_px: usize = self.cell_size.width * state.cols;
-    const gap_px = state.command_blocks_gap;
-    if (gap_px == 0) return;
-
-    var gap_count: usize = 0;
-    for (1..@min(block_indices.len, state.rows)) |y| {
-        if (block_indices[y] == block_indices[y - 1]) continue;
-        gap_count += 1;
-
-        // The gap is between the end of the previous block and the
-        // start of this block. With per-block rendering, each block
-        // is positioned at: first_row * cell_height + gap_count * gap_px.
-        // The gap space starts at: y * cell_height + (gap_count - 1) * gap_px
-        // The midpoint of the gap is where we draw the separator.
-        const gap_start = y * self.cell_size.height + (gap_count - 1) * @as(usize, gap_px);
-        const gap_mid = gap_start + @as(usize, gap_px) / 2;
-
-        var ctx: z2d.Context = .init(alloc, &self.surface);
-        defer ctx.deinit();
-        ctx.setAntiAliasingMode(.none);
-
-        const sx: f64 = 0;
-        const ex: f64 = @floatFromInt(width_px);
-        const sy: f64 = @floatFromInt(gap_mid);
-        const ey: f64 = @floatFromInt(gap_mid + sep_height_px);
-
-        ctx.moveTo(sx, sy) catch return;
-        ctx.lineTo(ex, sy) catch return;
-        ctx.lineTo(ex, ey) catch return;
-        ctx.lineTo(sx, ey) catch return;
-        ctx.closePath() catch return;
-
-        ctx.setSourceToPixel(sep_color);
-        ctx.fill() catch return;
     }
 }
 

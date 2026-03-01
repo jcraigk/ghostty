@@ -40,14 +40,26 @@ layout(binding = 1, std430) readonly buffer bg_cells {
     uint bg_colors[];
 };
 
+// Per-draw block parameters for command block rendering.
+// Bound at index 3, matching Metal buffer convention.
+layout(binding = 3, std140) uniform BlockParamsBlock {
+    float block_y_offset;
+    float block_first_row;
+    float block_x_offset;
+    float block_y_flat;
+};
+
 void main() {
     uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
     uvec2 cursor_pos = unpack2u16(cursor_pos_packed_2u16);
     bool cursor_wide = (bools & CURSOR_WIDE) != 0;
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
 
-    // Convert the grid x, y into world space x, y by accounting for cell size
-    vec2 cell_pos = cell_size * vec2(grid_pos);
+    // Convert the grid x, y into world space x, y by accounting for cell size.
+    // When block rendering is active, position relative to block origin.
+    vec2 cell_pos;
+    cell_pos.x = cell_size.x * float(grid_pos.x);
+    cell_pos.y = float(int(grid_pos.y) - int(block_first_row)) * cell_size.y + block_y_offset;
 
     int vid = gl_VertexID;
 

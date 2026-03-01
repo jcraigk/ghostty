@@ -10,9 +10,28 @@ layout(binding = 1, std430) readonly buffer bg_cells {
     uint cells[];
 };
 
+// Per-draw block parameters for command block rendering.
+// Bound at index 3, matching Metal buffer convention.
+layout(binding = 3, std140) uniform BlockParamsBlock {
+    float block_y_offset;
+    float block_first_row;
+    float block_x_offset;
+    float block_y_flat;
+};
+
 vec4 cell_bg() {
     uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
-    ivec2 grid_pos = ivec2(floor((gl_FragCoord.xy - grid_padding.wx) / cell_size));
+    // Compute grid position with block offset support.
+    // block_x_offset/block_y_offset are grid-relative (excludes padding),
+    // added to the padding to get the screen-space origin.
+    vec2 origin = vec2(grid_padding.w + block_x_offset, grid_padding.x + block_y_offset);
+    ivec2 grid_pos = ivec2(floor((gl_FragCoord.xy - origin) / cell_size));
+    // When block_y_flat is set, all pixels read from the same row (for solid fills).
+    if (block_y_flat != 0.0) {
+        grid_pos.y = int(block_first_row);
+    } else {
+        grid_pos.y += int(block_first_row);
+    }
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
 
     vec4 bg = vec4(0.0);

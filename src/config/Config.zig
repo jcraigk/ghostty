@@ -2864,19 +2864,21 @@ keybind: Keybinds = .{},
 
 /// Width in points of the status stripe on the left edge of each command
 /// block. The stripe color indicates exit status. Set to 0 to disable.
-/// Must be less than `command-blocks-padding-left`.
+/// Clamped to `command-blocks-padding-left` if it exceeds it.
 @"command-blocks-stripe-width": u16 = 9,
 
-/// Color of the separator line drawn between command blocks. Only applies
-/// when `command-blocks` is enabled.
+/// Color of the separator line drawn between command blocks. Set to empty
+/// to hide the separator line entirely (gaps between blocks are preserved).
+/// Only applies when `command-blocks` is enabled.
 /// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
-@"command-blocks-separator-color": Color = .{ .r = 0x50, .g = 0x50, .b = 0x50 },
+@"command-blocks-separator-color": ?Color = .{ .r = 0x50, .g = 0x50, .b = 0x50 },
 
 /// Stripe color for commands that exited successfully (exit code 0).
 /// Set to empty to hide the stripe on success. Only applies when
-/// `command-blocks` is enabled.
+/// `command-blocks` is enabled. Hidden by default to reduce visual
+/// noise for successful commands.
 /// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
-@"command-blocks-stripe-success": ?Color = .{ .r = 0x5f, .g = 0xaf, .b = 0x5f },
+@"command-blocks-stripe-success": ?Color = null,
 
 /// Stripe color for commands that failed (non-zero exit code).
 /// Only applies when `command-blocks` is enabled.
@@ -2889,6 +2891,13 @@ keybind: Keybinds = .{},
 /// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
 @"command-blocks-stripe-running": ?Color = null,
 
+/// Stripe color for commands killed by a signal (exit code 128-255,
+/// e.g. Ctrl+C = 130). Set to empty to hide. Falls back to
+/// `command-blocks-stripe-error` if not set. Only applies when
+/// `command-blocks` is enabled.
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"command-blocks-stripe-signal": ?Color = .{ .r = 0xd7, .g = 0xaf, .b = 0x5f },
+
 /// Background tint color blended over error blocks (non-zero exit code).
 /// The tint is applied at low opacity so text remains readable. Set to
 /// empty to disable the error tint. Only applies when `command-blocks`
@@ -2898,9 +2907,16 @@ keybind: Keybinds = .{},
 
 /// Background tint color blended over success blocks (exit code 0).
 /// Set to empty to disable the success tint. Only applies when
+/// `command-blocks` is enabled. Hidden by default to reduce visual
+/// noise for successful commands.
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"command-blocks-tint-success": ?Color = null,
+
+/// Background tint color blended over signal-killed blocks (exit code
+/// 128-255, e.g. Ctrl+C). Set to empty to disable. Only applies when
 /// `command-blocks` is enabled.
 /// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
-@"command-blocks-tint-success": ?Color = .{ .r = 0x06, .g = 0x19, .b = 0x06 },
+@"command-blocks-tint-signal": ?Color = .{ .r = 0x2d, .g = 0x1f, .b = 0x06 },
 
 /// Background tint color used when a block is highlighted (clicked).
 /// Clicking a non-active block highlights it with this tint; clicking
@@ -4698,6 +4714,14 @@ pub fn finalize(self: *Config) !void {
     // Minimum window size
     if (self.@"window-width" > 0) self.@"window-width" = @max(10, self.@"window-width");
     if (self.@"window-height" > 0) self.@"window-height" = @max(4, self.@"window-height");
+
+    // Command blocks: clamp stripe width to left padding so the stripe
+    // never extends beyond the text indent area.
+    if (self.@"command-blocks") {
+        if (self.@"command-blocks-stripe-width" > self.@"command-blocks-padding-left") {
+            self.@"command-blocks-stripe-width" = self.@"command-blocks-padding-left";
+        }
+    }
 
     // Command blocks: left padding indents text from the stripe area.
     // Right padding is zero so separators extend to the right edge.

@@ -255,74 +255,59 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             exit_code: i32 = -1,
         };
 
-        /// Map a block exit code to an RGBA stripe color.
-        fn stripeColor(exit_code: i32) [4]u8 {
+        /// Map a block exit code to an RGBA stripe color using config values.
+        fn stripeColor(self: *const Self, exit_code: i32) [4]u8 {
             return switch (exit_code) {
-                0 => .{ 78, 153, 78, 228 },
-                -1 => .{ 0, 0, 0, 0 },
-                128...255 => .{ 180, 150, 50, 228 },
-                else => .{ 190, 65, 65, 228 },
+                0 => if (self.config.command_blocks_stripe_success) |c|
+                    .{ c.r, c.g, c.b, 228 }
+                else
+                    .{ 0, 0, 0, 0 },
+                -1 => if (self.config.command_blocks_stripe_running) |c|
+                    .{ c.r, c.g, c.b, 228 }
+                else
+                    .{ 0, 0, 0, 0 },
+                128...255 => if (self.config.command_blocks_stripe_signal) |c|
+                    .{ c.r, c.g, c.b, 228 }
+                else
+                    .{ 0, 0, 0, 0 },
+                else => if (self.config.command_blocks_stripe_error) |c|
+                    .{ c.r, c.g, c.b, 228 }
+                else
+                    .{ 0, 0, 0, 0 },
+            };
+        }
+
+        /// Blend a background color towards a tint color at a given factor (out of 256).
+        /// Returns transparent if tint_color is null.
+        fn blendTint(bg: [4]u8, tint_color: ?configpkg.Config.Color, factor: u16) [4]u8 {
+            const c = tint_color orelse return .{ 0, 0, 0, 0 };
+            const inv: u16 = 256 - factor;
+            return .{
+                @intCast((@as(u16, bg[0]) * inv + @as(u16, c.r) * factor) >> 8),
+                @intCast((@as(u16, bg[1]) * inv + @as(u16, c.g) * factor) >> 8),
+                @intCast((@as(u16, bg[2]) * inv + @as(u16, c.b) * factor) >> 8),
+                if (bg[3] == 0) 255 else bg[3],
             };
         }
 
         /// Blend a cell bg color with a subtle red tint for error blocks.
-        fn blendErrorTint(bg: [4]u8) [4]u8 {
-            const tint_r: u16 = 40;
-            const tint_g: u16 = 6;
-            const tint_b: u16 = 6;
-            const factor: u16 = 80; // out of 256
-            const inv: u16 = 256 - factor;
-            return .{
-                @intCast((@as(u16, bg[0]) * inv + tint_r * factor) >> 8),
-                @intCast((@as(u16, bg[1]) * inv + tint_g * factor) >> 8),
-                @intCast((@as(u16, bg[2]) * inv + tint_b * factor) >> 8),
-                if (bg[3] == 0) 255 else bg[3],
-            };
+        fn blendErrorTint(self: *const Self, bg: [4]u8) [4]u8 {
+            return blendTint(bg, self.config.command_blocks_tint_error, 80);
         }
 
         /// Blend a cell bg color with a subtle green tint for success blocks.
-        fn blendSuccessTint(bg: [4]u8) [4]u8 {
-            const tint_r: u16 = 6;
-            const tint_g: u16 = 22;
-            const tint_b: u16 = 6;
-            const factor: u16 = 50; // out of 256
-            const inv: u16 = 256 - factor;
-            return .{
-                @intCast((@as(u16, bg[0]) * inv + tint_r * factor) >> 8),
-                @intCast((@as(u16, bg[1]) * inv + tint_g * factor) >> 8),
-                @intCast((@as(u16, bg[2]) * inv + tint_b * factor) >> 8),
-                if (bg[3] == 0) 255 else bg[3],
-            };
+        fn blendSuccessTint(self: *const Self, bg: [4]u8) [4]u8 {
+            return blendTint(bg, self.config.command_blocks_tint_success, 50);
         }
 
-        /// Blend a cell bg color with a subtle yellow tint for signal-killed blocks.
-        fn blendSignalTint(bg: [4]u8) [4]u8 {
-            const tint_r: u16 = 35;
-            const tint_g: u16 = 28;
-            const tint_b: u16 = 6;
-            const factor: u16 = 60; // out of 256
-            const inv: u16 = 256 - factor;
-            return .{
-                @intCast((@as(u16, bg[0]) * inv + tint_r * factor) >> 8),
-                @intCast((@as(u16, bg[1]) * inv + tint_g * factor) >> 8),
-                @intCast((@as(u16, bg[2]) * inv + tint_b * factor) >> 8),
-                if (bg[3] == 0) 255 else bg[3],
-            };
+        /// Blend a cell bg color with a subtle tint for signal-killed blocks (128-255).
+        fn blendSignalTint(self: *const Self, bg: [4]u8) [4]u8 {
+            return blendTint(bg, self.config.command_blocks_tint_signal, 60);
         }
 
-        /// Blend a cell bg color with an off-black blue tint for highlighted blocks.
-        fn blendHighlightTint(bg: [4]u8) [4]u8 {
-            const tint_r: u16 = 6;
-            const tint_g: u16 = 13;
-            const tint_b: u16 = 45;
-            const factor: u16 = 100; // out of 256
-            const inv: u16 = 256 - factor;
-            return .{
-                @intCast((@as(u16, bg[0]) * inv + tint_r * factor) >> 8),
-                @intCast((@as(u16, bg[1]) * inv + tint_g * factor) >> 8),
-                @intCast((@as(u16, bg[2]) * inv + tint_b * factor) >> 8),
-                if (bg[3] == 0) 255 else bg[3],
-            };
+        /// Blend a cell bg color with a blue tint for highlighted blocks.
+        fn blendHighlightTint(self: *const Self, bg: [4]u8) [4]u8 {
+            return blendTint(bg, self.config.command_blocks_tint_highlight, 100);
         }
 
         const HighlightTag = enum(u8) {
@@ -669,6 +654,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             command_blocks_padding_left: u16,
             command_blocks_padding_right: u16,
             command_blocks_stripe_width: u16,
+            command_blocks_separator_color: ?configpkg.Config.Color,
+            command_blocks_stripe_success: ?configpkg.Config.Color,
+            command_blocks_stripe_error: ?configpkg.Config.Color,
+            command_blocks_stripe_running: ?configpkg.Config.Color,
+            command_blocks_stripe_signal: ?configpkg.Config.Color,
+            command_blocks_tint_error: ?configpkg.Config.Color,
+            command_blocks_tint_success: ?configpkg.Config.Color,
+            command_blocks_tint_signal: ?configpkg.Config.Color,
+            command_blocks_tint_highlight: ?configpkg.Config.Color,
             scroll_to_bottom_on_output: bool,
 
             pub fn init(
@@ -749,6 +743,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .command_blocks_padding_left = config.@"command-blocks-padding-left",
                     .command_blocks_padding_right = config.@"command-blocks-padding-right",
                     .command_blocks_stripe_width = config.@"command-blocks-stripe-width",
+                    .command_blocks_separator_color = config.@"command-blocks-separator-color",
+                    .command_blocks_stripe_success = config.@"command-blocks-stripe-success",
+                    .command_blocks_stripe_error = config.@"command-blocks-stripe-error",
+                    .command_blocks_stripe_running = config.@"command-blocks-stripe-running",
+                    .command_blocks_stripe_signal = config.@"command-blocks-stripe-signal",
+                    .command_blocks_tint_error = config.@"command-blocks-tint-error",
+                    .command_blocks_tint_success = config.@"command-blocks-tint-success",
+                    .command_blocks_tint_signal = config.@"command-blocks-tint-signal",
+                    .command_blocks_tint_highlight = config.@"command-blocks-tint-highlight",
                     .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
                     .arena = arena,
                 };
@@ -1389,11 +1392,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         for (insp_features) |f| features.append(arena_alloc, f) catch {};
                     }
 
-                    // Command blocks separator overlay.
-                    if (self.config.command_blocks) {
-                        features.append(arena_alloc, .command_block_separators) catch {};
-                    }
-
                     break :overlay features.items;
                 };
 
@@ -1895,6 +1893,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                 .block_params = .{
                                     .block_y_offset = 0,
                                     .block_first_row = tint_row,
+                                    .block_x_offset = -pad_left,
                                     .block_y_flat = 1.0,
                                 },
                             });
@@ -1937,7 +1936,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         // Stripe: spans the full visual block extent (header to footer).
                         if (stripe_w > 0 and vis_bottom > vis_top) {
                             const stripe_scratch: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(block_idx));
-                            const sc = stripeColor(region.exit_code);
+                            const sc = self.stripeColor(region.exit_code);
                             if (sc[3] > 0) {
                                 pass.step(.{
                                     .pipeline = self.shaders.pipelines.cell_bg,
@@ -1967,31 +1966,34 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             if (region.screen_y_px > prev_end + 2) {
                                 const gap_mid = prev_end + (region.screen_y_px - prev_end) / 2;
 
-                                // Separator line (scratch row filled with gray, flat).
-                                // Uses block_x_offset=0 so padding_extend covers edges.
-                                pass.step(.{
-                                    .pipeline = self.shaders.pipelines.cell_bg,
-                                    .uniforms = frame.uniforms.buffer,
-                                    .buffers = &.{ null, frame.cells_bg.buffer },
-                                    .draw = .{ .type = .triangle, .vertex_count = 3 },
-                                    .scissor = .{
-                                        .x = 0,
-                                        .y = gap_mid,
-                                        .width = self.size.screen.width,
-                                        .height = 2,
-                                    },
-                                    .block_params = .{
-                                        .block_y_offset = 0,
-                                        .block_first_row = sep_row,
-                                        .block_y_flat = 1.0,
-                                    },
-                                });
+                                // Separator line (scratch row filled with color, flat).
+                                // Skipped when separator color is null (hidden).
+                                if (self.config.command_blocks_separator_color != null) {
+                                    pass.step(.{
+                                        .pipeline = self.shaders.pipelines.cell_bg,
+                                        .uniforms = frame.uniforms.buffer,
+                                        .buffers = &.{ null, frame.cells_bg.buffer },
+                                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                        .scissor = .{
+                                            .x = 0,
+                                            .y = gap_mid,
+                                            .width = self.size.screen.width,
+                                            .height = 2,
+                                        },
+                                        .block_params = .{
+                                            .block_y_offset = 0,
+                                            .block_first_row = sep_row,
+                                            .block_x_offset = -pad_left,
+                                            .block_y_flat = 1.0,
+                                        },
+                                    });
+                                }
 
                                 // Stripe through gap: footer half uses previous
                                 // block's color, header half uses current block's.
                                 if (stripe_w > 0) {
                                     // Footer stripe (prev_end to gap_mid).
-                                    const prev_sc = stripeColor(prev.exit_code);
+                                    const prev_sc = self.stripeColor(prev.exit_code);
                                     if (prev_sc[3] > 0 and gap_mid > prev_end) {
                                         const prev_bi = ts.block_indices[prev.first_row];
                                         const prev_stripe: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(prev_bi));
@@ -2015,7 +2017,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                         });
                                     }
                                     // Header stripe (gap_mid+2 to region start).
-                                    const cur_sc = stripeColor(region.exit_code);
+                                    const cur_sc = self.stripeColor(region.exit_code);
                                     if (cur_sc[3] > 0 and region.screen_y_px > gap_mid + 2) {
                                         const cur_bi = ts.block_indices[region.first_row];
                                         const cur_stripe: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(cur_bi));
@@ -3043,10 +3045,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const sep_row: usize = state.rows;
                 const cols_u: usize = state.cols;
 
-                // Scratch row for separator: all columns gray.
+                // Scratch row for separator: all columns use config separator color.
+                // When separator color is null (hidden), fill with transparent so
+                // the scratch row exists but draws nothing.
+                const sep_color: [4]u8 = if (self.config.command_blocks_separator_color) |c|
+                    .{ c.r, c.g, c.b, 255 }
+                else
+                    .{ 0, 0, 0, 0 };
                 var sx: usize = 0;
                 while (sx < cols_u) : (sx += 1) {
-                    self.cells.bgCell(@intCast(sep_row), @intCast(sx)).* = .{ 80, 80, 80, 255 };
+                    self.cells.bgCell(@intCast(sep_row), @intCast(sx)).* = sep_color;
                 }
 
                 // Per-block scratch rows: stripe colors and tint colors.
@@ -3059,7 +3067,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                     // Stripe scratch row.
                     const stripe_row: usize = sep_row + 1 + bi;
-                    const sc = stripeColor(ec);
+                    const sc = self.stripeColor(ec);
                     var scx: usize = 0;
                     while (scx < cols_u) : (scx += 1) {
                         self.cells.bgCell(@intCast(stripe_row), @intCast(scx)).* = sc;
@@ -3078,13 +3086,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     else
                         false;
                     const tc: [4]u8 = if (is_highlighted)
-                        blendHighlightTint(bg_rgba)
+                        self.blendHighlightTint(bg_rgba)
                     else if (ec >= 128 and ec <= 255)
-                        blendSignalTint(bg_rgba)
+                        self.blendSignalTint(bg_rgba)
                     else if (ec > 0)
-                        blendErrorTint(bg_rgba)
+                        self.blendErrorTint(bg_rgba)
                     else if (ec == 0)
-                        blendSuccessTint(bg_rgba)
+                        self.blendSuccessTint(bg_rgba)
                     else
                         .{ 0, 0, 0, 0 };
                     var tcx: usize = 0;
