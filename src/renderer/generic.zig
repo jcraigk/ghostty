@@ -1802,23 +1802,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     else
                         0;
 
-                    const cell_h_draw = self.grid_metrics.cell_height;
                     for (self.block_regions.items, 0..) |region, ri| {
                         const bp: @TypeOf(pass).Step.BlockParams = .{
                             .block_y_offset = region.grid_y_offset,
                             .block_first_row = @floatFromInt(region.first_row),
                         };
-                        // Content scissor uses row_count * cell_h (no descender
-                        // margin). The full height_px includes descender_margin
-                        // which extends into the next grid row — for the last
-                        // block that would be a scratch row filled with grey,
-                        // causing a visible grey line.
-                        const content_h: u32 = @as(u32, region.row_count) * cell_h_draw;
                         const scissor: @TypeOf(pass).Step.ScissorRect = .{
                             .x = 0,
                             .y = region.screen_y_px,
                             .width = self.size.screen.width,
-                            .height = content_h,
+                            .height = region.height_px,
                         };
 
                         // Compute visual block extent (header padding to footer padding).
@@ -2819,8 +2812,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const sep_px: u32 = 2;
                     const gap_px = footer_px + sep_px + header_px;
                     const padding_top = self.size.padding.top;
-                    const descender_margin = cell_h / 4;
-                    const total_gap = gap_px + descender_margin;
+                    const total_gap = gap_px;
 
                     // --- Unified scroll model ---
                     // Step 1: Compute block regions from natural (unshifted) positions.
@@ -2843,7 +2835,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                 .first_row = region_start,
                                 .row_count = rc,
                                 .screen_y_px = sy,
-                                .height_px = @intCast(h + @as(i32, @intCast(descender_margin))),
+                                .height_px = @intCast(h),
                                 .grid_y_offset = @floatFromInt(grid_y_i),
                                 .exit_code = ec,
                             }) catch {};
@@ -2864,7 +2856,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .first_row = region_start,
                             .row_count = rc,
                             .screen_y_px = final_sy,
-                            .height_px = @intCast(h + @as(i32, @intCast(descender_margin))),
+                            .height_px = @intCast(h),
                             .grid_y_offset = @floatFromInt(grid_y_i),
                             .exit_code = final_ec,
                         }) catch {};
