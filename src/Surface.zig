@@ -6023,6 +6023,24 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             }, .unlocked);
         },
 
+        .toggle_block_collapse => {
+            self.queueIo(.{
+                .toggle_block_collapse = {},
+            }, .unlocked);
+        },
+
+        .goto_block_previous => {
+            self.queueIo(.{
+                .goto_block = .previous,
+            }, .unlocked);
+        },
+
+        .goto_block_next => {
+            self.queueIo(.{
+                .goto_block = .next,
+            }, .unlocked);
+        },
+
         .write_screen_file => |v| try self.writeScreenFile(
             .screen,
             v,

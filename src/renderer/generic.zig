@@ -253,6 +253,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             instance_count: usize = 0,
             /// Exit code: 0 = success, >0 = error, -1 = running/unknown.
             exit_code: i32 = -1,
+            /// Whether this block is collapsed.
+            collapsed: bool = false,
+            /// Number of hidden lines (total - visible). For the indicator text.
+            hidden_lines: u16 = 0,
         };
 
         /// Map a block exit code to an RGBA stripe color using config values.
@@ -663,6 +667,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             command_blocks_tint_success: ?configpkg.Config.Color,
             command_blocks_tint_signal: ?configpkg.Config.Color,
             command_blocks_tint_highlight: ?configpkg.Config.Color,
+            command_blocks_collapse_preview_lines: u16,
+            command_blocks_auto_collapse_threshold: ?u16,
             scroll_to_bottom_on_output: bool,
 
             pub fn init(
@@ -752,6 +758,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .command_blocks_tint_success = config.@"command-blocks-tint-success",
                     .command_blocks_tint_signal = config.@"command-blocks-tint-signal",
                     .command_blocks_tint_highlight = config.@"command-blocks-tint-highlight",
+                    .command_blocks_collapse_preview_lines = config.@"command-blocks-collapse-preview-lines",
+                    .command_blocks_auto_collapse_threshold = config.@"command-blocks-auto-collapse-threshold",
                     .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
                     .arena = arena,
                 };
@@ -1315,6 +1323,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 } else 0;
                 self.terminal_state.command_blocks_gap = @intCast(@min(255, blocks_gap));
                 state.terminal.command_blocks_gap = blocks_gap;
+                state.terminal.auto_collapse_threshold = self.config.command_blocks_auto_collapse_threshold;
+                state.terminal.collapse_preview_lines = self.config.command_blocks_collapse_preview_lines;
 
                 // Update our terminal state
                 try self.terminal_state.update(self.alloc, state.terminal);
@@ -1725,7 +1735,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const lists = self.cells.fg_rows.lists;
                 // Offset starts after the cursor list (lists[0]).
                 var cursor_cells: usize = if (lists.len > 0) lists[0].items.len else 0;
-                for (self.block_regions.items) |*region| {
+                for (self.block_regions.items, 0..) |*region, ri| {
+                    // For the first region, skip any rows before region.first_row
+                    // (shouldn't happen normally). For subsequent regions, skip
+                    // any rows between the previous region's end and this region's
+                    // start — these are hidden rows from collapsed blocks.
+                    const skip_start: usize = if (ri > 0) blk: {
+                        const prev = self.block_regions.items[ri - 1];
+                        break :blk prev.first_row + prev.row_count;
+                    } else region.first_row;
+                    var skip_row: usize = skip_start;
+                    while (skip_row < region.first_row) : (skip_row += 1) {
+                        const skip_idx = skip_row + 1;
+                        if (skip_idx < lists.len) {
+                            cursor_cells += lists[skip_idx].items.len;
+                        }
+                    }
+
                     var count: usize = 0;
                     var row: usize = region.first_row;
                     while (row < region.first_row + region.row_count) : (row += 1) {
@@ -2842,6 +2868,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.block_regions.clearRetainingCapacity();
                 const block_indices = state.block_indices;
                 const block_exit_codes = state.block_exit_codes;
+                const block_collapsed = state.block_collapsed;
+                const block_output_row_offset = state.block_output_row_offset;
+                const block_total_rows = state.block_total_rows;
+                const preview_lines = self.config.command_blocks_collapse_preview_lines;
                 if (block_indices.len > 0 and self.config.command_blocks) {
                     const cell_h = self.grid_metrics.cell_height;
                     const footer_px: u32 = self.config.command_blocks_padding_footer;
@@ -2855,26 +2885,54 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // Step 1: Compute block regions from natural (unshifted) positions.
                     // Blocks start at padding_top and accumulate gaps between them.
                     // No scroll offset is applied yet.
+                    // Collapsed blocks have their row_count and height reduced.
+                    //
+                    // We also accumulate collapse_savings_px: the total pixels
+                    // saved by hiding viewport rows in collapsed blocks.
+                    // This uses viewport row counts (rc - visible_rc), NOT
+                    // total block rows, because the viewport is what determines
+                    // the pixel budget.
                     var region_start: u16 = 0;
                     var screen_y_i: i32 = @intCast(padding_top);
                     var grid_y_i: i32 = 0;
+                    var collapse_savings_px: u32 = 0;
                     var yi: u16 = 0;
                     while (yi < row_len) : (yi += 1) {
                         if (yi > 0 and yi < block_indices.len and
                             block_indices[yi] != block_indices[yi - 1])
                         {
                             const rc: u16 = yi - region_start;
-                            const h: i32 = @intCast(@as(u32, rc) * cell_h);
                             const bi = block_indices[region_start];
                             const ec: i32 = if (bi < block_exit_codes.len) block_exit_codes[bi] else -1;
+                            const is_collapsed = if (bi < block_collapsed.len) block_collapsed[bi] else false;
+
+                            // For collapsed blocks, limit visible rows to prompt+input+preview.
+                            const visible_rc: u16 = if (is_collapsed) vis: {
+                                const out_off: u16 = if (bi < block_output_row_offset.len) block_output_row_offset[bi] else 0;
+                                const max_visible = out_off + preview_lines;
+                                break :vis @min(rc, max_visible);
+                            } else rc;
+
+                            // hidden_lines uses total block rows (for the "[N lines hidden]" indicator).
+                            const total_block_rows: u16 = if (bi < block_total_rows.len) block_total_rows[bi] else rc;
+                            const hidden = if (total_block_rows > visible_rc) total_block_rows - visible_rc else 0;
+
+                            // Accumulate viewport collapse savings (viewport rows hidden, not total).
+                            if (is_collapsed and rc > visible_rc) {
+                                collapse_savings_px += @as(u32, rc - visible_rc) * cell_h;
+                            }
+
+                            const h: i32 = @intCast(@as(u32, visible_rc) * cell_h);
                             const sy: u32 = if (screen_y_i >= 0) @intCast(screen_y_i) else 0;
                             self.block_regions.append(self.alloc, .{
                                 .first_row = region_start,
-                                .row_count = rc,
+                                .row_count = visible_rc,
                                 .screen_y_px = sy,
                                 .height_px = @intCast(h),
                                 .grid_y_offset = @floatFromInt(grid_y_i),
                                 .exit_code = ec,
+                                .collapsed = is_collapsed,
+                                .hidden_lines = hidden,
                             }) catch {};
 
                             screen_y_i += h + @as(i32, @intCast(total_gap));
@@ -2885,26 +2943,38 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // Final block
                     {
                         const rc: u16 = @intCast(row_len - @as(usize, region_start));
-                        const h: i32 = @intCast(@as(u32, rc) * cell_h);
                         const final_bi = block_indices[region_start];
                         const final_ec: i32 = if (final_bi < block_exit_codes.len) block_exit_codes[final_bi] else -1;
+                        const is_collapsed = if (final_bi < block_collapsed.len) block_collapsed[final_bi] else false;
+
+                        const visible_rc: u16 = if (is_collapsed) vis: {
+                            const out_off: u16 = if (final_bi < block_output_row_offset.len) block_output_row_offset[final_bi] else 0;
+                            const max_visible = out_off + preview_lines;
+                            break :vis @min(rc, max_visible);
+                        } else rc;
+
+                        const total_block_rows: u16 = if (final_bi < block_total_rows.len) block_total_rows[final_bi] else rc;
+                        const hidden = if (total_block_rows > visible_rc) total_block_rows - visible_rc else 0;
+
+                        // Accumulate viewport collapse savings for final block too.
+                        if (is_collapsed and rc > visible_rc) {
+                            collapse_savings_px += @as(u32, rc - visible_rc) * cell_h;
+                        }
+
+                        const h: i32 = @intCast(@as(u32, visible_rc) * cell_h);
                         const final_sy: u32 = if (screen_y_i >= 0) @intCast(screen_y_i) else 0;
                         self.block_regions.append(self.alloc, .{
                             .first_row = region_start,
-                            .row_count = rc,
+                            .row_count = visible_rc,
                             .screen_y_px = final_sy,
                             .height_px = @intCast(h),
                             .grid_y_offset = @floatFromInt(grid_y_i),
                             .exit_code = final_ec,
+                            .collapsed = is_collapsed,
+                            .hidden_lines = hidden,
                         }) catch {};
                     }
 
-                    // Step 2: Compute gap_overflow — how many pixels the inter-block
-                    // gaps push content past the viewport bottom. Use content-aware
-                    // bottom: when following the cursor, only count rows up to the
-                    // cursor so empty rows below don't cause premature scrolling.
-                    // This gives a "document" feel — blocks start at the top and
-                    // only scroll when real content fills the viewport.
                     const gap_overflow: u32 = gap_overflow: {
                         if (self.block_regions.items.len < 2) break :gap_overflow 0;
 
@@ -2926,7 +2996,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             const last = self.block_regions.items[self.block_regions.items.len - 1];
                             break :content_bottom last.screen_y_px + last.height_px;
                         };
-                        const viewport_bottom = padding_top + @as(u32, @intCast(row_len)) * cell_h;
+                        const viewport_bottom = (padding_top + @as(u32, @intCast(row_len)) * cell_h) -| collapse_savings_px;
 
                         if (content_bottom > viewport_bottom) {
                             break :gap_overflow content_bottom - viewport_bottom;

@@ -33,6 +33,38 @@ exit_code: ?i32 = null,
 /// Whether this block has been manually collapsed by the user.
 collapsed: bool = false,
 
+/// Cached row count for completed blocks. Set when the block is closed
+/// by addBlock() and immutable thereafter. Null for the active block
+/// (whose extent is still growing) and blocks not yet closed.
+cached_row_count: ?u32 = null,
+
+/// Count rows between two pins (exclusive of limit pin's row).
+/// Used for computing block row counts from prompt_start to end.
+pub fn countRowsBetweenPins(start: Pin, limit: Pin) u32 {
+    var count: u32 = 0;
+    var it = start.rowIterator(.right_down, limit);
+    while (it.next()) |row_pin| {
+        if (row_pin.node == limit.node and row_pin.y == limit.y) break;
+        count += 1;
+    }
+    return if (count == 0) 1 else count;
+}
+
+/// Count rows from a pin to the end of the page list.
+/// Used for active blocks that have no end pin.
+pub fn countRowsFromPin(start: Pin) u32 {
+    var count: u32 = 0;
+    var node = start.node;
+    // Count remaining rows in the start node.
+    count += node.data.size.rows - start.y;
+    // Count full rows in subsequent nodes.
+    while (node.next) |next| {
+        node = next;
+        count += node.data.size.rows;
+    }
+    return if (count == 0) 1 else count;
+}
+
 /// Extract the user's input command text from the terminal buffer.
 ///
 /// Reads cell codepoints between `input_start` and `output_start`
@@ -130,6 +162,13 @@ pub const BlockList = struct {
             if (prev.end == null) {
                 const end_pin = try self.pages.trackPin(prompt_pin);
                 prev.end = end_pin;
+                // Cache the row count now that we know the block's extent.
+                if (!prev.prompt_start.garbage) {
+                    prev.cached_row_count = Block.countRowsBetweenPins(
+                        prev.prompt_start.*,
+                        end_pin.*,
+                    );
+                }
             }
         }
 
@@ -342,4 +381,58 @@ test "Block: outputText stub" {
     var buf: [256]u8 = undefined;
     const text = b.outputText(&s.pages, &buf);
     try testing.expectEqual(@as(usize, 0), text.len);
+}
+
+test "BlockList: addBlock caches row count on closed block" {
+    var s = try Screen.init(testing.allocator, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    defer s.deinit();
+
+    var bl = BlockList.init(testing.allocator, &s.pages);
+    defer bl.deinit();
+
+    const node = s.pages.pages.first.?;
+    _ = try bl.addBlock(.{ .node = node, .y = 0 });
+    _ = try bl.addBlock(.{ .node = node, .y = 8 });
+
+    // The first block (rows 0-7) should have cached_row_count = 8.
+    try testing.expect(bl.blocks.items[0].cached_row_count != null);
+    try testing.expectEqual(@as(u32, 8), bl.blocks.items[0].cached_row_count.?);
+
+    // The second (active) block should not have a cache.
+    try testing.expect(bl.blocks.items[1].cached_row_count == null);
+}
+
+test "Block: countRowsBetweenPins" {
+    var s = try Screen.init(testing.allocator, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    defer s.deinit();
+
+    const node = s.pages.pages.first.?;
+    const start: Pin = .{ .node = node, .y = 2 };
+    const limit: Pin = .{ .node = node, .y = 7 };
+
+    // Rows 2,3,4,5,6 = 5 rows (exclusive of row 7).
+    try testing.expectEqual(@as(u32, 5), Block.countRowsBetweenPins(start, limit));
+}
+
+test "Block: countRowsBetweenPins adjacent" {
+    var s = try Screen.init(testing.allocator, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    defer s.deinit();
+
+    const node = s.pages.pages.first.?;
+    const start: Pin = .{ .node = node, .y = 3 };
+    const limit: Pin = .{ .node = node, .y = 4 };
+
+    // Row 3 only = 1 row.
+    try testing.expectEqual(@as(u32, 1), Block.countRowsBetweenPins(start, limit));
+}
+
+test "Block: countRowsBetweenPins same row" {
+    var s = try Screen.init(testing.allocator, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    defer s.deinit();
+
+    const node = s.pages.pages.first.?;
+    const pin: Pin = .{ .node = node, .y = 5 };
+
+    // Same row: the iterator breaks immediately, count=0 → returns 1 (minimum).
+    try testing.expectEqual(@as(u32, 1), Block.countRowsBetweenPins(pin, pin));
 }

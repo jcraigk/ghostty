@@ -166,6 +166,8 @@ pub const DerivedConfig = struct {
     clipboard_write: configpkg.ClipboardAccess,
     enquiry_response: []const u8,
     conditional_state: configpkg.ConditionalState,
+    auto_collapse_threshold: ?u16,
+    collapse_preview_lines: u16,
 
     pub fn init(
         alloc_gpa: Allocator,
@@ -202,6 +204,8 @@ pub const DerivedConfig = struct {
             .clipboard_write = config.@"clipboard-write",
             .enquiry_response = try alloc.dupe(u8, config.@"enquiry-response"),
             .conditional_state = config._conditional_state,
+            .auto_collapse_threshold = config.@"command-blocks-auto-collapse-threshold",
+            .collapse_preview_lines = config.@"command-blocks-collapse-preview-lines",
 
             // This has to be last so that we copy AFTER the arena allocations
             // above happen (Zig assigns in order).
@@ -271,6 +275,10 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
 
     // Set our default cursor style
     term.screens.active.cursor.cursor_style = opts.config.cursor_style;
+
+    // Set block collapse config so it's available when OSC 133 A arrives.
+    term.auto_collapse_threshold = opts.config.auto_collapse_threshold;
+    term.collapse_preview_lines = opts.config.collapse_preview_lines;
 
     // Setup our terminal size in pixels for certain requests.
     term.width_px = term.cols * opts.size.cell.width;
@@ -472,6 +480,11 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
             config.image_storage_limit,
         );
     }
+
+    // Update block collapse config on the terminal so it's available
+    // immediately when OSC 133 A arrives on the termio thread.
+    self.terminal.auto_collapse_threshold = config.auto_collapse_threshold;
+    self.terminal.collapse_preview_lines = config.collapse_preview_lines;
 }
 
 /// Resize the terminal.
@@ -651,6 +664,28 @@ pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
         self.terminal.screens.active.scroll(.{ .delta_prompt = delta });
+    }
+
+    try self.renderer_wakeup.notify();
+}
+
+/// Toggle collapse on the currently highlighted command block.
+pub fn toggleBlockCollapse(self: *Termio) !void {
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        self.terminal.toggleHighlightedBlockCollapse();
+    }
+
+    try self.renderer_wakeup.notify();
+}
+
+/// Navigate to the previous or next command block.
+pub fn gotoBlock(self: *Termio, direction: anytype) !void {
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        self.terminal.gotoBlock(direction == .previous);
     }
 
     try self.renderer_wakeup.notify();

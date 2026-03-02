@@ -2925,6 +2925,24 @@ keybind: Keybinds = .{},
 /// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
 @"command-blocks-tint-highlight": ?Color = .{ .r = 0x06, .g = 0x0d, .b = 0x2d },
 
+/// Number of output preview lines to show when a command block is
+/// collapsed. When set to 0, collapsed blocks show only the prompt and
+/// input lines (no output). When set to N > 0, the first N output lines
+/// remain visible. Only applies when `command-blocks` is enabled.
+@"command-blocks-collapse-preview-lines": u16 = 0,
+
+/// Automatically collapse completed blocks when new commands are
+/// started. The value specifies how many recent completed blocks to
+/// keep expanded — blocks further back are automatically collapsed.
+///
+/// For example, a value of 1 means that when a new prompt appears, the
+/// block before the most recently completed block is auto-collapsed.
+/// A value of 0 collapses the most recently completed block immediately
+/// when a new prompt starts.
+///
+/// Leave empty (default) to disable auto-collapse entirely.
+@"command-blocks-auto-collapse-threshold": ?u16 = null,
+
 /// Custom entries into the command palette.
 ///
 /// Each entry requires the title, the corresponding action, and an optional

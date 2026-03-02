@@ -9,6 +9,7 @@ const highlight = @import("highlight.zig");
 const point = @import("point.zig");
 const size = @import("size.zig");
 const page = @import("page.zig");
+const Block = @import("Block.zig");
 const PageList = @import("PageList.zig");
 const Selection = @import("Selection.zig");
 const Screen = @import("Screen.zig");
@@ -95,6 +96,18 @@ pub const RenderState = struct {
     /// Per-block exit code, indexed by block index from block_indices.
     /// Values: 0 = success, positive = error, -1 = still running / unknown.
     block_exit_codes: []i32 = &.{},
+
+    /// Per-block collapsed state, indexed by viewport block index.
+    block_collapsed: []bool = &.{},
+
+    /// Per-block output row offset — how many rows into the block before
+    /// output starts (i.e., prompt+input row count). Indexed by viewport
+    /// block index.
+    block_output_row_offset: []u16 = &.{},
+
+    /// Per-block total row count (all rows, not just visible). Used for
+    /// the "[N lines hidden]" indicator. Indexed by viewport block index.
+    block_total_rows: []u16 = &.{},
 
     /// Pixel scroll offset for block mode. Positive = content shifted up.
     /// The renderer applies this as a uniform Y offset to all block regions.
@@ -605,13 +618,28 @@ pub const RenderState = struct {
                 self.block_indices[yi] = blk;
             }
 
-            // Populate per-block exit codes from the Terminal's block list.
+            // Populate per-block metadata from the Terminal's block list.
             const num_blocks: usize = @as(usize, blk) + 1;
             if (self.block_exit_codes.len < num_blocks) {
                 if (self.block_exit_codes.len > 0) alloc.free(self.block_exit_codes);
                 self.block_exit_codes = try alloc.alloc(i32, num_blocks);
             }
+            if (self.block_collapsed.len < num_blocks) {
+                if (self.block_collapsed.len > 0) alloc.free(self.block_collapsed);
+                self.block_collapsed = try alloc.alloc(bool, num_blocks);
+            }
+            if (self.block_output_row_offset.len < num_blocks) {
+                if (self.block_output_row_offset.len > 0) alloc.free(self.block_output_row_offset);
+                self.block_output_row_offset = try alloc.alloc(u16, num_blocks);
+            }
+            if (self.block_total_rows.len < num_blocks) {
+                if (self.block_total_rows.len > 0) alloc.free(self.block_total_rows);
+                self.block_total_rows = try alloc.alloc(u16, num_blocks);
+            }
             @memset(self.block_exit_codes[0..num_blocks], -1);
+            @memset(self.block_collapsed[0..num_blocks], false);
+            @memset(self.block_output_row_offset[0..num_blocks], 0);
+            @memset(self.block_total_rows[0..num_blocks], 0);
             const prev_highlighted = self.highlighted_block_idx;
             self.highlighted_block_idx = null;
             if (t.block_list) |*bl| {
@@ -622,6 +650,27 @@ pub const RenderState = struct {
                     if (yi < row_pins.len) {
                         const block = bl.blockAtPin(row_pins[yi]) orelse continue;
                         self.block_exit_codes[bi] = block.exit_code orelse -1;
+                        self.block_collapsed[bi] = block.collapsed;
+
+                        // Compute total row count from cached value or live count.
+                        const total_rows: u32 = if (block.cached_row_count) |c|
+                            c
+                        else if (block.end) |end_ptr|
+                            if (!end_ptr.garbage)
+                                Block.countRowsBetweenPins(block.prompt_start.*, end_ptr.*)
+                            else
+                                1
+                        else
+                            Block.countRowsFromPin(block.prompt_start.*);
+                        self.block_total_rows[bi] = @intCast(@min(total_rows, std.math.maxInt(u16)));
+
+                        // Compute output row offset (rows before output_start).
+                        if (block.output_start) |os| {
+                            if (!os.garbage and !block.prompt_start.garbage) {
+                                const offset = Block.countRowsBetweenPins(block.prompt_start.*, os.*);
+                                self.block_output_row_offset[bi] = @intCast(@min(offset, std.math.maxInt(u16)));
+                            }
+                        }
 
                         // Map the Terminal's highlighted block to viewport block index.
                         if (t.highlighted_block_idx) |hl_idx| {

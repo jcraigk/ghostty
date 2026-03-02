@@ -87,6 +87,15 @@ highlighted_block_idx: ?usize = null,
 /// command blocks are disabled.
 command_blocks_gap: u32 = 0,
 
+/// Auto-collapse threshold: when a new block is created, automatically
+/// collapse the block N positions back from the newest. Set by the
+/// renderer from config. null = disabled.
+auto_collapse_threshold: ?u16 = null,
+
+/// Number of output preview lines to show when a block is collapsed.
+/// Set by the renderer from config.
+collapse_preview_lines: u16 = 0,
+
 /// The color state for this terminal.
 colors: Colors,
 
@@ -1329,6 +1338,23 @@ fn blockListAddBlock(self: *Terminal) !void {
     });
     bl.pruneGarbage();
     _ = try bl.addBlock(screen.cursor.page_pin.*);
+
+    // Auto-collapse: when a new block is created and auto_collapse_threshold
+    // is set, collapse the block N+1 positions back from the end.
+    // threshold=0 → collapse the just-completed block (len-2)
+    // threshold=1 → keep 1 completed block expanded, collapse len-3
+    if (self.auto_collapse_threshold) |threshold| {
+        const items = bl.blocks.items;
+        if (items.len >= 2) {
+            const offset = @as(usize, threshold) + 2;
+            if (items.len >= offset) {
+                const target = items.len - offset;
+                if (!items[target].collapsed) {
+                    items[target].collapsed = true;
+                }
+            }
+        }
+    }
 }
 
 /// Set input_start on the active block at the current cursor position.
@@ -1369,6 +1395,62 @@ pub fn toggleBlockHighlight(self: *Terminal, block_idx: usize) void {
         }
     }
     self.highlighted_block_idx = block_idx;
+}
+
+/// Navigate to the previous or next completed command block.
+/// Sets highlighted_block_idx and scrolls viewport to make the block visible.
+/// `is_previous`: true = go to earlier block, false = go to later block.
+pub fn gotoBlock(self: *Terminal, is_previous: bool) void {
+    const bl = self.block_list orelse return;
+    const items = bl.blocks.items;
+    if (items.len < 2) return; // Need at least active + 1 completed block.
+
+    // Last completed block index (active block is items.len - 1).
+    const last_completed = items.len - 2;
+
+    if (is_previous) {
+        if (self.highlighted_block_idx) |current| {
+            // Already highlighting — go to previous.
+            if (current > 0) {
+                self.highlighted_block_idx = current - 1;
+            }
+            // At block 0 — stay there.
+        } else {
+            // Nothing highlighted — highlight the last completed block.
+            self.highlighted_block_idx = last_completed;
+        }
+    } else {
+        if (self.highlighted_block_idx) |current| {
+            if (current < last_completed) {
+                self.highlighted_block_idx = current + 1;
+            } else {
+                // At or past the last completed — deselect (return to active).
+                self.highlighted_block_idx = null;
+            }
+        }
+        // Nothing highlighted + next = no-op.
+    }
+
+    // Scroll the highlighted block's prompt_start into view.
+    if (self.highlighted_block_idx) |hl_idx| {
+        if (hl_idx < items.len) {
+            const block = &items[hl_idx];
+            if (!block.prompt_start.garbage) {
+                self.screens.active.scroll(.{
+                    .pin = block.prompt_start.*,
+                });
+            }
+        }
+    }
+}
+
+/// Toggle the collapsed state of the currently highlighted block.
+/// No-op if no block is highlighted or block_list is not active.
+pub fn toggleHighlightedBlockCollapse(self: *Terminal) void {
+    const hl_idx = self.highlighted_block_idx orelse return;
+    const bl = &(self.block_list orelse return);
+    if (hl_idx >= bl.blocks.items.len) return;
+    bl.blocks.items[hl_idx].collapsed = !bl.blocks.items[hl_idx].collapsed;
 }
 
 /// The semantic prompt type. This is used when tracking a line type and
@@ -1850,8 +1932,120 @@ fn applyBlockScrollPx(self: *Terminal, delta_px: isize) void {
     self.block_scroll_px = new_val;
 
     if (row_delta != 0) {
-        self.screens.active.scroll(.{ .delta_row = row_delta });
+        // Adjust the delta to skip over hidden rows in collapsed blocks.
+        // Without this, scrolling gets "stuck" because PageList moves through
+        // ALL rows including hidden ones, but the renderer suppresses them.
+        const adjusted_delta = self.adjustDeltaForCollapsedBlocks(row_delta);
+        self.screens.active.scroll(.{ .delta_row = adjusted_delta });
     }
+}
+
+/// Adjust a row delta to account for hidden rows in collapsed blocks.
+///
+/// When scrolling through collapsed blocks, the PageList contains all rows
+/// including hidden output rows that the renderer will suppress. Without
+/// adjustment, these hidden rows consume scroll input without any visual
+/// effect. This function inflates the delta to skip over hidden rows.
+///
+/// The approach: starting from the current viewport position, walk in the
+/// scroll direction, counting both visible and hidden rows. For every
+/// hidden row encountered, add 1 to the delta so the viewport lands on
+/// a visible row.
+fn adjustDeltaForCollapsedBlocks(self: *Terminal, row_delta: isize) isize {
+    var bl = self.block_list orelse return row_delta;
+    if (bl.blocks.items.len == 0) return row_delta;
+
+    // Get the current viewport top-left pin.
+    const viewport_tl = self.screens.active.pages.getTopLeft(.viewport);
+
+    // We need to walk |row_delta| rows in the appropriate direction,
+    // skipping over hidden rows in collapsed blocks. The result is
+    // the total number of PageList rows to move (visible + hidden).
+    const abs_delta: usize = if (row_delta < 0) @intCast(-row_delta) else @intCast(row_delta);
+    const scrolling_up = row_delta < 0;
+
+    var pin = viewport_tl;
+    var visible_counted: usize = 0;
+    var total_moved: usize = 0;
+
+    // Walk row by row in the scroll direction.
+    while (visible_counted < abs_delta) {
+        // Move pin one row in the scroll direction.
+        const new_pin = if (scrolling_up)
+            switch (pin.upOverflow(1)) {
+                .offset => |p| @as(?@TypeOf(pin), p),
+                .overflow => @as(?@TypeOf(pin), null),
+            }
+        else
+            switch (pin.downOverflow(1)) {
+                .offset => |p| @as(?@TypeOf(pin), p),
+                .overflow => @as(?@TypeOf(pin), null),
+            };
+
+        pin = new_pin orelse break; // Hit boundary
+        total_moved += 1;
+
+        // Check if this row is hidden in a collapsed block.
+        if (isRowHiddenInCollapsedBlock(&bl, pin, self.collapse_preview_lines)) {
+            // Hidden row — don't count it as visible, just keep moving.
+            continue;
+        }
+
+        visible_counted += 1;
+    }
+
+    // If we land on a hidden row, keep going to find the next visible row.
+    while (isRowHiddenInCollapsedBlock(&bl, pin, self.collapse_preview_lines)) {
+        const new_pin = if (scrolling_up)
+            switch (pin.upOverflow(1)) {
+                .offset => |p| @as(?@TypeOf(pin), p),
+                .overflow => @as(?@TypeOf(pin), null),
+            }
+        else
+            switch (pin.downOverflow(1)) {
+                .offset => |p| @as(?@TypeOf(pin), p),
+                .overflow => @as(?@TypeOf(pin), null),
+            };
+
+        pin = new_pin orelse break;
+        total_moved += 1;
+    }
+
+    const adjusted: isize = @intCast(total_moved);
+    return if (scrolling_up) -adjusted else adjusted;
+}
+
+/// Check if a given pin falls within the hidden portion of a collapsed block.
+/// Hidden rows are output rows beyond the preview_lines limit in collapsed blocks.
+fn isRowHiddenInCollapsedBlock(
+    bl: *Block.BlockList,
+    pin: anytype,
+    preview_lines: u32,
+) bool {
+    const block = bl.blockAtPin(pin) orelse return false;
+    if (!block.collapsed) return false;
+
+    // A collapsed block hides output rows beyond collapse_preview_lines.
+    // The visible portion is: prompt rows + input rows + preview_lines output rows.
+    // Everything after that is hidden.
+    const output_start_pin = block.output_start orelse return false;
+    if (output_start_pin.garbage) return false;
+
+    // If pin is before output_start, it's in the prompt/input area (visible).
+    if (pin.before(output_start_pin.*)) return false;
+
+    // Pin is in the output area. Count how many output rows in from the start.
+    const rows_into_output = Block.countRowsBetweenPins(output_start_pin.*, pin);
+    // countRowsBetweenPins counts rows from start to limit (exclusive of limit's row),
+    // returning minimum 1 for same-row. So for same row it returns 1, but the
+    // 0-indexed output row number should be 0. Adjust accordingly.
+    const output_row_idx: u32 = if (pin.node == output_start_pin.node and pin.y == output_start_pin.y)
+        0
+    else
+        rows_into_output;
+
+    // The row is hidden if its 0-indexed output row number >= preview_lines.
+    return output_row_idx >= preview_lines;
 }
 
 /// To be called before shifting a row (as in insertLines and deleteLines)

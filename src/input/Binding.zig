@@ -489,6 +489,24 @@ pub const Action = union(enum) {
     /// Positive values scroll downwards, and negative values scroll upwards.
     jump_to_prompt: i16,
 
+    /// Toggle collapse on the currently highlighted command block.
+    ///
+    /// Requires shell integration and command-blocks mode. If no block is
+    /// highlighted, this is a no-op.
+    toggle_block_collapse,
+
+    /// Navigate to the previous completed command block.
+    ///
+    /// Requires shell integration and command-blocks mode. If no block is
+    /// currently highlighted, highlights the last completed block.
+    goto_block_previous,
+
+    /// Navigate to the next completed command block.
+    ///
+    /// Requires shell integration and command-blocks mode. Pressing next
+    /// from the last completed block deselects (returns to the active block).
+    goto_block_next,
+
     /// Write the entire scrollback into a temporary file with the specified
     /// action. The action determines what to do with the filepath.
     ///
@@ -1336,6 +1354,9 @@ pub const Action = union(enum) {
             .scroll_page_lines,
             .adjust_selection,
             .jump_to_prompt,
+            .toggle_block_collapse,
+            .goto_block_previous,
+            .goto_block_next,
             .write_scrollback_file,
             .write_screen_file,
             .write_selection_file,
