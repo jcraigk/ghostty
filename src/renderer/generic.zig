@@ -1985,6 +1985,37 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             }
                         }
 
+                        // Collapse indicator: semi-transparent overlay on the
+                        // last visible row of collapsed blocks. Signals that
+                        // output is hidden below. Starts after the stripe so
+                        // the stripe color remains visible.
+                        if (region.collapsed and region.hidden_lines > 0 and region.height_px > 0) {
+                            const cell_h = self.grid_metrics.cell_height;
+                            const indicator_h = @min(cell_h, region.height_px);
+                            const indicator_y = region.screen_y_px + region.height_px - indicator_h;
+                            const collapse_scratch: f32 = sep_row + 1.0 +
+                                @as(f32, @floatFromInt(num_blocks)) * 2.0 +
+                                @as(f32, @floatFromInt(block_idx));
+                            pass.step(.{
+                                .pipeline = self.shaders.pipelines.cell_bg,
+                                .uniforms = frame.uniforms.buffer,
+                                .buffers = &.{ null, frame.cells_bg.buffer },
+                                .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                .scissor = .{
+                                    .x = stripe_w,
+                                    .y = indicator_y,
+                                    .width = self.size.screen.width -| stripe_w,
+                                    .height = indicator_h,
+                                },
+                                .block_params = .{
+                                    .block_y_offset = 0,
+                                    .block_first_row = collapse_scratch,
+                                    .block_x_offset = -pad_left,
+                                    .block_y_flat = 1.0,
+                                },
+                            });
+                        }
+
                         // Separator + stripe through gap to next block.
                         if (ri > 0) {
                             const prev = self.block_regions.items[ri - 1];
@@ -2786,8 +2817,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     break :blk 0;
                 break :blk state.block_indices[state.block_indices.len - 1] + 1;
             };
-            // Extra rows: 1 separator + num_blocks stripe + num_blocks tint.
-            const scratch_rows: u16 = if (num_blocks > 0) 1 + num_blocks * 2 else 0;
+            // Extra rows: 1 separator + num_blocks stripe + num_blocks tint + num_blocks collapse.
+            const scratch_rows: u16 = if (num_blocks > 0) 1 + num_blocks * 3 else 0;
             const total_rows = state.rows + scratch_rows;
 
             const grid_size_diff =
@@ -2886,16 +2917,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // Blocks start at padding_top and accumulate gaps between them.
                     // No scroll offset is applied yet.
                     // Collapsed blocks have their row_count and height reduced.
-                    //
-                    // We also accumulate collapse_savings_px: the total pixels
-                    // saved by hiding viewport rows in collapsed blocks.
-                    // This uses viewport row counts (rc - visible_rc), NOT
-                    // total block rows, because the viewport is what determines
-                    // the pixel budget.
                     var region_start: u16 = 0;
                     var screen_y_i: i32 = @intCast(padding_top);
                     var grid_y_i: i32 = 0;
-                    var collapse_savings_px: u32 = 0;
                     var yi: u16 = 0;
                     while (yi < row_len) : (yi += 1) {
                         if (yi > 0 and yi < block_indices.len and
@@ -2907,20 +2931,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             const is_collapsed = if (bi < block_collapsed.len) block_collapsed[bi] else false;
 
                             // For collapsed blocks, limit visible rows to prompt+input+preview.
+                            // Always show at least 1 output line so the block isn't empty.
                             const visible_rc: u16 = if (is_collapsed) vis: {
                                 const out_off: u16 = if (bi < block_output_row_offset.len) block_output_row_offset[bi] else 0;
-                                const max_visible = out_off + preview_lines;
+                                const min_preview = @max(preview_lines, 1);
+                                const max_visible = out_off + min_preview;
                                 break :vis @min(rc, max_visible);
                             } else rc;
 
                             // hidden_lines uses total block rows (for the "[N lines hidden]" indicator).
                             const total_block_rows: u16 = if (bi < block_total_rows.len) block_total_rows[bi] else rc;
                             const hidden = if (total_block_rows > visible_rc) total_block_rows - visible_rc else 0;
-
-                            // Accumulate viewport collapse savings (viewport rows hidden, not total).
-                            if (is_collapsed and rc > visible_rc) {
-                                collapse_savings_px += @as(u32, rc - visible_rc) * cell_h;
-                            }
 
                             const h: i32 = @intCast(@as(u32, visible_rc) * cell_h);
                             const sy: u32 = if (screen_y_i >= 0) @intCast(screen_y_i) else 0;
@@ -2949,17 +2970,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                         const visible_rc: u16 = if (is_collapsed) vis: {
                             const out_off: u16 = if (final_bi < block_output_row_offset.len) block_output_row_offset[final_bi] else 0;
-                            const max_visible = out_off + preview_lines;
+                            const min_preview = @max(preview_lines, 1);
+                            const max_visible = out_off + min_preview;
                             break :vis @min(rc, max_visible);
                         } else rc;
 
                         const total_block_rows: u16 = if (final_bi < block_total_rows.len) block_total_rows[final_bi] else rc;
                         const hidden = if (total_block_rows > visible_rc) total_block_rows - visible_rc else 0;
-
-                        // Accumulate viewport collapse savings for final block too.
-                        if (is_collapsed and rc > visible_rc) {
-                            collapse_savings_px += @as(u32, rc - visible_rc) * cell_h;
-                        }
 
                         const h: i32 = @intCast(@as(u32, visible_rc) * cell_h);
                         const final_sy: u32 = if (screen_y_i >= 0) @intCast(screen_y_i) else 0;
@@ -2996,7 +3013,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             const last = self.block_regions.items[self.block_regions.items.len - 1];
                             break :content_bottom last.screen_y_px + last.height_px;
                         };
-                        const viewport_bottom = (padding_top + @as(u32, @intCast(row_len)) * cell_h) -| collapse_savings_px;
+                        // Use the raw viewport pixel extent (without subtracting
+                        // collapse_savings_px). Collapsed blocks save pixels by
+                        // rendering fewer rows, which is already reflected in block
+                        // region heights and content_bottom. Subtracting savings
+                        // here creates instability when collapsed blocks enter/leave
+                        // the viewport (savings change with scroll position, causing
+                        // gap_overflow to jump between frames).
+                        const viewport_bottom = padding_top + @as(u32, @intCast(row_len)) * cell_h;
 
                         if (content_bottom > viewport_bottom) {
                             break :gap_overflow content_bottom - viewport_bottom;
@@ -3169,6 +3193,46 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     while (tcx < cols_u) : (tcx += 1) {
                         self.cells.bgCell(@intCast(tint_row), @intCast(tcx)).* = tc;
                     }
+
+                    // Collapse indicator scratch row: semi-transparent overlay
+                    // drawn on the last visible row of collapsed blocks.
+                    // Uses the block's tint/highlight color as base so the
+                    // indicator blends correctly with the block's background.
+                    const collapse_row: usize = sep_row + 1 + @as(usize, num_blocks) * 2 + bi;
+                    const collapse_color: [4]u8 = blk: {
+                        // Start with the tint color for this block (same logic as tint scratch row above).
+                        const base: [4]u8 = if (is_highlighted)
+                            self.blendHighlightTint(bg_rgba)
+                        else if (ec >= 128 and ec <= 255)
+                            self.blendSignalTint(bg_rgba)
+                        else if (ec > 0)
+                            self.blendErrorTint(bg_rgba)
+                        else if (ec == 0)
+                            self.blendSuccessTint(bg_rgba)
+                        else
+                            bg_rgba;
+                        // Blend the tint toward terminal bg to create
+                        // the dimming effect, with moderate opacity.
+                        break :blk .{
+                            @intCast((@as(u16, base[0]) * 3 + @as(u16, bg.r)) / 4),
+                            @intCast((@as(u16, base[1]) * 3 + @as(u16, bg.g)) / 4),
+                            @intCast((@as(u16, base[2]) * 3 + @as(u16, bg.b)) / 4),
+                            200,
+                        };
+                    };
+                    var ccx: usize = 0;
+                    while (ccx < cols_u) : (ccx += 1) {
+                        self.cells.bgCell(@intCast(collapse_row), @intCast(ccx)).* = collapse_color;
+                    }
+                }
+            }
+
+            // Render collapse indicator text on collapsed blocks.
+            for (self.block_regions.items) |region| {
+                if (region.collapsed and region.hidden_lines > 0 and region.row_count > 0) {
+                    const last_row: terminal.size.CellCountInt =
+                        @intCast(region.first_row + region.row_count - 1);
+                    self.addCollapseIndicatorText(last_row, region.hidden_lines);
                 }
             }
 
@@ -4079,6 +4143,62 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             try self.addUnderline(@intCast(coord.x), @intCast(coord.y), .single, screen_fg, 255);
             if (cp.wide and coord.x < self.cells.size.columns - 1) {
                 try self.addUnderline(@intCast(coord.x + 1), @intCast(coord.y), .single, screen_fg, 255);
+            }
+        }
+
+        /// Render collapse indicator text on the last visible row of a
+        /// collapsed block. The text (e.g. "... 5 lines hidden ...") is
+        /// right-aligned and rendered in a subdued foreground color.
+        fn addCollapseIndicatorText(
+            self: *Self,
+            y: terminal.size.CellCountInt,
+            hidden_lines: u16,
+        ) void {
+            // Format the indicator string into a stack buffer.
+            var buf: [64]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, " ... {d} lines hidden ", .{hidden_lines}) catch return;
+
+            // Compute right-aligned starting column. Leave 1 cell margin
+            // on the right so the text doesn't touch the edge.
+            const cols: u16 = self.cells.size.columns;
+            const text_len: u16 = @intCast(@min(text.len, cols));
+            if (text_len == 0) return;
+            const start_x: u16 = cols - text_len;
+
+            // Use a dimmed foreground color (blend fg toward bg).
+            const fg = self.terminal_state.colors.foreground;
+            const bg = self.terminal_state.colors.background;
+            const dim_fg: terminal.color.RGB = .{
+                .r = @intCast((@as(u16, fg.r) + @as(u16, bg.r)) / 2),
+                .g = @intCast((@as(u16, fg.g) + @as(u16, bg.g)) / 2),
+                .b = @intCast((@as(u16, fg.b) + @as(u16, bg.b)) / 2),
+            };
+
+            // Render each character as a fg cell glyph.
+            for (text, 0..) |ch, i| {
+                const x: u16 = start_x + @as(u16, @intCast(i));
+                if (x >= cols) break;
+
+                const render_ = self.font_grid.renderCodepoint(
+                    self.alloc,
+                    @intCast(ch),
+                    .regular,
+                    .text,
+                    .{ .grid_metrics = self.grid_metrics },
+                ) catch continue;
+                const render = render_ orelse continue;
+
+                self.cells.add(self.alloc, .text, .{
+                    .atlas = .grayscale,
+                    .grid_pos = .{ x, y },
+                    .color = .{ dim_fg.r, dim_fg.g, dim_fg.b, 255 },
+                    .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
+                    .glyph_size = .{ render.glyph.width, render.glyph.height },
+                    .bearings = .{
+                        @intCast(render.glyph.offset_x),
+                        @intCast(render.glyph.offset_y),
+                    },
+                }) catch continue;
             }
         }
 

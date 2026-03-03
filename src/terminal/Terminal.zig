@@ -1343,13 +1343,14 @@ fn blockListAddBlock(self: *Terminal) !void {
     // is set, collapse the block N+1 positions back from the end.
     // threshold=0 → collapse the just-completed block (len-2)
     // threshold=1 → keep 1 completed block expanded, collapse len-3
+    // Blocks with no output (output_start == null) are never collapsed.
     if (self.auto_collapse_threshold) |threshold| {
         const items = bl.blocks.items;
         if (items.len >= 2) {
             const offset = @as(usize, threshold) + 2;
             if (items.len >= offset) {
                 const target = items.len - offset;
-                if (!items[target].collapsed) {
+                if (!items[target].collapsed and items[target].output_start != null) {
                     items[target].collapsed = true;
                 }
             }
@@ -1445,12 +1446,16 @@ pub fn gotoBlock(self: *Terminal, is_previous: bool) void {
 }
 
 /// Toggle the collapsed state of the currently highlighted block.
-/// No-op if no block is highlighted or block_list is not active.
+/// No-op if no block is highlighted, block_list is not active, or the
+/// block has no output (nothing to collapse).
 pub fn toggleHighlightedBlockCollapse(self: *Terminal) void {
     const hl_idx = self.highlighted_block_idx orelse return;
     const bl = &(self.block_list orelse return);
     if (hl_idx >= bl.blocks.items.len) return;
-    bl.blocks.items[hl_idx].collapsed = !bl.blocks.items[hl_idx].collapsed;
+    const block = &bl.blocks.items[hl_idx];
+    // Blocks with no output cannot be collapsed.
+    if (block.output_start == null) return;
+    block.collapsed = !block.collapsed;
 }
 
 /// The semantic prompt type. This is used when tracking a line type and
