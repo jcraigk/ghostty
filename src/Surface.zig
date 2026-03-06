@@ -2754,7 +2754,7 @@ pub fn keyCallback(
         defer self.renderer_state.mutex.unlock();
         const t: *terminal.Terminal = self.renderer_state.terminal;
         if (t.block_list != null) {
-            const scrolled_up = (t.block_scroll_px orelse 0) > 0 or
+            const scrolled_up = t.scroll_offset_px > 0 or
                 !t.screens.active.viewportIsBottom();
             if (scrolled_up) {
                 t.scrollViewport(.bottom);
@@ -4152,151 +4152,60 @@ pub fn mouseButtonCallback(
                 }
 
                 // Command blocks: toggle block highlight on single click.
-                // We iterate viewport rows to find block boundaries (same
-                // logic as render.zig block_indices), compute visual Y
-                // extents including inter-block gaps, and match the click
-                // pixel position to the correct block.
-                if (t.block_list) |*bl| blk: {
-                    const gap_px = t.command_blocks_gap;
-                    if (gap_px == 0) break :blk;
+                // Use BlockLayout to map click position to block.
+                if (t.block_list != null) blk: {
+                    const layout = t.block_layout orelse break :blk;
+                    const brl = layout.block_offsets.items;
+                    if (brl.len == 0) break :blk;
 
                     const cell_h: u32 = self.size.cell.height;
                     if (cell_h == 0) break :blk;
                     const padding_top: u32 = self.size.padding.top;
-                    const viewport_rows: u32 = @intCast(screen.pages.rows);
+                    // Use rows * cell_height for viewport_h to match Terminal.height_px
+                    // and the renderer's viewport_top_px computation.
+                    const viewport_h: u32 = @as(u32, t.rows) * cell_h;
+                    const doc_h: u32 = layout.total_height_px;
+                    const scroll_px: u32 = t.scroll_offset_px;
 
-                    // Build viewport block boundaries by scanning rows for
-                    // semantic_prompt == .prompt, mirroring render.zig logic.
-                    // Store up to 64 block boundaries (first row of each block).
-                    const max_vp_blocks = 64;
-                    var block_first_rows: [max_vp_blocks]u32 = undefined;
-                    var block_pins: [max_vp_blocks]terminal.PageList.Pin = undefined;
-                    var num_vp_blocks: u32 = 1; // Block 0 always starts at row 0
-                    block_first_rows[0] = 0;
+                    // Convert click pixel Y to virtual document Y.
+                    // Clamped to 0: when doc_h < viewport_h, content starts at top.
+                    const viewport_top_i64: i64 = @max(0, @as(i64, @intCast(doc_h)) -
+                        @as(i64, @intCast(viewport_h)) -
+                        @as(i64, @intCast(scroll_px)));
+                    const content_y_f: f64 = pos.y - @as(f64, @floatFromInt(padding_top));
+                    if (content_y_f < 0) break :blk;
+                    const virtual_y_i64: i64 = @as(i64, @intFromFloat(content_y_f)) + viewport_top_i64;
+                    if (virtual_y_i64 < 0) break :blk;
+                    const virtual_y: u32 = @intCast(@min(virtual_y_i64, @as(i64, @intCast(doc_h))));
 
-                    var row_it = screen.pages.rowIterator(
-                        .right_down,
-                        .{ .viewport = .{} },
-                        null,
-                    );
-                    var yi: u32 = 0;
-                    // Store the pin for row 0
-                    if (row_it.next()) |first_pin| {
-                        block_pins[0] = first_pin;
-                        yi = 1;
-                    }
-                    while (row_it.next()) |row_pin| : (yi += 1) {
-                        const rac = row_pin.rowAndCell();
-                        if (rac.row.semantic_prompt == .prompt and yi > 0) {
-                            if (num_vp_blocks < max_vp_blocks) {
-                                block_first_rows[num_vp_blocks] = yi;
-                                block_pins[num_vp_blocks] = row_pin;
-                                num_vp_blocks += 1;
-                            }
-                        }
-                    }
-
-                    // Compute cursor-aware gap_overflow to match the renderer.
-                    // The renderer uses content_bottom based on the cursor
-                    // position, not the full viewport. This is critical because
-                    // when following (not scrolled), the cursor might be in the
-                    // middle of the viewport, giving gap_overflow = 0.
-                    const gap_overflow: u32 = go: {
-                        if (num_vp_blocks < 2) break :go 0;
-
-                        // Find the cursor's viewport row.
-                        const cursor_vp_y: ?u32 = cvp: {
-                            if (screen.viewportIsBottom()) {
-                                break :cvp @intCast(screen.cursor.y);
-                            }
-                            if (screen.pages.pointFromPin(
-                                .viewport,
-                                screen.cursor.page_pin.*,
-                            )) |cp| {
-                                break :cvp @intCast(cp.viewport.y);
-                            }
-                            break :cvp null;
-                        };
-
-                        // Compute content_bottom in natural (unshifted) coords.
-                        const content_bottom: u32 = cb: {
-                            if (cursor_vp_y) |cvy| {
-                                // Find which viewport block the cursor is in.
-                                for (0..num_vp_blocks) |bi| {
-                                    const bstart = block_first_rows[bi];
-                                    const bend = if (bi + 1 < num_vp_blocks)
-                                        block_first_rows[bi + 1]
-                                    else
-                                        viewport_rows;
-                                    if (cvy >= bstart and cvy < bend) {
-                                        const rows_in = cvy - bstart + 1;
-                                        break :cb bstart * cell_h + @as(u32, @intCast(bi)) * gap_px + rows_in * cell_h;
-                                    }
-                                }
-                            }
-                            // Cursor not in viewport: use full extent.
-                            const last_start = block_first_rows[num_vp_blocks - 1];
-                            const last_rows = viewport_rows - last_start;
-                            break :cb last_start * cell_h + (num_vp_blocks - 1) * gap_px + last_rows * cell_h;
-                        };
-
-                        const viewport_pixel_h = viewport_rows * cell_h;
-                        break :go if (content_bottom > viewport_pixel_h)
-                            content_bottom - viewport_pixel_h
-                        else
-                            0;
-                    };
-                    const scroll_px: u32 = if (t.block_scroll_px) |sp|
-                        if (sp > 0) @intCast(sp) else 0
-                    else
-                        0;
-                    const effective_shift: u32 = if (gap_overflow > scroll_px)
-                        gap_overflow - scroll_px
-                    else
-                        0;
-
-                    // Click Y relative to content origin (padding_top),
-                    // then add effective_shift to get the unshifted position.
-                    const raw_click_y: f64 = pos.y - @as(f64, @floatFromInt(padding_top));
-                    if (raw_click_y < 0) break :blk;
-                    const click_y: u32 = @as(u32, @intFromFloat(raw_click_y)) + effective_shift;
-
-                    // Walk viewport blocks and find which one contains click_y.
-                    var found_pin: ?terminal.PageList.Pin = null;
-                    for (0..num_vp_blocks) |bi| {
-                        const start_row = block_first_rows[bi];
-                        const end_row = if (bi + 1 < num_vp_blocks)
-                            block_first_rows[bi + 1]
-                        else
-                            viewport_rows;
-                        const block_visual_start = start_row * cell_h + @as(u32, @intCast(bi)) * gap_px;
-                        const block_visual_end = block_visual_start + (end_row - start_row) * cell_h;
-
-                        if (click_y >= block_visual_start and click_y < block_visual_end) {
-                            found_pin = block_pins[bi];
+                    // Find which block contains this virtual Y.
+                    for (brl) |info| {
+                        const block_end = info.virtual_y_px + info.visible_height_px;
+                        if (virtual_y >= info.virtual_y_px and virtual_y < block_end) {
+                            t.toggleBlockHighlight(info.block_list_index);
+                            try self.queueRender();
                             break;
-                        }
-                    }
-
-                    // Map the viewport pin back to a block_list index.
-                    if (found_pin) |fp| {
-                        if (bl.blockAtPin(fp)) |block_ptr| {
-                            // Find the index of this block in the list.
-                            for (bl.blocks.items, 0..) |*b, idx| {
-                                if (b == block_ptr) {
-                                    t.toggleBlockHighlight(idx);
-                                    try self.queueRender();
-                                    break;
-                                }
-                            }
                         }
                     }
                 }
             },
 
-            // Double click, select the word under our mouse.
-            // First try to detect if we're clicking on a URL to select the entire URL.
+            // Double click: in command-blocks mode, toggle collapse/expand
+            // on the highlighted block. Otherwise, select the word under
+            // our mouse (or URL).
             2 => {
+                // Command blocks: double-click on an empty cell toggles
+                // collapse on the highlighted block. Double-click on a
+                // cell with text falls through to normal word selection.
+                if (t.highlighted_block_idx != null and t.block_list != null) {
+                    const rac = pin.rowAndCell();
+                    if (!rac.cell.hasText()) {
+                        t.toggleHighlightedBlockCollapse();
+                        try self.queueRender();
+                        break :click;
+                    }
+                }
+
                 const sel_ = sel: {
                     // Try link detection without requiring modifier keys
                     if (self.linkAtPin(
@@ -4903,116 +4812,56 @@ pub fn cursorPosCallback(
         try self.mouseRefreshLinks(pos, pos_vp, over_link);
     }
 
-    // Command blocks: pointer cursor on completed blocks, text cursor
-    // on the active (last) block. We use pixel Y with gap awareness to
-    // determine which visual block the mouse is over. The active block
-    // is always the last viewport block.
+    // Command blocks: determine if the mouse is over a completed block
+    // (pointer cursor) vs. the active block (text cursor).
+    // Use BlockLayout to map mouse position to the virtual document.
     if (self.io.terminal.block_list != null and !self.mouse.over_link) {
         const t: *terminal.Terminal = self.renderer_state.terminal;
-        if (t.block_list) |*bl| {
-            if (bl.activeBlock()) |active| {
-                if (!active.prompt_start.garbage) {
-                    const screen2: *terminal.Screen = t.screens.active;
-                    // Get the viewport row for the active block's start.
-                    const active_vp = screen2.pages.pointFromPin(
-                        .viewport,
-                        active.prompt_start.*,
-                    );
-                    // If the active block isn't in the viewport, the mouse is
-                    // definitely over completed blocks (pointer cursor).
-                    const in_history = if (active_vp) |avp| ih: {
-                        const cell_h: u32 = self.size.cell.height;
-                        const gap_px = t.command_blocks_gap;
-                        if (cell_h == 0 or gap_px == 0) {
-                            break :ih pos_vp.y < avp.viewport.y;
-                        }
-                        // Single pass: count prompt boundaries in viewport,
-                        // and those before the active block's row, plus
-                        // build block boundary info for gap_overflow calc.
-                        var gaps_before_active: u32 = 0;
-                        var all_gaps: u32 = 0;
-                        const viewport_rows: u32 = @intCast(screen2.pages.rows);
-                        const max_cs_blocks = 64;
-                        var cs_block_rows: [max_cs_blocks]u32 = undefined;
-                        var cs_num_blocks: u32 = 1;
-                        cs_block_rows[0] = 0;
-                        var count_it = screen2.pages.rowIterator(
-                            .right_down,
-                            .{ .viewport = .{} },
-                            null,
-                        );
-                        var ri: u32 = 0;
-                        while (count_it.next()) |rp| : (ri += 1) {
-                            if (ri > 0) {
-                                const rac = rp.rowAndCell();
-                                if (rac.row.semantic_prompt == .prompt) {
-                                    all_gaps += 1;
-                                    if (ri < avp.viewport.y) gaps_before_active += 1;
-                                    if (cs_num_blocks < max_cs_blocks) {
-                                        cs_block_rows[cs_num_blocks] = ri;
-                                        cs_num_blocks += 1;
-                                    }
-                                }
-                            }
-                        }
-                        // Active block's visual Y start (natural coords).
-                        const active_visual_y: u32 = avp.viewport.y * cell_h + gaps_before_active * gap_px;
+        if (t.block_layout) |layout| cursor_shape: {
+            const brl = layout.block_offsets.items;
+            if (brl.len == 0) break :cursor_shape;
 
-                        // Cursor-aware gap_overflow (same as click handler).
-                        const cs_gap_overflow: u32 = cgo: {
-                            if (cs_num_blocks < 2) break :cgo 0;
-                            const cs_cursor_vp_y: ?u32 = ccvp: {
-                                if (screen2.viewportIsBottom()) {
-                                    break :ccvp @intCast(screen2.cursor.y);
-                                }
-                                if (screen2.pages.pointFromPin(
-                                    .viewport,
-                                    screen2.cursor.page_pin.*,
-                                )) |ccp| {
-                                    break :ccvp @intCast(ccp.viewport.y);
-                                }
-                                break :ccvp null;
-                            };
-                            const cs_content_bottom: u32 = ccb: {
-                                if (cs_cursor_vp_y) |ccvy| {
-                                    for (0..cs_num_blocks) |cbi| {
-                                        const cbstart = cs_block_rows[cbi];
-                                        const cbend = if (cbi + 1 < cs_num_blocks)
-                                            cs_block_rows[cbi + 1]
-                                        else
-                                            viewport_rows;
-                                        if (ccvy >= cbstart and ccvy < cbend) {
-                                            const crows_in = ccvy - cbstart + 1;
-                                            break :ccb cbstart * cell_h + @as(u32, @intCast(cbi)) * gap_px + crows_in * cell_h;
-                                        }
-                                    }
-                                }
-                                const cls = cs_block_rows[cs_num_blocks - 1];
-                                break :ccb cls * cell_h + (cs_num_blocks - 1) * gap_px + (viewport_rows - cls) * cell_h;
-                            };
-                            break :cgo if (cs_content_bottom > viewport_rows * cell_h)
-                                cs_content_bottom - viewport_rows * cell_h
-                            else
-                                0;
-                        };
-                        const scroll_px2: u32 = if (t.block_scroll_px) |sp| if (sp > 0) @intCast(sp) else 0 else 0;
-                        const eff_shift: u32 = if (cs_gap_overflow > scroll_px2) cs_gap_overflow - scroll_px2 else 0;
+            const cell_h: u32 = self.size.cell.height;
+            if (cell_h == 0) break :cursor_shape;
+            const padding_top: u32 = self.size.padding.top;
+            // Use rows * cell_height for viewport_h to match Terminal.height_px.
+            const viewport_h: u32 = @as(u32, t.rows) * cell_h;
+            const doc_h: u32 = layout.total_height_px;
+            const scroll_px: u32 = t.scroll_offset_px;
 
-                        // Mouse pixel Y adjusted to unshifted content coordinates.
-                        const padding_top: u32 = self.size.padding.top;
-                        const mouse_content_y: f64 = pos.y - @as(f64, @floatFromInt(padding_top));
-                        if (mouse_content_y < 0) break :ih true;
-                        const adjusted_y: u32 = @as(u32, @intFromFloat(mouse_content_y)) + eff_shift;
-                        break :ih adjusted_y < active_visual_y;
-                    } else true; // Active block not in viewport
-
-                    _ = try self.rt_app.performAction(
-                        .{ .surface = self },
-                        .mouse_shape,
-                        if (in_history) .default else .text,
-                    );
-                }
+            // Convert mouse pixel Y to virtual document Y.
+            // Clamped to 0: when doc_h < viewport_h, content starts at top.
+            const viewport_top_i64: i64 = @max(0, @as(i64, @intCast(doc_h)) -
+                @as(i64, @intCast(viewport_h)) -
+                @as(i64, @intCast(scroll_px)));
+            const content_y_f: f64 = pos.y - @as(f64, @floatFromInt(padding_top));
+            if (content_y_f < 0) {
+                // Above content area — treat as history (pointer cursor).
+                _ = try self.rt_app.performAction(
+                    .{ .surface = self },
+                    .mouse_shape,
+                    .default,
+                );
+                break :cursor_shape;
             }
+            const virtual_y_i64: i64 = @as(i64, @intFromFloat(content_y_f)) + viewport_top_i64;
+
+            // The active block is the last one in the layout.
+            // If the mouse virtual Y is before the active block's start,
+            // we're over completed blocks (pointer cursor).
+            const active_info = brl[brl.len - 1];
+            const in_history = if (virtual_y_i64 < 0)
+                true
+            else ih: {
+                const virtual_y: u32 = @intCast(@min(virtual_y_i64, @as(i64, @intCast(doc_h))));
+                break :ih virtual_y < active_info.virtual_y_px;
+            };
+
+            _ = try self.rt_app.performAction(
+                .{ .surface = self },
+                .mouse_shape,
+                if (in_history) .default else .text,
+            );
         }
     }
 
@@ -5375,124 +5224,72 @@ fn blockAdjustedY(self: *const Surface, raw_y: f64) f64 {
     const t: *terminal.Terminal = self.renderer_state.terminal;
     if (t.block_list == null) return raw_y;
 
-    const gap_px = t.command_blocks_gap;
-    if (gap_px == 0) return raw_y;
+    const layout = t.block_layout orelse return raw_y;
+    const brl = layout.block_offsets.items;
+    if (brl.len == 0) return raw_y;
 
     const cell_h: u32 = self.size.cell.height;
     if (cell_h == 0) return raw_y;
 
     const padding_top: u32 = self.size.padding.top;
-    const screen: *terminal.Screen = t.screens.active;
-    const viewport_rows: u32 = @intCast(screen.pages.rows);
+    // Use rows * cell_height for viewport_h to match Terminal.height_px.
+    const viewport_h: u32 = @as(u32, t.rows) * cell_h;
+    const doc_h: u32 = layout.total_height_px;
+    const scroll_px: u32 = t.scroll_offset_px;
 
-    // Build viewport block boundaries by scanning rows for
-    // semantic_prompt == .prompt, mirroring render.zig logic.
-    const max_vp_blocks = 64;
-    var block_first_rows: [max_vp_blocks]u32 = undefined;
-    var num_vp_blocks: u32 = 1;
-    block_first_rows[0] = 0;
+    // viewport_top_px: the virtual Y at the top of the viewport.
+    // Clamped to 0: when doc_h < viewport_h, content renders from the top.
+    const viewport_top_i64: i64 = @max(0, @as(i64, @intCast(doc_h)) -
+        @as(i64, @intCast(viewport_h)) -
+        @as(i64, @intCast(scroll_px)));
 
-    var row_it = screen.pages.rowIterator(
-        .right_down,
-        .{ .viewport = .{} },
-        null,
-    );
-    var ri: u32 = 0;
-    _ = row_it.next(); // skip row 0
-    ri = 1;
-    while (row_it.next()) |rp| : (ri += 1) {
-        const rac = rp.rowAndCell();
-        if (rac.row.semantic_prompt == .prompt and ri > 0) {
-            if (num_vp_blocks < max_vp_blocks) {
-                block_first_rows[num_vp_blocks] = ri;
-                num_vp_blocks += 1;
-            }
-        }
-    }
-
-    if (num_vp_blocks < 2) return raw_y;
-
-    // Cursor-aware gap_overflow, matching render.zig logic.
-    const cursor_vp_y: ?u32 = cvp: {
-        if (screen.viewportIsBottom()) {
-            break :cvp @intCast(screen.cursor.y);
-        }
-        if (screen.pages.pointFromPin(
-            .viewport,
-            screen.cursor.page_pin.*,
-        )) |cp| {
-            break :cvp @intCast(cp.viewport.y);
-        }
-        break :cvp null;
-    };
-
-    const content_bottom: u32 = cb: {
-        if (cursor_vp_y) |cvy| {
-            for (0..num_vp_blocks) |bi| {
-                const bstart = block_first_rows[bi];
-                const bend = if (bi + 1 < num_vp_blocks)
-                    block_first_rows[bi + 1]
-                else
-                    viewport_rows;
-                if (cvy >= bstart and cvy < bend) {
-                    const rows_in = cvy - bstart + 1;
-                    break :cb bstart * cell_h + @as(u32, @intCast(bi)) * gap_px + rows_in * cell_h;
-                }
-            }
-        }
-        const last_start = block_first_rows[num_vp_blocks - 1];
-        const last_rows = viewport_rows - last_start;
-        break :cb last_start * cell_h + (num_vp_blocks - 1) * gap_px + last_rows * cell_h;
-    };
-
-    const viewport_pixel_h = viewport_rows * cell_h;
-    const gap_overflow: u32 = if (content_bottom > viewport_pixel_h)
-        content_bottom - viewport_pixel_h
-    else
-        0;
-    const scroll_px: u32 = if (t.block_scroll_px) |sp|
-        if (sp > 0) @intCast(sp) else 0
-    else
-        0;
-    const effective_shift: u32 = if (gap_overflow > scroll_px)
-        gap_overflow - scroll_px
-    else
-        0;
-
-    // Convert raw pixel Y to content-relative coordinate (subtract padding,
-    // add effective_shift to get unshifted position).
+    // Convert screen pixel Y to virtual document Y.
     const content_y_f: f64 = raw_y - @as(f64, @floatFromInt(padding_top));
     if (content_y_f < 0) return raw_y;
-    const content_y: u32 = @as(u32, @intFromFloat(content_y_f)) + effective_shift;
+    const virtual_y_i64: i64 = @as(i64, @intFromFloat(content_y_f)) + viewport_top_i64;
+    if (virtual_y_i64 < 0) return raw_y;
+    const virtual_y: u32 = @intCast(@min(virtual_y_i64, @as(i64, @intCast(doc_h))));
 
-    // Walk blocks to find how many gap pixels are before content_y,
-    // and compute the gap-free grid Y.
-    var accumulated_gap: u32 = 0;
-    for (1..num_vp_blocks) |bi| {
-        const bstart = block_first_rows[bi];
-        const block_visual_start = bstart * cell_h + @as(u32, @intCast(bi)) * gap_px;
-        // If the click is before this block's visual start, it might be in a gap.
-        // The gap region is [block_visual_start - gap_px, block_visual_start).
-        const gap_start = block_visual_start - gap_px;
-        if (content_y < gap_start) {
-            // Click is before this gap; done accumulating.
-            break;
-        } else if (content_y < block_visual_start) {
-            // Click is inside the gap — clamp to the end of the previous block.
-            accumulated_gap += content_y - gap_start;
-            break;
-        } else {
-            // Click is past this gap entirely.
-            accumulated_gap += gap_px;
+    // Find which block contains this virtual Y and map to a viewport row.
+    const screen_active: *terminal.Screen = t.screens.active;
+
+    for (brl, 0..) |info, layout_i| {
+        const block_end = info.virtual_y_px + info.visible_height_px;
+
+        // Check if virtual_y is in this block's content.
+        if (virtual_y >= info.virtual_y_px and virtual_y < block_end) {
+            const offset_in_block: u32 = virtual_y - info.virtual_y_px;
+            const row_in_block: u32 = @min(offset_in_block / cell_h, info.visible_rows -| 1);
+
+            // Use the block's prompt_start_pin to find the viewport row.
+            if (screen_active.pages.pointFromPin(.viewport, info.prompt_start_pin)) |vp_pt| {
+                const first_row: u32 = @intCast(vp_pt.viewport.y);
+                const target_row: u32 = first_row + row_in_block;
+                return @as(f64, @floatFromInt(padding_top)) +
+                    @as(f64, @floatFromInt(target_row)) * @as(f64, @floatFromInt(cell_h)) +
+                    @as(f64, @floatFromInt(cell_h)) / 2.0;
+            }
+            return raw_y;
+        }
+
+        // Check if virtual_y is in a gap between this block and the next.
+        if (layout_i + 1 < brl.len) {
+            const next = brl[layout_i + 1];
+            if (virtual_y >= block_end and virtual_y < next.virtual_y_px) {
+                // In a gap — clamp to the last visible row of the current block.
+                if (screen_active.pages.pointFromPin(.viewport, info.prompt_start_pin)) |vp_pt| {
+                    const first_row: u32 = @intCast(vp_pt.viewport.y);
+                    const target_row: u32 = first_row + info.visible_rows -| 1;
+                    return @as(f64, @floatFromInt(padding_top)) +
+                        @as(f64, @floatFromInt(target_row)) * @as(f64, @floatFromInt(cell_h)) +
+                        @as(f64, @floatFromInt(cell_h)) / 2.0;
+                }
+                return raw_y;
+            }
         }
     }
 
-    // The correct grid row for this screen pixel is:
-    //   grid_row = (content_y + effective_shift - accumulated_gap) / cell_h
-    // posToViewport computes: (adjusted_y - padding_top) / cell_h
-    // So: adjusted_y = raw_y + effective_shift - accumulated_gap
-    const adj_f: f64 = raw_y + @as(f64, @floatFromInt(effective_shift)) - @as(f64, @floatFromInt(accumulated_gap));
-    return @max(adj_f, @as(f64, @floatFromInt(padding_top)));
+    return raw_y;
 }
 
 /// Scroll to the bottom of the viewport.
@@ -5971,7 +5768,27 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 self.renderer_state.mutex.lock();
                 defer self.renderer_state.mutex.unlock();
                 const t: *terminal.Terminal = self.renderer_state.terminal;
-                t.screens.active.scroll(.{ .row = n });
+
+                // When BlockLayout is active, convert the row offset (from
+                // the top of the document, as the scrollbar sends it) into
+                // scroll_offset_px (pixels from the bottom).
+                if (t.block_layout) |*layout| {
+                    layout.ensureValid();
+                    const doc_h = layout.total_height_px;
+                    const viewport_h = t.height_px;
+                    const cell_h: u32 = if (t.rows > 0 and viewport_h > 0)
+                        viewport_h / @as(u32, t.rows)
+                    else
+                        16;
+                    // The row offset from the top in pixels.
+                    const top_px: u32 = @intCast(@as(u64, n) * @as(u64, cell_h));
+                    // scroll_offset_px = max_scroll - top_px, clamped.
+                    const max_scroll: u32 = if (doc_h > viewport_h) doc_h - viewport_h else 0;
+                    t.scroll_offset_px = max_scroll -| top_px;
+                    t.syncPageListViewport();
+                } else {
+                    t.screens.active.scroll(.{ .row = n });
+                }
             }
 
             try self.queueRender();

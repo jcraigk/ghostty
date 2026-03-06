@@ -9,7 +9,7 @@ const highlight = @import("highlight.zig");
 const point = @import("point.zig");
 const size = @import("size.zig");
 const page = @import("page.zig");
-const Block = @import("Block.zig");
+const BlockLayout = @import("BlockLayout.zig");
 const PageList = @import("PageList.zig");
 const Selection = @import("Selection.zig");
 const Screen = @import("Screen.zig");
@@ -87,35 +87,25 @@ pub const RenderState = struct {
     /// values for comparison.
     viewport_pin: ?PageList.Pin = null,
 
-    /// Per-row block metadata stored as side arrays, indexed by screen Y.
-    /// Only allocated when command_blocks_gap > 0.
-    block_gaps: []BlockGap = &.{},
-    block_indices: []u16 = &.{},
-    command_blocks_gap: u8 = 0,
+    /// Pixel scroll offset for block mode. 0 = following (at bottom).
+    /// Positive values = scrolled up by that many pixels in the virtual document.
+    scroll_offset_px: u32 = 0,
 
-    /// Per-block exit code, indexed by block index from block_indices.
-    /// Values: 0 = success, positive = error, -1 = still running / unknown.
-    block_exit_codes: []i32 = &.{},
+    /// Snapshot of BlockLayout data for the renderer. Populated from
+    /// Terminal.block_layout during update(). This is the single source
+    /// of truth for block positioning, exit codes, collapse state, etc.
+    block_render_list: std.ArrayListUnmanaged(BlockRenderInfo) = .empty,
 
-    /// Per-block collapsed state, indexed by viewport block index.
-    block_collapsed: []bool = &.{},
+    /// Total virtual document height in pixels from BlockLayout.
+    total_doc_height_px: u32 = 0,
 
-    /// Per-block output row offset — how many rows into the block before
-    /// output starts (i.e., prompt+input row count). Indexed by viewport
-    /// block index.
-    block_output_row_offset: []u16 = &.{},
+    /// BlockLayout config snapshot for the renderer.
+    block_layout_cell_height: u32 = 0,
+    block_layout_gap_px: u32 = 0,
 
-    /// Per-block total row count (all rows, not just visible). Used for
-    /// the "[N lines hidden]" indicator. Indexed by viewport block index.
-    block_total_rows: []u16 = &.{},
-
-    /// Pixel scroll offset for block mode. Positive = content shifted up.
-    /// The renderer applies this as a uniform Y offset to all block regions.
-    block_scroll_px: i32 = 0,
-
-    /// Viewport-relative block index of the highlighted block, or null
-    /// if no block is currently highlighted in the visible viewport.
-    highlighted_block_idx: ?u16 = null,
+    /// Index into BlockList.blocks of the highlighted block, or null
+    /// if no block is currently highlighted. Matches Terminal.highlighted_block_idx.
+    highlighted_block_idx: ?usize = null,
 
     /// The cached selection so we can avoid expensive selection calculations
     /// if possible.
@@ -268,11 +258,37 @@ pub const RenderState = struct {
         full,
     };
 
-    pub const BlockGap = enum(u8) {
-        none = 0,
-        footer = 1,
-        separator = 2,
-        header = 3,
+    /// Snapshot of a single block's layout info for the renderer.
+    /// Copied from BlockLayout.BlockLayoutInfo during update() so the
+    /// renderer can read it outside the terminal mutex.
+    pub const BlockRenderInfo = struct {
+        /// Absolute pixel Y in the virtual document where content starts.
+        virtual_y_px: u32,
+        /// Visible content height in pixels.
+        visible_height_px: u32,
+        /// Number of visible content rows.
+        visible_rows: u32,
+        /// Total content rows (before collapse).
+        total_rows: u32,
+        /// Prompt/input rows before output_start.
+        output_row_offset: u16,
+        /// Exit code (-1 = running/unknown).
+        exit_code: i32,
+        /// Whether collapsed.
+        collapsed: bool,
+        /// Index into BlockList.blocks (stable).
+        block_list_index: usize,
+        /// The prompt_start pin for row data access.
+        prompt_start_pin: PageList.Pin,
+        /// Total extent including trailing gap.
+        total_extent_px: u32,
+        /// First row of this block in the cell buffer (viewport-relative).
+        /// Set to max(u16) if the block's prompt_start is not in the viewport.
+        viewport_first_row: u16 = std.math.maxInt(u16),
+
+        pub fn hiddenLines(self: BlockRenderInfo) u32 {
+            return self.total_rows -| self.visible_rows;
+        }
     };
 
     const SelectionCache = struct {
@@ -291,9 +307,7 @@ pub const RenderState = struct {
             cells.deinit(alloc);
         }
         self.row_data.deinit(alloc);
-        if (self.block_gaps.len > 0) alloc.free(self.block_gaps);
-        if (self.block_indices.len > 0) alloc.free(self.block_indices);
-        if (self.block_exit_codes.len > 0) alloc.free(self.block_exit_codes);
+        self.block_render_list.deinit(alloc);
     }
 
     /// Update the render state to the latest terminal state.
@@ -593,108 +607,92 @@ pub const RenderState = struct {
         }
         assert(y == self.rows);
 
-        // Populate block metadata side arrays after the main loop so
-        // the loop itself stays untouched. This scans the already-populated
-        // row_rows to find prompt boundaries.
-        if (self.command_blocks_gap > 0) {
-            if (self.block_gaps.len != self.rows) {
-                if (self.block_gaps.len > 0) alloc.free(self.block_gaps);
-                if (self.block_indices.len > 0) alloc.free(self.block_indices);
-                self.block_gaps = try alloc.alloc(BlockGap, self.rows);
-                self.block_indices = try alloc.alloc(u16, self.rows);
-            }
-            @memset(self.block_gaps, .none);
-            var blk: u16 = 0;
-            for (row_rows, 0..) |row, yi| {
-                // Every primary prompt row (not continuation) after the first
-                // viewport row starts a new block. This handles:
-                // - Consecutive prompts (empty enters): each .prompt = new block
-                // - Output→prompt: new block after command output
-                // - First prompt scrolled off: output rows at top stay block 0,
-                //   next .prompt row starts block 1
-                // Multi-line prompts use .prompt_continuation for wrapped lines,
-                // so only the primary .prompt triggers a boundary.
-                if (row.semantic_prompt == .prompt and yi > 0) blk += 1;
-                self.block_indices[yi] = blk;
-            }
+        // Pass per-pixel scroll offset for block mode.
+        self.scroll_offset_px = t.scroll_offset_px;
 
-            // Populate per-block metadata from the Terminal's block list.
-            const num_blocks: usize = @as(usize, blk) + 1;
-            if (self.block_exit_codes.len < num_blocks) {
-                if (self.block_exit_codes.len > 0) alloc.free(self.block_exit_codes);
-                self.block_exit_codes = try alloc.alloc(i32, num_blocks);
-            }
-            if (self.block_collapsed.len < num_blocks) {
-                if (self.block_collapsed.len > 0) alloc.free(self.block_collapsed);
-                self.block_collapsed = try alloc.alloc(bool, num_blocks);
-            }
-            if (self.block_output_row_offset.len < num_blocks) {
-                if (self.block_output_row_offset.len > 0) alloc.free(self.block_output_row_offset);
-                self.block_output_row_offset = try alloc.alloc(u16, num_blocks);
-            }
-            if (self.block_total_rows.len < num_blocks) {
-                if (self.block_total_rows.len > 0) alloc.free(self.block_total_rows);
-                self.block_total_rows = try alloc.alloc(u16, num_blocks);
-            }
-            @memset(self.block_exit_codes[0..num_blocks], -1);
-            @memset(self.block_collapsed[0..num_blocks], false);
-            @memset(self.block_output_row_offset[0..num_blocks], 0);
-            @memset(self.block_total_rows[0..num_blocks], 0);
+        // Snapshot BlockLayout data and detect highlight/collapse changes.
+        if (t.block_layout) |*layout| {
+            layout.ensureValid();
+            const src = layout.block_offsets.items;
+
+            // Detect highlight changes.
             const prev_highlighted = self.highlighted_block_idx;
-            self.highlighted_block_idx = null;
-            if (t.block_list) |*bl| {
-                var prev_blk_idx: u16 = std.math.maxInt(u16);
-                for (self.block_indices[0..self.rows], 0..) |bi, yi| {
-                    if (bi == prev_blk_idx) continue;
-                    prev_blk_idx = bi;
-                    if (yi < row_pins.len) {
-                        const block = bl.blockAtPin(row_pins[yi]) orelse continue;
-                        self.block_exit_codes[bi] = block.exit_code orelse -1;
-                        self.block_collapsed[bi] = block.collapsed;
-
-                        // Compute total row count from cached value or live count.
-                        const total_rows: u32 = if (block.cached_row_count) |c|
-                            c
-                        else if (block.end) |end_ptr|
-                            if (!end_ptr.garbage)
-                                Block.countRowsBetweenPins(block.prompt_start.*, end_ptr.*)
-                            else
-                                1
-                        else
-                            Block.countRowsFromPin(block.prompt_start.*);
-                        self.block_total_rows[bi] = @intCast(@min(total_rows, std.math.maxInt(u16)));
-
-                        // Compute output row offset (rows before output_start).
-                        if (block.output_start) |os| {
-                            if (!os.garbage and !block.prompt_start.garbage) {
-                                const offset = Block.countRowsBetweenPins(block.prompt_start.*, os.*);
-                                self.block_output_row_offset[bi] = @intCast(@min(offset, std.math.maxInt(u16)));
-                            }
-                        }
-
-                        // Map the Terminal's highlighted block to viewport block index.
-                        if (t.highlighted_block_idx) |hl_idx| {
-                            if (hl_idx < bl.blocks.items.len) {
-                                const hl_block = &bl.blocks.items[hl_idx];
-                                // Compare by identity: same block pointer.
-                                if (block == hl_block) {
-                                    self.highlighted_block_idx = bi;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // If the highlighted block changed, force a full rebuild so
-            // the tint scratch rows are updated with the correct color.
+            self.highlighted_block_idx = t.highlighted_block_idx;
             if (!std.meta.eql(prev_highlighted, self.highlighted_block_idx)) {
                 self.dirty = .full;
             }
-        }
 
-        // Pass per-pixel scroll offset for block mode.
-        self.block_scroll_px = t.block_scroll_px orelse 0;
+            // Detect collapsed state changes by comparing against previous snapshot.
+            const prev = self.block_render_list.items;
+            if (prev.len == src.len) {
+                for (prev, src) |old, new| {
+                    if (old.collapsed != new.collapsed) {
+                        self.dirty = .full;
+                        break;
+                    }
+                }
+            } else if (prev.len > 0) {
+                self.dirty = .full;
+            }
+
+            // Copy layout data and compute viewport_first_row for each block.
+            // We use screen-space coordinates to handle blocks above the viewport:
+            // get the viewport top-left's screen row, then for each block compute
+            // (block_screen_row - viewport_screen_row) to get the viewport-relative row.
+            const vp_screen_y: usize = if (s.pages.pointFromPin(.screen, viewport_pin)) |pt|
+                pt.screen.y
+            else
+                0;
+
+            self.block_render_list.clearRetainingCapacity();
+            self.block_render_list.ensureTotalCapacity(alloc, src.len) catch {};
+            for (src) |info| {
+                // Find where this block's prompt_start is in the cell buffer (viewport).
+                // Use screen coordinates and subtract viewport top to handle blocks
+                // that start above the viewport (where pointFromPin(.viewport) returns null).
+                const vp_row: u16 = vp_row_calc: {
+                    const screen_pt = s.pages.pointFromPin(.screen, info.prompt_start_pin) orelse
+                        break :vp_row_calc std.math.maxInt(u16);
+                    const block_screen_y: usize = screen_pt.screen.y;
+                    if (block_screen_y >= vp_screen_y) {
+                        // Block starts at or below viewport top.
+                        const offset = block_screen_y - vp_screen_y;
+                        if (offset >= self.rows) {
+                            // Block starts past the cell buffer — mark as not in viewport.
+                            break :vp_row_calc std.math.maxInt(u16);
+                        }
+                        break :vp_row_calc @intCast(@min(offset, std.math.maxInt(u16) - 1));
+                    } else {
+                        // Block starts above viewport. Return 0; the renderer will
+                        // use clip_top_rows to handle the partial visibility.
+                        break :vp_row_calc 0;
+                    }
+                };
+
+                self.block_render_list.append(alloc, .{
+                    .virtual_y_px = info.virtual_y_px,
+                    .visible_height_px = info.visible_height_px,
+                    .visible_rows = info.visible_rows,
+                    .total_rows = info.total_rows,
+                    .output_row_offset = info.output_row_offset,
+                    .exit_code = info.exit_code,
+                    .collapsed = info.collapsed,
+                    .block_list_index = info.block_list_index,
+                    .prompt_start_pin = info.prompt_start_pin,
+                    .total_extent_px = info.total_extent_px,
+                    .viewport_first_row = vp_row,
+                }) catch {};
+            }
+            self.total_doc_height_px = layout.total_height_px;
+            self.block_layout_cell_height = layout.config.cell_height;
+            self.block_layout_gap_px = layout.config.gapPx();
+        } else {
+            self.highlighted_block_idx = null;
+            self.block_render_list.clearRetainingCapacity();
+            self.total_doc_height_px = 0;
+            self.block_layout_cell_height = 0;
+            self.block_layout_gap_px = 0;
+        }
 
         // If our screen has a selection, then mark the rows with the
         // selection. We do this outside of the loop above because its unlikely

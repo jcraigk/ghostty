@@ -30,6 +30,7 @@ const size = @import("size.zig");
 const pagepkg = @import("page.zig");
 const style = @import("style.zig");
 const Block = @import("Block.zig");
+const BlockLayout = @import("BlockLayout.zig");
 const Screen = @import("Screen.zig");
 const ScreenSet = @import("ScreenSet.zig");
 const Page = pagepkg.Page;
@@ -70,22 +71,21 @@ pwd: std.ArrayList(u8),
 /// sequences. Only populated when command-blocks is enabled.
 block_list: ?Block.BlockList = null,
 
-/// Per-pixel scroll offset for command-blocks mode. When non-null,
-/// this is the number of pixels the viewport content is shifted up.
-/// The renderer applies this as a uniform Y offset to all block regions.
-/// Null means "follow the active area" (no scroll offset).
-block_scroll_px: ?i32 = null,
+/// Pixel-based virtual document layout computed from block_list.
+/// The single source of truth for block positioning, scroll bounds,
+/// and viewport mapping. Only populated when command-blocks is enabled.
+block_layout: ?BlockLayout = null,
+
+/// Pixel scroll offset from the bottom of the virtual document.
+/// 0 = following (viewport at bottom, auto-scrolls on new output).
+/// Values > 0 = scrolled up by that many pixels.
+/// Replaces the old block_scroll_px + PageList viewport scroll model.
+scroll_offset_px: u32 = 0,
 
 /// Index into block_list.blocks of the currently highlighted block, or
 /// null if no block is highlighted. Only one block can be highlighted
 /// at a time. The active (last) block cannot be highlighted.
 highlighted_block_idx: ?usize = null,
-
-/// Total gap size (in pixels) between command blocks. This is set by
-/// the renderer so Surface can use it for click-to-block mapping.
-/// Equals footer_padding + separator(2) + header_padding, or 0 if
-/// command blocks are disabled.
-command_blocks_gap: u32 = 0,
 
 /// Auto-collapse threshold: when a new block is created, automatically
 /// collapse the block N positions back from the newest. Set by the
@@ -282,6 +282,7 @@ pub fn init(
 }
 
 pub fn deinit(self: *Terminal, alloc: Allocator) void {
+    if (self.block_layout) |*layout| layout.deinit();
     if (self.block_list) |*bl| bl.deinit();
     self.tabstops.deinit(alloc);
     self.screens.deinit(alloc);
@@ -1343,18 +1344,25 @@ fn blockListAddBlock(self: *Terminal) !void {
     // is set, collapse the block N+1 positions back from the end.
     // threshold=0 → collapse the just-completed block (len-2)
     // threshold=1 → keep 1 completed block expanded, collapse len-3
-    // Blocks with no output (output_start == null) are never collapsed.
     if (self.auto_collapse_threshold) |threshold| {
         const items = bl.blocks.items;
         if (items.len >= 2) {
             const offset = @as(usize, threshold) + 2;
             if (items.len >= offset) {
                 const target = items.len - offset;
+                // Only collapse blocks that have output (same guard as manual toggle).
                 if (!items[target].collapsed and items[target].output_start != null) {
                     items[target].collapsed = true;
                 }
             }
         }
+    }
+
+    // Initialize the layout if it doesn't exist yet, otherwise invalidate.
+    if (self.block_layout == null) {
+        self.block_layout = BlockLayout.init(self.gpa(), bl);
+    } else {
+        self.block_layout.?.invalidate();
     }
 }
 
@@ -1432,9 +1440,26 @@ pub fn gotoBlock(self: *Terminal, is_previous: bool) void {
         // Nothing highlighted + next = no-op.
     }
 
-    // Scroll the highlighted block's prompt_start into view.
+    // Scroll the highlighted block into view using BlockLayout.
     if (self.highlighted_block_idx) |hl_idx| {
-        if (hl_idx < items.len) {
+        if (self.block_layout) |*layout| {
+            if (layout.virtualYForBlock(hl_idx)) |block_y| {
+                layout.ensureValid();
+                const doc_h = layout.total_height_px;
+                const viewport_h = self.height_px;
+                if (doc_h > viewport_h) {
+                    // scroll_offset_px = doc_h - viewport_h - block_y, clamped.
+                    const max_scroll = doc_h - viewport_h;
+                    const target: u32 = if (block_y < doc_h - viewport_h)
+                        doc_h - viewport_h - block_y
+                    else
+                        0;
+                    self.scroll_offset_px = @min(target, max_scroll);
+                    self.syncPageListViewport();
+                }
+            }
+        } else if (hl_idx < items.len) {
+            // Fallback for non-layout mode.
             const block = &items[hl_idx];
             if (!block.prompt_start.garbage) {
                 self.screens.active.scroll(.{
@@ -1456,6 +1481,8 @@ pub fn toggleHighlightedBlockCollapse(self: *Terminal) void {
     // Blocks with no output cannot be collapsed.
     if (block.output_start == null) return;
     block.collapsed = !block.collapsed;
+    // Invalidate the layout so it recomputes with the new collapse state.
+    if (self.block_layout) |*layout| layout.invalidate();
 }
 
 /// The semantic prompt type. This is used when tracking a line type and
@@ -1867,190 +1894,160 @@ pub const ScrollViewport = union(enum) {
     delta_px: isize,
 };
 
-/// Scroll the viewport of the terminal grid. When block_list is active,
-/// pixel deltas are tracked for smooth per-pixel scrolling.
+/// Scroll the viewport of the terminal grid.
+///
+/// When block_layout is active, scrolling adjusts scroll_offset_px which
+/// is a single pixel offset into BlockLayout's virtual document.
+/// The PageList viewport is NOT manipulated for block scrolling — the
+/// renderer fetches row data directly from block pins.
+///
+/// When block_layout is not active, scrolling falls through to the
+/// traditional PageList viewport scroll.
 pub fn scrollViewport(self: *Terminal, behavior: ScrollViewport) void {
-    switch (behavior) {
-        .top => {
-            self.block_scroll_px = null;
-            self.screens.active.scroll(.{ .top = {} });
-        },
-        .bottom => {
-            self.block_scroll_px = null;
-            self.screens.active.scroll(.{ .active = {} });
-        },
-        .delta => |delta| {
-            if (self.block_list != null) {
-                const cell_h: isize = if (self.rows > 0 and self.height_px > 0)
+    if (self.block_layout) |*layout| {
+        switch (behavior) {
+            .top => {
+                layout.ensureValid();
+                const doc_h = layout.total_height_px;
+                const viewport_h = self.height_px;
+                self.scroll_offset_px = if (doc_h > viewport_h) doc_h - viewport_h else 0;
+                self.syncPageListViewport();
+            },
+            .bottom => {
+                self.scroll_offset_px = 0;
+                self.syncPageListViewport();
+            },
+            .delta => |delta| {
+                const cell_h: i64 = if (self.rows > 0 and self.height_px > 0)
                     @intCast(self.height_px / @as(u32, self.rows))
                 else
                     16;
-                const px = delta * cell_h;
-                self.applyBlockScrollPx(px);
-            } else {
-                self.screens.active.scroll(.{ .delta_row = delta });
-            }
-        },
-        .delta_px => |px| {
-            if (self.block_list != null) {
-                self.applyBlockScrollPx(px);
-            } else {
-                self.screens.active.scroll(.{ .delta_row = if (px > 0) 1 else -1 });
-            }
-        },
+                const px_delta: i64 = @as(i64, delta) * cell_h;
+                self.applyBlockScrollDelta(-px_delta);
+            },
+            .delta_px => |px| {
+                // Negate: terminal convention is negative = up, but
+                // scroll_offset_px increases when scrolling up.
+                self.applyBlockScrollDelta(-@as(i64, px));
+            },
+        }
+    } else {
+        switch (behavior) {
+            .top => self.screens.active.scroll(.{ .top = {} }),
+            .bottom => self.screens.active.scroll(.{ .active = {} }),
+            .delta => |delta| self.screens.active.scroll(.{ .delta_row = delta }),
+            .delta_px => |px| self.screens.active.scroll(.{ .delta_row = if (px > 0) 1 else -1 }),
+        }
     }
 }
 
-/// Apply a pixel delta to block_scroll_px and sync the PageList viewport.
-/// delta_px follows terminal convention: negative = scroll up (towards older),
-/// positive = scroll down (towards newer). block_scroll_px tracks how far
-/// we've scrolled up from the bottom (0 = following, positive = scrolled up).
-fn applyBlockScrollPx(self: *Terminal, delta_px: isize) void {
-    const current: i64 = self.block_scroll_px orelse 0;
-    // Negate: scroll-up (negative delta) increases the offset from bottom.
-    const new_i64: i64 = current - @as(i64, delta_px);
+/// Apply a pixel delta to scroll_offset_px, clamped to [0, max_scroll].
+/// Positive delta = scroll up (increase offset), negative = scroll down.
+fn applyBlockScrollDelta(self: *Terminal, delta: i64) void {
+    const layout = &(self.block_layout orelse return);
+    layout.ensureValid();
 
-    // Cap: we use a generous upper bound here. The renderer's gap_overflow
-    // and effective_shift handle the visual bounds — when block_scroll_px
-    // exceeds gap_overflow, effective_shift is simply 0 (first block at top).
-    // The PageList handles its own row-level scroll bounds internally.
-    // We just need to prevent i32 overflow.
-    const max_scroll: i64 = std.math.maxInt(i32);
-    const new_val: i32 = @intCast(std.math.clamp(new_i64, 0, max_scroll));
+    const doc_h = layout.total_height_px;
+    const viewport_h = self.height_px;
+    const max_scroll: u32 = if (doc_h > viewport_h) doc_h - viewport_h else 0;
 
-    if (new_val <= 0) {
-        self.block_scroll_px = null;
+    const current: i64 = @intCast(self.scroll_offset_px);
+    const new_val: i64 = current + delta;
+    self.scroll_offset_px = @intCast(std.math.clamp(new_val, 0, @as(i64, max_scroll)));
+    self.syncPageListViewport();
+}
+
+/// Synchronize the PageList viewport with scroll_offset_px.
+///
+/// The cell buffer (used by the renderer) is populated from the PageList
+/// viewport rows. When BlockLayout drives scrolling via scroll_offset_px,
+/// we must keep the PageList viewport approximately in sync so the cell
+/// buffer contains the rows that are actually visible on screen.
+///
+/// When following (scroll_offset_px == 0), the viewport is reset to the
+/// active area (bottom). Otherwise, we find the block at the top of the
+/// visible area and scroll the PageList to its prompt_start pin.
+pub fn syncPageListViewport(self: *Terminal) void {
+    const layout = &(self.block_layout orelse return);
+    layout.ensureValid();
+
+    const doc_h = layout.total_height_px;
+    const viewport_h = self.height_px;
+
+    // viewport_top_px: virtual Y at the top of the visible area.
+    // Clamped to 0 for small documents (same as renderer).
+    // This is computed the same way whether following (scroll_offset_px=0) or
+    // scrolled up, ensuring the PageList viewport always covers the rows that
+    // the renderer will actually draw.
+    const viewport_top_px: u32 = if (doc_h > viewport_h + self.scroll_offset_px)
+        doc_h - viewport_h - self.scroll_offset_px
+    else
+        0;
+
+    // Find the first block that overlaps the viewport.
+    const range = layout.viewportBlockRange(viewport_top_px, viewport_h);
+    if (range.start_idx >= layout.block_offsets.items.len) {
+        // No blocks visible — stay at active.
         self.screens.active.scroll(.{ .active = {} });
         return;
     }
 
-    const cell_h: i32 = blk: {
-        if (self.rows > 0 and self.height_px > 0) {
-            break :blk @intCast(self.height_px / @as(u32, self.rows));
-        }
-        break :blk 16;
-    };
-    const old_rows = @divTrunc(@as(i32, @intCast(current)), cell_h);
-    const new_rows = @divTrunc(new_val, cell_h);
-    const row_delta: isize = @as(isize, old_rows) - @as(isize, new_rows);
-
-    self.block_scroll_px = new_val;
-
-    if (row_delta != 0) {
-        // Adjust the delta to skip over hidden rows in collapsed blocks.
-        // Without this, scrolling gets "stuck" because PageList moves through
-        // ALL rows including hidden ones, but the renderer suppresses them.
-        const adjusted_delta = self.adjustDeltaForCollapsedBlocks(row_delta);
-        self.screens.active.scroll(.{ .delta_row = adjusted_delta });
-    }
-}
-
-/// Adjust a row delta to account for hidden rows in collapsed blocks.
-///
-/// When scrolling through collapsed blocks, the PageList contains all rows
-/// including hidden output rows that the renderer will suppress. Without
-/// adjustment, these hidden rows consume scroll input without any visual
-/// effect. This function inflates the delta to skip over hidden rows.
-///
-/// The approach: starting from the current viewport position, walk in the
-/// scroll direction, counting both visible and hidden rows. For every
-/// hidden row encountered, add 1 to the delta so the viewport lands on
-/// a visible row.
-fn adjustDeltaForCollapsedBlocks(self: *Terminal, row_delta: isize) isize {
-    var bl = self.block_list orelse return row_delta;
-    if (bl.blocks.items.len == 0) return row_delta;
-
-    // Get the current viewport top-left pin.
-    const viewport_tl = self.screens.active.pages.getTopLeft(.viewport);
-
-    // We need to walk |row_delta| rows in the appropriate direction,
-    // skipping over hidden rows in collapsed blocks. The result is
-    // the total number of PageList rows to move (visible + hidden).
-    const abs_delta: usize = if (row_delta < 0) @intCast(-row_delta) else @intCast(row_delta);
-    const scrolling_up = row_delta < 0;
-
-    var pin = viewport_tl;
-    var visible_counted: usize = 0;
-    var total_moved: usize = 0;
-
-    // Walk row by row in the scroll direction.
-    while (visible_counted < abs_delta) {
-        // Move pin one row in the scroll direction.
-        const new_pin = if (scrolling_up)
-            switch (pin.upOverflow(1)) {
-                .offset => |p| @as(?@TypeOf(pin), p),
-                .overflow => @as(?@TypeOf(pin), null),
-            }
-        else
-            switch (pin.downOverflow(1)) {
-                .offset => |p| @as(?@TypeOf(pin), p),
-                .overflow => @as(?@TypeOf(pin), null),
-            };
-
-        pin = new_pin orelse break; // Hit boundary
-        total_moved += 1;
-
-        // Check if this row is hidden in a collapsed block.
-        if (isRowHiddenInCollapsedBlock(&bl, pin, self.collapse_preview_lines)) {
-            // Hidden row — don't count it as visible, just keep moving.
-            continue;
-        }
-
-        visible_counted += 1;
-    }
-
-    // If we land on a hidden row, keep going to find the next visible row.
-    while (isRowHiddenInCollapsedBlock(&bl, pin, self.collapse_preview_lines)) {
-        const new_pin = if (scrolling_up)
-            switch (pin.upOverflow(1)) {
-                .offset => |p| @as(?@TypeOf(pin), p),
-                .overflow => @as(?@TypeOf(pin), null),
-            }
-        else
-            switch (pin.downOverflow(1)) {
-                .offset => |p| @as(?@TypeOf(pin), p),
-                .overflow => @as(?@TypeOf(pin), null),
-            };
-
-        pin = new_pin orelse break;
-        total_moved += 1;
-    }
-
-    const adjusted: isize = @intCast(total_moved);
-    return if (scrolling_up) -adjusted else adjusted;
-}
-
-/// Check if a given pin falls within the hidden portion of a collapsed block.
-/// Hidden rows are output rows beyond the preview_lines limit in collapsed blocks.
-fn isRowHiddenInCollapsedBlock(
-    bl: *Block.BlockList,
-    pin: anytype,
-    preview_lines: u32,
-) bool {
-    const block = bl.blockAtPin(pin) orelse return false;
-    if (!block.collapsed) return false;
-
-    // A collapsed block hides output rows beyond collapse_preview_lines.
-    // The visible portion is: prompt rows + input rows + preview_lines output rows.
-    // Everything after that is hidden.
-    const output_start_pin = block.output_start orelse return false;
-    if (output_start_pin.garbage) return false;
-
-    // If pin is before output_start, it's in the prompt/input area (visible).
-    if (pin.before(output_start_pin.*)) return false;
-
-    // Pin is in the output area. Count how many output rows in from the start.
-    const rows_into_output = Block.countRowsBetweenPins(output_start_pin.*, pin);
-    // countRowsBetweenPins counts rows from start to limit (exclusive of limit's row),
-    // returning minimum 1 for same-row. So for same row it returns 1, but the
-    // 0-indexed output row number should be 0. Adjust accordingly.
-    const output_row_idx: u32 = if (pin.node == output_start_pin.node and pin.y == output_start_pin.y)
-        0
+    const cell_h: u32 = if (self.rows > 0 and viewport_h > 0)
+        viewport_h / @as(u32, self.rows)
     else
-        rows_into_output;
+        16;
 
-    // The row is hidden if its 0-indexed output row number >= preview_lines.
-    return output_row_idx >= preview_lines;
+    // Find the first block whose content actually overlaps the viewport.
+    // viewportBlockRange may return a block whose content is above viewport_top
+    // (only its trailing gap overlaps). Starting the PageList viewport at such
+    // a block wastes rows on content above the screen, potentially pushing
+    // later blocks' rows past the cell buffer boundary.
+    const items = layout.block_offsets.items;
+    var effective_start = range.start_idx;
+    var row_offset: u32 = 0;
+
+    while (effective_start < range.end_idx) {
+        const info = items[effective_start];
+        const content_end_px = info.virtual_y_px + info.visible_height_px;
+        if (content_end_px > viewport_top_px) {
+            // This block has content in the viewport.
+            const px_into_block: u32 = if (viewport_top_px > info.virtual_y_px)
+                viewport_top_px - info.virtual_y_px
+            else
+                0;
+            row_offset = if (cell_h > 0) px_into_block / cell_h else 0;
+            break;
+        }
+        // Block's content is entirely above viewport_top — skip it.
+        effective_start += 1;
+    }
+
+    if (effective_start >= items.len) {
+        // No blocks with visible content — stay at active.
+        self.screens.active.scroll(.{ .active = {} });
+        return;
+    }
+
+    const info = items[effective_start];
+
+    // Count total content rows we need across all visible blocks.
+    var total_visible_content_rows: u32 = 0;
+    for (items[effective_start..@min(range.end_idx, items.len)]) |blk_info| {
+        total_visible_content_rows += blk_info.visible_rows;
+    }
+
+    log.debug("syncPageListViewport: doc_h={} vp_h={} scroll={} vp_top={} range=[{},{}] eff_start={} total_visible_rows={} grid_rows={} row_offset={}", .{
+        doc_h, viewport_h, self.scroll_offset_px, viewport_top_px,
+        range.start_idx, range.end_idx, effective_start, total_visible_content_rows, self.rows, row_offset,
+    });
+
+    // Get a pin at that row in the block and scroll the PageList to it.
+    if (layout.pinAtBlockRow(info.block_list_index, row_offset)) |pin| {
+        self.screens.active.scroll(.{ .pin = pin });
+    } else {
+        // Fallback: scroll to the block's prompt start.
+        self.screens.active.scroll(.{ .pin = info.prompt_start_pin });
+    }
 }
 
 /// To be called before shifting a row (as in insertLines and deleteLines)

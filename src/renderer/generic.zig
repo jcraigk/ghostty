@@ -232,12 +232,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         overlay: ?Overlay = null,
 
         /// Block regions for per-block scissored rendering.
-        /// Populated in rebuildCells from block_indices.
+        /// Populated in rebuildCells from block_render_list.
         block_regions: std.ArrayListUnmanaged(BlockRegion) = .empty,
 
-        /// Gap overflow in pixels — how many pixels inter-block gaps push
-        /// content past the viewport. Used to adjust the scrollbar.
-        gap_overflow_px: u32 = 0,
 
         const BlockRegion = struct {
             first_row: u16,
@@ -257,6 +254,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             collapsed: bool = false,
             /// Number of hidden lines (total - visible). For the indicator text.
             hidden_lines: u16 = 0,
+            /// Block index for scratch row lookup (0-based across all regions).
+            /// When using BlockLayout, this is the index within block_render_list.
+            block_idx: u16 = 0,
         };
 
         /// Map a block exit code to an RGBA stripe color using config values.
@@ -1316,15 +1316,45 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     state.terminal.scrollViewport(.bottom);
                 }
 
-                // Set the block gap pixel size for block metadata computation.
-                // Also store on the terminal so Surface can use it for click mapping.
-                const blocks_gap: u32 = if (self.config.command_blocks) gap: {
-                    break :gap @as(u32, self.config.command_blocks_padding_footer) + 2 + @as(u32, self.config.command_blocks_padding_header);
-                } else 0;
-                self.terminal_state.command_blocks_gap = @intCast(@min(255, blocks_gap));
-                state.terminal.command_blocks_gap = blocks_gap;
                 state.terminal.auto_collapse_threshold = self.config.command_blocks_auto_collapse_threshold;
                 state.terminal.collapse_preview_lines = self.config.command_blocks_collapse_preview_lines;
+
+                // Update BlockLayout configuration. This must happen before
+                // the render state snapshot so the layout is up to date.
+                if (state.terminal.block_layout) |*layout| {
+                    const Block = @import("../terminal/Block.zig");
+                    const active_cursor_row: ?u32 = acr: {
+                        if (state.terminal.block_list) |*bl| {
+                            if (bl.activeBlock()) |active| {
+                                if (!active.prompt_start.garbage) {
+                                    const cursor_pin = state.terminal.screens.active.cursor.page_pin.*;
+                                    // Safety: only compute if cursor is at or after prompt_start.
+                                    // If cursor is before prompt_start (e.g. during init), skip.
+                                    if (!cursor_pin.before(active.prompt_start.*)) {
+                                        break :acr Block.countRowsBetweenPins(active.prompt_start.*, cursor_pin);
+                                    }
+                                }
+                            }
+                        }
+                        break :acr null;
+                    };
+                    layout.setConfig(.{
+                        .cell_height = self.grid_metrics.cell_height,
+                        .footer_padding_px = self.config.command_blocks_padding_footer,
+                        .header_padding_px = self.config.command_blocks_padding_header,
+                        .separator_height_px = 2,
+                        .preview_lines = self.config.command_blocks_collapse_preview_lines,
+                        .active_block_cursor_row = active_cursor_row,
+                    });
+                }
+
+                // Sync the PageList viewport to match the BlockLayout virtual
+                // document before snapshotting. This ensures the cell buffer
+                // contains the rows the renderer will actually draw (especially
+                // when inter-block gaps push earlier blocks into the visible area).
+                if (state.terminal.block_layout != null) {
+                    state.terminal.syncPageListViewport();
+                }
 
                 // Update our terminal state
                 try self.terminal_state.update(self.alloc, state.terminal);
@@ -1516,36 +1546,33 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // check the scrollbar cache here and update if needed.
                 // This is pretty fast.
                 //
-                // In block mode, we need to adjust the scrollbar to account
-                // for gap_overflow pixels. The PageList doesn't know about
-                // inter-block gaps, so without adjustment the scrollbar
-                // won't appear when gaps push content off the viewport.
+                // When BlockLayout is active, we derive the scrollbar entirely
+                // from the virtual document dimensions. Otherwise, we use the
+                // PageList scrollbar directly.
                 var adjusted_scrollbar = critical.scrollbar;
-                if (self.config.command_blocks and self.gap_overflow_px > 0) {
-                    // The PageList doesn't know about inter-block gaps, so we
-                    // inflate the scrollbar to create a virtual document that
-                    // includes gap-equivalent rows.
-                    //
-                    // Virtual document model:
-                    //   total = pagelist.total + gap_rows
-                    //   len   = pagelist.len (unchanged)
-                    //   offset = pagelist.offset + (gap_rows - gap_rows_consumed)
-                    //
-                    // gap_rows_consumed represents how many gap-rows the user
-                    // has scrolled through. At the bottom (following), none are
-                    // consumed so offset is at its maximum. At the top, all are
-                    // consumed so offset contribution from gaps is 0.
+                if (self.config.command_blocks and self.terminal_state.total_doc_height_px > 0) {
                     const cell_h = self.grid_metrics.cell_height;
                     if (cell_h > 0) {
-                        const gap_rows = (self.gap_overflow_px + cell_h - 1) / cell_h;
-                        const scroll_px: u32 = if (self.terminal_state.block_scroll_px > 0)
-                            @intCast(self.terminal_state.block_scroll_px)
-                        else
-                            0;
-                        const consumed_px = @min(scroll_px, self.gap_overflow_px);
-                        const gap_rows_consumed = consumed_px / cell_h;
-                        adjusted_scrollbar.total += gap_rows;
-                        adjusted_scrollbar.offset += gap_rows - gap_rows_consumed;
+                        const doc_h = self.terminal_state.total_doc_height_px;
+                        // Use rows * cell_height for consistency with Terminal.height_px.
+                        const viewport_h: u32 = @as(u32, @intCast(self.terminal_state.rows)) * cell_h;
+                        const scroll_px = self.terminal_state.scroll_offset_px;
+
+                        // Only override the scrollbar when the document is taller
+                        // than the viewport. When doc_h <= viewport_h, everything
+                        // fits on screen and the PageList scrollbar (no scrollback)
+                        // is already correct.
+                        if (doc_h > viewport_h) {
+                            // Convert pixel values to row units for the scrollbar.
+                            // scroll_offset_px is pixels from the bottom (0 = following).
+                            // Scrollbar.offset is the first visible row from the top
+                            // (0 = top of history). Convert by inverting.
+                            const max_scroll = doc_h - viewport_h;
+                            const offset_from_top_px = max_scroll -| scroll_px;
+                            adjusted_scrollbar.total = (doc_h + cell_h - 1) / cell_h;
+                            adjusted_scrollbar.len = (viewport_h + cell_h - 1) / cell_h;
+                            adjusted_scrollbar.offset = offset_from_top_px / cell_h;
+                        }
                     }
                 }
                 if (!self.scrollbar.eql(adjusted_scrollbar)) {
@@ -1743,7 +1770,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const skip_start: usize = if (ri > 0) blk: {
                         const prev = self.block_regions.items[ri - 1];
                         break :blk prev.first_row + prev.row_count;
-                    } else region.first_row;
+                    } else 0;
                     var skip_row: usize = skip_start;
                     while (skip_row < region.first_row) : (skip_row += 1) {
                         const skip_idx = skip_row + 1;
@@ -1763,6 +1790,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     region.instance_offset = cursor_cells;
                     region.instance_count = count;
                     cursor_cells += count;
+
+                    log.debug("block_instance: ri={} first_row={} row_count={} inst_offset={} inst_count={} screen_y={} height={} grid_y_off={d:.1}", .{
+                        ri, region.first_row, region.row_count, region.instance_offset, region.instance_count, region.screen_y_px, region.height_px, region.grid_y_offset,
+                    });
                 }
             }
 
@@ -1853,10 +1884,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const sep_row: f32 = @floatFromInt(ts.rows);
                     const pad_left: f32 = @floatFromInt(self.size.padding.left);
                     const stripe_w: u32 = self.config.command_blocks_stripe_width;
-                    const num_blocks: u16 = if (ts.block_indices.len > 0)
-                        ts.block_indices[ts.block_indices.len - 1] + 1
-                    else
-                        0;
+                    const num_blocks: u16 = @intCast(@min(ts.block_render_list.items.len, std.math.maxInt(u16)));
 
                     for (self.block_regions.items, 0..) |region, ri| {
                         const bp: @TypeOf(pass).Step.BlockParams = .{
@@ -1896,11 +1924,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         // This fills the area between separator lines with the tint,
                         // including footer/header padding within the block's visual
                         // boundary. Also drawn when the block is highlighted (clicked).
-                        const block_idx = ts.block_indices[region.first_row];
-                        const is_hl = if (ts.highlighted_block_idx) |hl|
-                            hl == block_idx
-                        else
-                            false;
+                        const block_idx = region.block_idx;
+                        const is_hl = if (ts.highlighted_block_idx) |hl_block_list_idx| blk: {
+                            // Compare against this region's block_list_index.
+                            if (block_idx < ts.block_render_list.items.len) {
+                                break :blk ts.block_render_list.items[block_idx].block_list_index == hl_block_list_idx;
+                            }
+                            break :blk false;
+                        } else false;
                         if ((region.exit_code >= 0 or is_hl) and num_blocks > 0 and vis_bottom > vis_top) {
                             const tint_base: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(num_blocks));
                             const tint_row: f32 = tint_base + @as(f32, @floatFromInt(block_idx));
@@ -2052,8 +2083,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                     // Footer stripe (prev_end to gap_mid).
                                     const prev_sc = self.stripeColor(prev.exit_code);
                                     if (prev_sc[3] > 0 and gap_mid > prev_end) {
-                                        const prev_bi = ts.block_indices[prev.first_row];
-                                        const prev_stripe: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(prev_bi));
+                                        const prev_stripe: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(prev.block_idx));
                                         pass.step(.{
                                             .pipeline = self.shaders.pipelines.cell_bg,
                                             .uniforms = frame.uniforms.buffer,
@@ -2076,8 +2106,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                     // Header stripe (gap_mid+2 to region start).
                                     const cur_sc = self.stripeColor(region.exit_code);
                                     if (cur_sc[3] > 0 and region.screen_y_px > gap_mid + 2) {
-                                        const cur_bi = ts.block_indices[region.first_row];
-                                        const cur_stripe: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(cur_bi));
+                                        const cur_stripe: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(region.block_idx));
                                         pass.step(.{
                                             .pipeline = self.shaders.pipelines.cell_bg,
                                             .uniforms = frame.uniforms.buffer,
@@ -2811,11 +2840,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             //     std.log.warn("[rebuildCells time] {}\t{}", .{start_micro, end.since(start) / std.time.ns_per_us});
             // }
 
-            // Count visible blocks for scratch row allocation.
+            // Count blocks for scratch row allocation from BlockLayout.
             const num_blocks: u16 = blk: {
-                if (!self.config.command_blocks or state.block_indices.len == 0)
-                    break :blk 0;
-                break :blk state.block_indices[state.block_indices.len - 1] + 1;
+                if (!self.config.command_blocks) break :blk 0;
+                break :blk @intCast(@min(state.block_render_list.items.len, std.math.maxInt(u16)));
             };
             // Extra rows: 1 separator + num_blocks stripe + num_blocks tint + num_blocks collapse.
             const scratch_rows: u16 = if (num_blocks > 0) 1 + num_blocks * 3 else 0;
@@ -2897,173 +2925,98 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Compute block regions for per-block scissored rendering.
             {
                 self.block_regions.clearRetainingCapacity();
-                const block_indices = state.block_indices;
-                const block_exit_codes = state.block_exit_codes;
-                const block_collapsed = state.block_collapsed;
-                const block_output_row_offset = state.block_output_row_offset;
-                const block_total_rows = state.block_total_rows;
-                const preview_lines = self.config.command_blocks_collapse_preview_lines;
-                if (block_indices.len > 0 and self.config.command_blocks) {
-                    const cell_h = self.grid_metrics.cell_height;
-                    const footer_px: u32 = self.config.command_blocks_padding_footer;
-                    const header_px: u32 = self.config.command_blocks_padding_header;
-                    const sep_px: u32 = 2;
-                    const gap_px = footer_px + sep_px + header_px;
+
+                const brl = state.block_render_list.items;
+                const use_layout = brl.len > 0 and self.config.command_blocks;
+
+                if (use_layout) {
+                    // --- BlockLayout-driven block region computation ---
+                    // BlockLayout provides stable, viewport-independent virtual coordinates.
+                    // We compute viewport_top_px from the scroll offset, then map each
+                    // block's virtual_y_px to screen coordinates.
                     const padding_top = self.size.padding.top;
-                    const total_gap = gap_px;
+                    const screen_h = self.size.screen.height;
+                    const cell_h_vp = self.grid_metrics.cell_height;
+                    const doc_h = state.total_doc_height_px;
+                    const viewport_h: u32 = @as(u32, @intCast(row_len)) * cell_h_vp;
+                    const scroll_px = state.scroll_offset_px;
 
-                    // --- Unified scroll model ---
-                    // Step 1: Compute block regions from natural (unshifted) positions.
-                    // Blocks start at padding_top and accumulate gaps between them.
-                    // No scroll offset is applied yet.
-                    // Collapsed blocks have their row_count and height reduced.
-                    var region_start: u16 = 0;
-                    var screen_y_i: i32 = @intCast(padding_top);
-                    var grid_y_i: i32 = 0;
-                    var yi: u16 = 0;
-                    while (yi < row_len) : (yi += 1) {
-                        if (yi > 0 and yi < block_indices.len and
-                            block_indices[yi] != block_indices[yi - 1])
-                        {
-                            const rc: u16 = yi - region_start;
-                            const bi = block_indices[region_start];
-                            const ec: i32 = if (bi < block_exit_codes.len) block_exit_codes[bi] else -1;
-                            const is_collapsed = if (bi < block_collapsed.len) block_collapsed[bi] else false;
+                    const viewport_top_px: i64 = @max(0, @as(i64, @intCast(doc_h)) -
+                        @as(i64, @intCast(viewport_h)) -
+                        @as(i64, @intCast(scroll_px)));
 
-                            // For collapsed blocks, limit visible rows to prompt+input+preview.
-                            // Always show at least 1 output line so the block isn't empty.
-                            const visible_rc: u16 = if (is_collapsed) vis: {
-                                const out_off: u16 = if (bi < block_output_row_offset.len) block_output_row_offset[bi] else 0;
-                                const min_preview = @max(preview_lines, 1);
-                                const max_visible = out_off + min_preview;
-                                break :vis @min(rc, max_visible);
-                            } else rc;
+                    log.debug("rebuildCells_blocks: n_blocks={} doc_h={} vp_h={} scroll={} vp_top={} cell_h={} screen_h={} pad_top={} row_len={}", .{
+                        brl.len, doc_h, viewport_h, scroll_px, @as(u32, @intCast(viewport_top_px)), cell_h_vp, screen_h, padding_top, row_len,
+                    });
 
-                            // hidden_lines uses total block rows (for the "[N lines hidden]" indicator).
-                            const total_block_rows: u16 = if (bi < block_total_rows.len) block_total_rows[bi] else rc;
-                            const hidden = if (total_block_rows > visible_rc) total_block_rows - visible_rc else 0;
+                    for (brl, 0..) |info, layout_i| {
+                        // screen_y = padding_top + (block.virtual_y_px - viewport_top_px)
+                        const block_screen_y_i64: i64 = @as(i64, @intCast(padding_top)) +
+                            @as(i64, @intCast(info.virtual_y_px)) - viewport_top_px;
 
-                            const h: i32 = @intCast(@as(u32, visible_rc) * cell_h);
-                            const sy: u32 = if (screen_y_i >= 0) @intCast(screen_y_i) else 0;
-                            self.block_regions.append(self.alloc, .{
-                                .first_row = region_start,
-                                .row_count = visible_rc,
-                                .screen_y_px = sy,
-                                .height_px = @intCast(h),
-                                .grid_y_offset = @floatFromInt(grid_y_i),
-                                .exit_code = ec,
-                                .collapsed = is_collapsed,
-                                .hidden_lines = hidden,
-                            }) catch {};
+                        // Skip blocks entirely above or below the screen.
+                        const block_bottom_i64 = block_screen_y_i64 + @as(i64, @intCast(info.visible_height_px));
+                        if (block_bottom_i64 <= 0) continue;
+                        if (block_screen_y_i64 >= @as(i64, @intCast(screen_h))) continue;
 
-                            screen_y_i += h + @as(i32, @intCast(total_gap));
-                            grid_y_i += h + @as(i32, @intCast(total_gap));
-                            region_start = yi;
-                        }
-                    }
-                    // Final block
-                    {
-                        const rc: u16 = @intCast(row_len - @as(usize, region_start));
-                        const final_bi = block_indices[region_start];
-                        const final_ec: i32 = if (final_bi < block_exit_codes.len) block_exit_codes[final_bi] else -1;
-                        const is_collapsed = if (final_bi < block_collapsed.len) block_collapsed[final_bi] else false;
+                        // Clip to screen bounds.
+                        const screen_y: u32 = if (block_screen_y_i64 >= 0)
+                            @intCast(block_screen_y_i64)
+                        else
+                            0;
 
-                        const visible_rc: u16 = if (is_collapsed) vis: {
-                            const out_off: u16 = if (final_bi < block_output_row_offset.len) block_output_row_offset[final_bi] else 0;
-                            const min_preview = @max(preview_lines, 1);
-                            const max_visible = out_off + min_preview;
-                            break :vis @min(rc, max_visible);
-                        } else rc;
+                        const clip_top: u32 = if (block_screen_y_i64 < 0)
+                            @intCast(-block_screen_y_i64)
+                        else
+                            0;
 
-                        const total_block_rows: u16 = if (final_bi < block_total_rows.len) block_total_rows[final_bi] else rc;
-                        const hidden = if (total_block_rows > visible_rc) total_block_rows - visible_rc else 0;
+                        const visible_h: u32 = info.visible_height_px -| clip_top;
+                        const height: u32 = @min(visible_h, screen_h -| screen_y);
 
-                        const h: i32 = @intCast(@as(u32, visible_rc) * cell_h);
-                        const final_sy: u32 = if (screen_y_i >= 0) @intCast(screen_y_i) else 0;
+                        if (height == 0) continue;
+
+                        // Map to cell buffer rows using viewport_first_row from RenderState.
+                        // viewport_first_row is computed during the render state snapshot
+                        // using screen-space coordinates (handles blocks above viewport).
+                        // If maxInt, the block's rows are not in the cell buffer at all
+                        // (the PageList viewport doesn't cover this block), so skip it.
+                        if (info.viewport_first_row == std.math.maxInt(u16)) continue;
+                        const first_row: u16 = info.viewport_first_row;
+
+                        // Compute how many rows of this block to render.
+                        // rows_above: rows of this block that are above the viewport
+                        // (only non-zero when the block starts above viewport_top_px).
+                        const visible_rc: u16 = @intCast(@min(info.visible_rows, std.math.maxInt(u16)));
+                        const vp_top_u32: u32 = @intCast(viewport_top_px);
+                        const rows_above: u16 = if (info.virtual_y_px < vp_top_u32 and cell_h_vp > 0)
+                            @intCast(@min((vp_top_u32 - info.virtual_y_px) / cell_h_vp, std.math.maxInt(u16)))
+                        else
+                            0;
+                        const display_rc: u16 = visible_rc -| rows_above;
+
+                        // Grid Y offset: the shader needs to know where this block
+                        // sits relative to the grid origin.
+                        const grid_y: f32 = @as(f32, @floatFromInt(screen_y)) -
+                            @as(f32, @floatFromInt(padding_top));
+
+                        const hidden: u16 = @intCast(@min(info.hiddenLines(), std.math.maxInt(u16)));
+
+                        log.debug("block_region: idx={} vp_first_row={} first_row={} display_rc={} rows_above={} visible_rc={} screen_y={} virt_y={} vp_top={}", .{
+                            layout_i, info.viewport_first_row, first_row, display_rc, rows_above, visible_rc, screen_y, info.virtual_y_px, @as(u32, @intCast(viewport_top_px)),
+                        });
                         self.block_regions.append(self.alloc, .{
-                            .first_row = region_start,
-                            .row_count = visible_rc,
-                            .screen_y_px = final_sy,
-                            .height_px = @intCast(h),
-                            .grid_y_offset = @floatFromInt(grid_y_i),
-                            .exit_code = final_ec,
-                            .collapsed = is_collapsed,
+                            .first_row = first_row,
+                            .row_count = display_rc,
+                            .screen_y_px = screen_y,
+                            .height_px = height,
+                            .grid_y_offset = grid_y,
+                            .exit_code = info.exit_code,
+                            .collapsed = info.collapsed,
                             .hidden_lines = hidden,
+                            .block_idx = @intCast(@min(layout_i, std.math.maxInt(u16))),
                         }) catch {};
                     }
 
-                    const gap_overflow: u32 = gap_overflow: {
-                        if (self.block_regions.items.len < 2) break :gap_overflow 0;
-
-                        const content_bottom: u32 = content_bottom: {
-                            if (state.cursor.viewport) |cursor_vp| {
-                                // Cursor is in the viewport — compute the bottom
-                                // of the content based on the cursor's position
-                                // within its block, ignoring empty rows below.
-                                for (self.block_regions.items) |region| {
-                                    const region_end = region.first_row + region.row_count;
-                                    if (cursor_vp.y >= region.first_row and cursor_vp.y < region_end) {
-                                        const rows_in_block: u32 = cursor_vp.y - region.first_row + 1;
-                                        break :content_bottom region.screen_y_px + rows_in_block * cell_h;
-                                    }
-                                }
-                            }
-                            // Cursor not in viewport (scrolled into history) or
-                            // not found — use the full last block extent.
-                            const last = self.block_regions.items[self.block_regions.items.len - 1];
-                            break :content_bottom last.screen_y_px + last.height_px;
-                        };
-                        // Use the raw viewport pixel extent (without subtracting
-                        // collapse_savings_px). Collapsed blocks save pixels by
-                        // rendering fewer rows, which is already reflected in block
-                        // region heights and content_bottom. Subtracting savings
-                        // here creates instability when collapsed blocks enter/leave
-                        // the viewport (savings change with scroll position, causing
-                        // gap_overflow to jump between frames).
-                        const viewport_bottom = padding_top + @as(u32, @intCast(row_len)) * cell_h;
-
-                        if (content_bottom > viewport_bottom) {
-                            break :gap_overflow content_bottom - viewport_bottom;
-                        }
-                        break :gap_overflow 0;
-                    };
-
-                    // Step 3: Apply effective_shift = max(0, gap_overflow - scroll_offset).
-                    // - When following (block_scroll_px=0): shift = gap_overflow → cursor visible.
-                    // - When user scrolls up (block_scroll_px increases): shift decreases,
-                    //   revealing content at the top.
-                    // - At block_scroll_px = gap_overflow: shift = 0, first block at top.
-                    const scroll_offset: u32 = if (state.block_scroll_px > 0)
-                        @intCast(state.block_scroll_px)
-                    else
-                        0;
-                    const effective_shift: u32 = if (gap_overflow > scroll_offset)
-                        gap_overflow - scroll_offset
-                    else
-                        0;
-
-                    // Store gap_overflow for scrollbar adjustment.
-                    self.gap_overflow_px = gap_overflow;
-
-                    if (effective_shift > 0) {
-                        for (self.block_regions.items) |*region| {
-                            region.grid_y_offset -= @as(f32, @floatFromInt(effective_shift));
-                            if (effective_shift >= region.screen_y_px + region.height_px) {
-                                // Fully above viewport — zero it out.
-                                region.screen_y_px = 0;
-                                region.height_px = 0;
-                            } else if (effective_shift > region.screen_y_px) {
-                                // Partially above — clip the top.
-                                const clipped = effective_shift - region.screen_y_px;
-                                region.height_px -|= clipped;
-                                region.screen_y_px = 0;
-                            } else {
-                                region.screen_y_px -= effective_shift;
-                            }
-                        }
-                    }
-                } else {
-                    self.gap_overflow_px = 0;
                 }
             }
 
@@ -3152,10 +3105,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
 
                 // Per-block scratch rows: stripe colors and tint colors.
+                const brl_items = state.block_render_list.items;
                 var bi: u16 = 0;
                 while (bi < num_blocks) : (bi += 1) {
-                    const ec: i32 = if (bi < state.block_exit_codes.len)
-                        state.block_exit_codes[bi]
+                    const ec: i32 = if (bi < brl_items.len)
+                        brl_items[bi].exit_code
                     else
                         -1;
 
@@ -3175,10 +3129,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const tint_row: usize = sep_row + 1 + num_blocks + bi;
                     const bg = state.colors.background;
                     const bg_rgba: [4]u8 = .{ bg.r, bg.g, bg.b, 255 };
-                    const is_highlighted = if (state.highlighted_block_idx) |hl|
-                        hl == bi
-                    else
-                        false;
+                    const is_highlighted = if (state.highlighted_block_idx) |hl_block_list_idx| blk: {
+                        if (bi < brl_items.len) {
+                            break :blk brl_items[bi].block_list_index == hl_block_list_idx;
+                        }
+                        break :blk false;
+                    } else false;
+
                     const tc: [4]u8 = if (is_highlighted)
                         self.blendHighlightTint(bg_rgba)
                     else if (ec >= 128 and ec <= 255)
