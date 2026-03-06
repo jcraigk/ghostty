@@ -1220,8 +1220,11 @@ pub fn semanticPrompt(
                 }
             }
 
-            // Track this as a new command block.
-            if (self.screens.active_key == .primary) {
+            // Track this as a new command block, but only for initial prompts.
+            // Continuation (k=c) and secondary (k=s) prompts are part of
+            // the current block's input (e.g. multi-line strings, heredocs).
+            const kind = cmd.readOption(.prompt_kind) orelse .initial;
+            if (self.screens.active_key == .primary and kind == .initial) {
                 self.blockListAddBlock() catch {};
             }
         },
@@ -2036,10 +2039,10 @@ pub fn syncPageListViewport(self: *Terminal) void {
         total_visible_content_rows += blk_info.visible_rows;
     }
 
-    log.debug("syncPageListViewport: doc_h={} vp_h={} scroll={} vp_top={} range=[{},{}] eff_start={} total_visible_rows={} grid_rows={} row_offset={}", .{
-        doc_h, viewport_h, self.scroll_offset_px, viewport_top_px,
-        range.start_idx, range.end_idx, effective_start, total_visible_content_rows, self.rows, row_offset,
-    });
+    // log.debug("syncPageListViewport: doc_h={} vp_h={} scroll={} vp_top={} range=[{},{}] eff_start={} total_visible_rows={} grid_rows={} row_offset={}", .{
+    //     doc_h, viewport_h, self.scroll_offset_px, viewport_top_px,
+    //     range.start_idx, range.end_idx, effective_start, total_visible_content_rows, self.rows, row_offset,
+    // });
 
     // Get a pin at that row in the block and scroll the PageList to it.
     if (layout.pinAtBlockRow(info.block_list_index, row_offset)) |pin| {

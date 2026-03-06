@@ -1331,7 +1331,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                     // Safety: only compute if cursor is at or after prompt_start.
                                     // If cursor is before prompt_start (e.g. during init), skip.
                                     if (!cursor_pin.before(active.prompt_start.*)) {
-                                        break :acr Block.countRowsBetweenPins(active.prompt_start.*, cursor_pin);
+                                        // countRowsBetweenPins returns 1-based count (min 1).
+                                        // Convert to 0-based row index for the layout.
+                                        const rows = Block.countRowsBetweenPins(active.prompt_start.*, cursor_pin);
+                                        break :acr rows -| 1;
                                     }
                                 }
                             }
@@ -1791,9 +1794,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     region.instance_count = count;
                     cursor_cells += count;
 
-                    log.debug("block_instance: ri={} first_row={} row_count={} inst_offset={} inst_count={} screen_y={} height={} grid_y_off={d:.1}", .{
-                        ri, region.first_row, region.row_count, region.instance_offset, region.instance_count, region.screen_y_px, region.height_px, region.grid_y_offset,
-                    });
+                    // log.debug("block_instance: ri={} first_row={} row_count={} inst_offset={} inst_count={} screen_y={} height={} grid_y_off={d:.1}", .{
+                    //     ri, region.first_row, region.row_count, region.instance_offset, region.instance_count, region.screen_y_px, region.height_px, region.grid_y_offset,
+                    // });
                 }
             }
 
@@ -1917,7 +1920,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             if (next.screen_y_px <= this_end) break :blk this_end;
                             const gap_mid = this_end + (next.screen_y_px - this_end) / 2;
                             break :blk gap_mid;
-                        } else self.size.screen.height;
+                        } else if (region.exit_code < 0)
+                            // Active block: extend tint/stripe to screen bottom.
+                            self.size.screen.height
+                        else
+                            // Last completed block: extend only to content + footer padding.
+                            @min(region.screen_y_px + region.height_px + self.config.command_blocks_padding_footer, self.size.screen.height);
 
                         // Block tint: background layer spanning the full visual block
                         // extent (vis_top to vis_bottom), matching the stripe coverage.
@@ -2154,7 +2162,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .block_params = default_bp,
                         });
                     }
-                } else {
+                } else if (!self.config.command_blocks) {
+                    // Non-block mode: draw all cell backgrounds and text
+                    // without scissoring. In block mode, bg_color already
+                    // covers the screen and blocks draw their own content.
                     pass.step(.{
                         .pipeline = self.shaders.pipelines.cell_bg,
                         .uniforms = frame.uniforms.buffer,
@@ -2945,9 +2956,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         @as(i64, @intCast(viewport_h)) -
                         @as(i64, @intCast(scroll_px)));
 
-                    log.debug("rebuildCells_blocks: n_blocks={} doc_h={} vp_h={} scroll={} vp_top={} cell_h={} screen_h={} pad_top={} row_len={}", .{
-                        brl.len, doc_h, viewport_h, scroll_px, @as(u32, @intCast(viewport_top_px)), cell_h_vp, screen_h, padding_top, row_len,
-                    });
+                    // log.debug("rebuildCells_blocks: n_blocks={} doc_h={} vp_h={} scroll={} vp_top={} cell_h={} screen_h={} pad_top={} row_len={}", .{
+                    //     brl.len, doc_h, viewport_h, scroll_px, @as(u32, @intCast(viewport_top_px)), cell_h_vp, screen_h, padding_top, row_len,
+                    // });
 
                     for (brl, 0..) |info, layout_i| {
                         // screen_y = padding_top + (block.virtual_y_px - viewport_top_px)
@@ -3001,9 +3012,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                         const hidden: u16 = @intCast(@min(info.hiddenLines(), std.math.maxInt(u16)));
 
-                        log.debug("block_region: idx={} vp_first_row={} first_row={} display_rc={} rows_above={} visible_rc={} screen_y={} virt_y={} vp_top={}", .{
-                            layout_i, info.viewport_first_row, first_row, display_rc, rows_above, visible_rc, screen_y, info.virtual_y_px, @as(u32, @intCast(viewport_top_px)),
-                        });
+                        // log.debug("block_region: idx={} vp_first_row={} first_row={} display_rc={} rows_above={} visible_rc={} screen_y={} virt_y={} vp_top={}", .{
+                        //     layout_i, info.viewport_first_row, first_row, display_rc, rows_above, visible_rc, screen_y, info.virtual_y_px, @as(u32, @intCast(viewport_top_px)),
+                        // });
                         self.block_regions.append(self.alloc, .{
                             .first_row = first_row,
                             .row_count = display_rc,
