@@ -158,8 +158,10 @@ pub fn rebuild(self: *BlockLayout) void {
         const output_row_offset: u16 = self.countOutputOffset(block);
 
         // Compute visible rows (accounting for collapse).
+        // When collapsed, show 1 prompt/input line + preview_lines of output.
+        // This keeps multi-line inputs (continuations, heredocs) compact.
         const visible_rows: u32 = if (block.collapsed)
-            @max(1, @min(total_rows, @as(u32, output_row_offset) + @as(u32, self.config.preview_lines)))
+            @max(1, @min(total_rows, 1 + @as(u32, self.config.preview_lines)))
         else
             total_rows;
 
@@ -586,14 +588,14 @@ test "BlockLayout: collapsed block with preview lines" {
     config.active_block_cursor_row = 2;
     layout.setConfig(config);
 
-    // Collapse: output_row_offset=2, preview_lines=3.
-    // visible_rows = max(1, min(10, 2+3)) = 5.
+    // Collapse: 1 prompt line + preview_lines=3.
+    // visible_rows = max(1, min(10, 1+3)) = 4.
     bl.blocks.items[0].collapsed = true;
     layout.invalidate();
 
     const b0 = layout.blockAt(0).?;
     try testing.expectEqual(@as(u16, 2), b0.output_row_offset);
-    try testing.expectEqual(@as(u32, 5), b0.visible_rows);
+    try testing.expectEqual(@as(u32, 4), b0.visible_rows);
     try testing.expectEqual(@as(u32, 10), b0.total_rows);
 }
 

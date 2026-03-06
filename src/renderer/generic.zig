@@ -1889,6 +1889,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const stripe_w: u32 = self.config.command_blocks_stripe_width;
                     const num_blocks: u16 = @intCast(@min(ts.block_render_list.items.len, std.math.maxInt(u16)));
 
+                    // Track the last block's params/scissor for the cursor draw.
+                    var last_bp: @TypeOf(pass).Step.BlockParams = default_bp;
+                    var last_scissor: @TypeOf(pass).Step.ScissorRect = .{
+                        .x = 0,
+                        .y = 0,
+                        .width = self.size.screen.width,
+                        .height = self.size.screen.height,
+                    };
+
                     for (self.block_regions.items, 0..) |region, ri| {
                         const bp: @TypeOf(pass).Step.BlockParams = .{
                             .block_y_offset = region.grid_y_offset,
@@ -1997,6 +2006,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                 .block_params = bp,
                             });
                         }
+
+                        // Remember this block's params for the cursor draw.
+                        last_bp = bp;
+                        last_scissor = scissor;
 
                         // Stripe: spans the full visual block extent (header to footer).
                         if (stripe_w > 0 and vis_bottom > vis_top) {
@@ -2139,10 +2152,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         }
                     }
 
-                    // Draw cursor cells (at the start of the fg buffer,
-                    // not included in any block's instance range).
-                    const cursor_count = self.cells.fg_rows.lists[0].items.len;
-                    if (cursor_count > 0) {
+                    // Draw cursor cells. Block cursors go to lists[0] (drawn
+                    // first), bar/hollow/underline cursors go to lists[rows+1]
+                    // (drawn last). Both need the active block's params/scissor.
+                    const lists = self.cells.fg_rows.lists;
+                    const block_cursor_count = if (lists.len > 0) lists[0].items.len else 0;
+                    const overlay_cursor_idx = self.cells.size.rows + 1;
+                    const overlay_cursor_count = if (overlay_cursor_idx < lists.len) lists[overlay_cursor_idx].items.len else 0;
+
+                    if (block_cursor_count > 0) {
                         pass.step(.{
                             .pipeline = self.shaders.pipelines.cell_text,
                             .uniforms = frame.uniforms.buffer,
@@ -2157,9 +2175,38 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .draw = .{
                                 .type = .triangle_strip,
                                 .vertex_count = 4,
-                                .instance_count = cursor_count,
+                                .instance_count = block_cursor_count,
                             },
-                            .block_params = default_bp,
+                            .scissor = last_scissor,
+                            .block_params = last_bp,
+                        });
+                    }
+
+                    if (overlay_cursor_count > 0) {
+                        // Compute base_instance: sum of all cells in lists[0..rows+1].
+                        var overlay_base: usize = 0;
+                        for (lists[0..overlay_cursor_idx]) |list| {
+                            overlay_base += list.items.len;
+                        }
+                        pass.step(.{
+                            .pipeline = self.shaders.pipelines.cell_text,
+                            .uniforms = frame.uniforms.buffer,
+                            .buffers = &.{
+                                frame.cells.buffer,
+                                frame.cells_bg.buffer,
+                            },
+                            .textures = &.{
+                                frame.grayscale,
+                                frame.color,
+                            },
+                            .draw = .{
+                                .type = .triangle_strip,
+                                .vertex_count = 4,
+                                .instance_count = overlay_cursor_count,
+                                .base_instance = overlay_base,
+                            },
+                            .scissor = last_scissor,
+                            .block_params = last_bp,
                         });
                     }
                 } else if (!self.config.command_blocks) {
