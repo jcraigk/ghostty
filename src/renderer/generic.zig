@@ -3320,12 +3320,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-            // Render collapse indicator text on collapsed blocks.
+            // Replace cells on the last visible row of collapsed blocks with
+            // the "... N lines hidden" indicator text. This modifies the cell
+            // buffer directly so selection/highlight sees the indicator text,
+            // while copy operations read from the original PageList data.
             for (self.block_regions.items) |region| {
                 if (region.collapsed and region.hidden_lines > 0 and region.row_count > 0) {
                     const last_row: terminal.size.CellCountInt =
                         @intCast(region.first_row + region.row_count - 1);
-                    self.addCollapseIndicatorText(last_row, region.hidden_lines);
+                    self.replaceCollapseIndicatorCells(last_row, region.hidden_lines);
                 }
             }
 
@@ -4239,10 +4242,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
         }
 
-        /// Render collapse indicator text on the last visible row of a
-        /// collapsed block. The text (e.g. "... 5 lines hidden ...") is
-        /// right-aligned and rendered in a subdued foreground color.
-        fn addCollapseIndicatorText(
+        /// Replace cells on the last visible row of a collapsed block with
+        /// the "... N lines hidden" indicator. This modifies the cell buffer
+        /// directly (removing original fg glyphs and bg colors for the
+        /// indicator columns) so that selection sees the indicator text.
+        /// Copy operations read from PageList pins and get the original data.
+        fn replaceCollapseIndicatorCells(
             self: *Self,
             y: terminal.size.CellCountInt,
             hidden_lines: u16,
@@ -4259,6 +4264,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const start_x: u16 = cols - text_len;
             if (start_x < cols / 2) return;
 
+            // Remove existing fg cells on the indicator columns.
+            // fg_rows is indexed as [y + 1] (index 0 is reserved for cursor).
+            const row_list = &self.cells.fg_rows.lists[y + 1];
+            var i: usize = 0;
+            while (i < row_list.items.len) {
+                if (row_list.items[i].grid_pos[0] >= start_x) {
+                    _ = row_list.swapRemove(i);
+                } else {
+                    i += 1;
+                }
+            }
+
+            // Clear bg cells for the indicator columns (transparent).
+            var cx: u16 = start_x;
+            while (cx < cols) : (cx += 1) {
+                self.cells.bgCell(y, cx).* = .{ 0, 0, 0, 0 };
+            }
+
             // Use a dimmed foreground color (blend fg toward bg).
             const fg = self.terminal_state.colors.foreground;
             const bg = self.terminal_state.colors.background;
@@ -4268,9 +4291,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .b = @intCast((@as(u16, fg.b) + @as(u16, bg.b)) / 2),
             };
 
-            // Render each character as a fg cell glyph.
-            for (text, 0..) |ch, i| {
-                const x: u16 = start_x + @as(u16, @intCast(i));
+            // Add the indicator text glyphs.
+            for (text, 0..) |ch, ci| {
+                const x: u16 = start_x + @as(u16, @intCast(ci));
                 if (x >= cols) break;
 
                 const render_ = self.font_grid.renderCodepoint(
