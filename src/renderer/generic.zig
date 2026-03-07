@@ -4251,12 +4251,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             var buf: [64]u8 = undefined;
             const text = std.fmt.bufPrint(&buf, " ... {d} {s} hidden ", .{ hidden_lines, if (hidden_lines == 1) @as([]const u8, "line") else @as([]const u8, "lines") }) catch return;
 
-            // Compute right-aligned starting column. Leave 1 cell margin
-            // on the right so the text doesn't touch the edge.
+            // Compute right-aligned starting column. Skip if the indicator
+            // text would overlap with the first half of the row (prompt text).
             const cols: u16 = self.cells.size.columns;
             const text_len: u16 = @intCast(@min(text.len, cols));
             if (text_len == 0) return;
             const start_x: u16 = cols - text_len;
+            if (start_x < cols / 2) return;
 
             // Use a dimmed foreground color (blend fg toward bg).
             const fg = self.terminal_state.colors.foreground;
