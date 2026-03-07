@@ -1347,21 +1347,27 @@ fn blockListAddBlock(self: *Terminal) !void {
     });
     bl.pruneGarbage();
 
-    // If the active block has no output yet (no command has been executed),
-    // this is likely a prompt redraw (e.g. after resize/font change). Replace
-    // the active block's prompt_start instead of creating a new empty block.
-    // The shell sends OSC 133 A + B on redraw, so input_start may be set.
+    // If the active block has no output yet (no command has been executed)
+    // AND the new prompt is on the same row as the existing prompt, this is
+    // a prompt redraw (e.g. after resize/font change). Replace the active
+    // block's prompt_start instead of creating a new empty block.
+    // If the cursor has moved to a different row, it's a genuine new prompt
+    // (e.g. user pressed Enter on an empty prompt).
     if (bl.activeBlock()) |active| {
         if (active.output_start == null and active.exit_code == null) {
-            active.prompt_start.* = screen.cursor.page_pin.*;
-            // Reset input_start since the shell will re-send OSC 133 B.
-            if (active.input_start) |pin| {
-                screen.pages.untrackPin(pin);
-                active.input_start = null;
+            const same_row = active.prompt_start.node == screen.cursor.page_pin.node and
+                active.prompt_start.y == screen.cursor.page_pin.y;
+            if (same_row) {
+                active.prompt_start.* = screen.cursor.page_pin.*;
+                // Reset input_start since the shell will re-send OSC 133 B.
+                if (active.input_start) |pin| {
+                    screen.pages.untrackPin(pin);
+                    active.input_start = null;
+                }
+                active.end = null;
+                if (self.block_layout) |*layout| layout.invalidate();
+                return;
             }
-            active.end = null;
-            if (self.block_layout) |*layout| layout.invalidate();
-            return;
         }
     }
 
