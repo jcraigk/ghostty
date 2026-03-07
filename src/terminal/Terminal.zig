@@ -1346,6 +1346,25 @@ fn blockListAddBlock(self: *Terminal) !void {
         break :init self.block_list.?;
     });
     bl.pruneGarbage();
+
+    // If the active block has no output yet (no command has been executed),
+    // this is likely a prompt redraw (e.g. after resize/font change). Replace
+    // the active block's prompt_start instead of creating a new empty block.
+    // The shell sends OSC 133 A + B on redraw, so input_start may be set.
+    if (bl.activeBlock()) |active| {
+        if (active.output_start == null and active.exit_code == null) {
+            active.prompt_start.* = screen.cursor.page_pin.*;
+            // Reset input_start since the shell will re-send OSC 133 B.
+            if (active.input_start) |pin| {
+                screen.pages.untrackPin(pin);
+                active.input_start = null;
+            }
+            active.end = null;
+            if (self.block_layout) |*layout| layout.invalidate();
+            return;
+        }
+    }
+
     _ = try bl.addBlock(screen.cursor.page_pin.*);
 
     // Auto-collapse: when a new block is created and auto_collapse_threshold
@@ -3184,6 +3203,20 @@ pub fn resize(
         .left = 0,
         .right = cols - 1,
     };
+
+    // Invalidate block layout, cached row counts, and reset scroll offset.
+    // After a resize, cell metrics change, row counts change due to reflow,
+    // and the old pixel-based scroll offset no longer maps correctly. Reset
+    // to following (offset 0) which is the safe default.
+    if (self.block_list) |*bl| {
+        for (bl.blocks.items) |*block| {
+            block.cached_row_count = null;
+        }
+    }
+    if (self.block_layout) |*layout| {
+        layout.invalidate();
+        self.scroll_offset_px = 0;
+    }
 }
 
 /// Set the pwd for the terminal.
