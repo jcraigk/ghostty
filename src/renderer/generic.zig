@@ -670,7 +670,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             command_blocks_collapse_preview_lines: u16,
             command_blocks_auto_collapse_threshold: ?u16,
             command_blocks_toolbar: bool,
+            command_blocks_toolbar_icons: configpkg.Config.ToolbarIcons,
+            command_blocks_toolbar_position: configpkg.Config.ToolbarPosition,
             command_blocks_toolbar_color: ?configpkg.Config.Color,
+            command_blocks_toolbar_radius: u16,
+            command_blocks_toolbar_icon_radius: u16,
             scroll_to_bottom_on_output: bool,
 
             pub fn init(
@@ -763,7 +767,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .command_blocks_collapse_preview_lines = config.@"command-blocks-collapse-preview-lines",
                     .command_blocks_auto_collapse_threshold = config.@"command-blocks-auto-collapse-threshold",
                     .command_blocks_toolbar = config.@"command-blocks-toolbar",
+                    .command_blocks_toolbar_icons = config.@"command-blocks-toolbar-icons",
+                    .command_blocks_toolbar_position = config.@"command-blocks-toolbar-position",
                     .command_blocks_toolbar_color = config.@"command-blocks-toolbar-color",
+                    .command_blocks_toolbar_radius = config.@"command-blocks-toolbar-radius",
+                    .command_blocks_toolbar_icon_radius = config.@"command-blocks-toolbar-icon-radius",
                     .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
                     .arena = arena,
                 };
@@ -2132,7 +2140,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         }
                     }
 
-                    // Toolbar: draw a pill-shaped background on the hovered or highlighted block.
+                    // Toolbar: draw a pill-shaped background with icon shapes on the hovered or highlighted block.
                     // Rendered after all block content so it appears on top.
                     if (self.config.command_blocks_toolbar and num_blocks > 0) toolbar: {
                         const hovered_bl_idx = ts.hovered_block_idx orelse
@@ -2145,18 +2153,39 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         } else null;
                         const region = hovered_region orelse break :toolbar;
 
-                        // Toolbar dimensions: one cell height, scales with font size.
+                        const icons_cfg = self.config.command_blocks_toolbar_icons;
+                        const enabled = icons_cfg.enabledIcons();
+                        const icon_count = enabled.len;
+                        if (icon_count == 0) break :toolbar;
+
+                        // Toolbar dimensions: each icon gets a square slot (cell_h x cell_h).
                         const cell_h = self.grid_metrics.cell_height;
                         const cell_w = self.grid_metrics.cell_width;
                         const toolbar_h: u32 = @min(cell_h, region.height_px);
-                        const toolbar_w: u32 = cell_w * 3;
-                        // Position at the right edge of the text grid, inset by 1 cell.
+                        const icon_slot_w: u32 = toolbar_h; // square slots
+                        const icon_padding: u32 = @max(2, toolbar_h / 6);
+                        const toolbar_w: u32 = icon_count * icon_slot_w + icon_padding * 2;
+
+                        // Position based on config.
                         const grid_cols: u32 = self.cells.size.columns;
                         const grid_right: u32 = self.size.padding.left + grid_cols * cell_w;
-                        const toolbar_x: u32 = grid_right -| toolbar_w -| cell_w;
-                        const toolbar_y: u32 = region.screen_y_px;
-                        // Corner radius scales with cell height (roughly 1/4 height for pill look).
-                        const corner_radius: f32 = @as(f32, @floatFromInt(toolbar_h)) / 4.0;
+                        const is_right = self.config.command_blocks_toolbar_position == .@"upper-right" or
+                            self.config.command_blocks_toolbar_position == .@"lower-right";
+                        const is_upper = self.config.command_blocks_toolbar_position == .@"upper-right" or
+                            self.config.command_blocks_toolbar_position == .@"upper-left";
+                        const toolbar_x: u32 = if (is_right)
+                            grid_right -| toolbar_w -| cell_w
+                        else
+                            self.size.padding.left + cell_w;
+                        const toolbar_y: u32 = if (is_upper)
+                            region.screen_y_px
+                        else
+                            (region.screen_y_px + region.height_px) -| toolbar_h;
+
+                        const corner_radius: f32 = if (self.config.command_blocks_toolbar_radius > 0)
+                            @floatFromInt(self.config.command_blocks_toolbar_radius)
+                        else
+                            @as(f32, @floatFromInt(toolbar_h)) / 4.0;
 
                         if (toolbar_h > 0 and toolbar_w > 0) {
                             const toolbar_scratch: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(num_blocks)) * 3.0;
@@ -2189,41 +2218,273 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                 },
                             });
 
-                            // Ellipsis dots: 3 small circles inside the pill.
-                            const dot_scratch: f32 = toolbar_scratch + 1.0;
-                            const dot_size: u32 = @max(3, toolbar_h / 5);
-                            const dot_y = toolbar_y + (toolbar_h - dot_size) / 2;
-                            const dot_spacing = toolbar_w / 4;
-                            const dot_start_x = toolbar_x + dot_spacing - dot_size / 2;
-                            var dot_i: u32 = 0;
-                            while (dot_i < 3) : (dot_i += 1) {
-                                const dx = dot_start_x + dot_spacing * dot_i;
-                                const dx_f: f32 = @floatFromInt(dx);
-                                const dy_f: f32 = @floatFromInt(dot_y);
-                                const ds_f: f32 = @floatFromInt(dot_size);
-                                pass.step(.{
-                                    .pipeline = self.shaders.pipelines.cell_bg,
-                                    .uniforms = frame.uniforms.buffer,
-                                    .buffers = &.{ null, frame.cells_bg.buffer },
-                                    .draw = .{ .type = .triangle, .vertex_count = 3 },
-                                    .scissor = .{
-                                        .x = dx,
-                                        .y = dot_y,
-                                        .width = dot_size,
-                                        .height = dot_size,
+                            // Draw each icon shape in its slot with margins and hover highlight.
+                            const icon_scratch: f32 = toolbar_scratch + 1.0;
+                            const hover_scratch: f32 = icon_scratch + 1.0;
+                            const icon_margin: u32 = @max(1, toolbar_h / 8);
+                            // Icon drawing area: ~55% of the slot for clean look inside container.
+                            const icon_area: u32 = @max(6, (toolbar_h -| icon_margin * 2) * 55 / 100);
+                            const hovered_icon_idx: ?u32 = ts.hovered_toolbar_icon;
+                            var icon_i: u32 = 0;
+                            while (icon_i < icon_count) : (icon_i += 1) {
+                                const slot_x = toolbar_x + icon_padding + icon_i * icon_slot_w;
+
+                                // Draw hover highlight background for this icon.
+                                if (hovered_icon_idx != null and hovered_icon_idx.? == icon_i) {
+                                    const hx = slot_x + icon_margin;
+                                    const hy = toolbar_y + icon_margin;
+                                    const hw = icon_slot_w -| icon_margin * 2;
+                                    const hh = toolbar_h -| icon_margin * 2;
+                                    const hx_f: f32 = @floatFromInt(hx);
+                                    const hy_f: f32 = @floatFromInt(hy);
+                                    const hw_f: f32 = @floatFromInt(hw);
+                                    const hh_f: f32 = @floatFromInt(hh);
+                                    const hover_radius: f32 = if (self.config.command_blocks_toolbar_icon_radius > 0)
+                                        @floatFromInt(self.config.command_blocks_toolbar_icon_radius)
+                                    else
+                                        4.0;
+                                    pass.step(.{
+                                        .pipeline = self.shaders.pipelines.cell_bg,
+                                        .uniforms = frame.uniforms.buffer,
+                                        .buffers = &.{ null, frame.cells_bg.buffer },
+                                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                        .scissor = .{
+                                            .x = hx,
+                                            .y = hy,
+                                            .width = hw,
+                                            .height = hh,
+                                        },
+                                        .block_params = .{
+                                            .block_y_offset = 0,
+                                            .block_first_row = hover_scratch,
+                                            .block_x_offset = -pad_left,
+                                            .block_y_flat = 1.0,
+                                            .block_corner_radius = hover_radius,
+                                            .block_scissor_x = hx_f,
+                                            .block_scissor_y = hy_f,
+                                            .block_scissor_w = hw_f,
+                                            .block_scissor_h = hh_f,
+                                        },
+                                    });
+                                }
+
+                                const icon_cx = slot_x + icon_slot_w / 2;
+                                const icon_cy = toolbar_y + toolbar_h / 2;
+                                const icon_r: f32 = if (self.config.command_blocks_toolbar_icon_radius > 0)
+                                    @floatFromInt(self.config.command_blocks_toolbar_icon_radius)
+                                else
+                                    2.0;
+
+                                switch (enabled.icons[icon_i]) {
+                                    .ellipsis => {
+                                        // Three horizontal dots.
+                                        const dot_size: u32 = @max(3, icon_area / 4);
+                                        const dot_cy = icon_cy - dot_size / 2;
+                                        const total_dots_w = dot_size * 3 + (dot_size / 2) * 2;
+                                        const dots_start = icon_cx -| total_dots_w / 2;
+                                        var di: u32 = 0;
+                                        while (di < 3) : (di += 1) {
+                                            const dx = dots_start + di * (dot_size + dot_size / 2);
+                                            const dx_f: f32 = @floatFromInt(dx);
+                                            const dy_f: f32 = @floatFromInt(dot_cy);
+                                            const ds_f: f32 = @floatFromInt(dot_size);
+                                            pass.step(.{
+                                                .pipeline = self.shaders.pipelines.cell_bg,
+                                                .uniforms = frame.uniforms.buffer,
+                                                .buffers = &.{ null, frame.cells_bg.buffer },
+                                                .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                                .scissor = .{
+                                                    .x = dx,
+                                                    .y = dot_cy,
+                                                    .width = dot_size,
+                                                    .height = dot_size,
+                                                },
+                                                .block_params = .{
+                                                    .block_y_offset = 0,
+                                                    .block_first_row = icon_scratch,
+                                                    .block_x_offset = -pad_left,
+                                                    .block_y_flat = 1.0,
+                                                    .block_corner_radius = ds_f / 2.0,
+                                                    .block_scissor_x = dx_f,
+                                                    .block_scissor_y = dy_f,
+                                                    .block_scissor_w = ds_f,
+                                                    .block_scissor_h = ds_f,
+                                                },
+                                            });
+                                        }
                                     },
-                                    .block_params = .{
-                                        .block_y_offset = 0,
-                                        .block_first_row = dot_scratch,
-                                        .block_x_offset = -pad_left,
-                                        .block_y_flat = 1.0,
-                                        .block_corner_radius = ds_f / 2.0,
-                                        .block_scissor_x = dx_f,
-                                        .block_scissor_y = dy_f,
-                                        .block_scissor_w = ds_f,
-                                        .block_scissor_h = ds_f,
+                                    .copy => {
+                                        // Two overlapping rectangles (clipboard icon).
+                                        const rect_w: u32 = icon_area * 2 / 3;
+                                        const rect_h: u32 = icon_area * 3 / 4;
+                                        const offset: u32 = icon_area / 5;
+                                        // Back rectangle (upper-left).
+                                        const back_x = icon_cx - icon_area / 2;
+                                        const back_y = icon_cy - icon_area / 2;
+                                        const bx_f: f32 = @floatFromInt(back_x);
+                                        const by_f: f32 = @floatFromInt(back_y);
+                                        const bw_f: f32 = @floatFromInt(rect_w);
+                                        const bh_f: f32 = @floatFromInt(rect_h);
+                                        pass.step(.{
+                                            .pipeline = self.shaders.pipelines.cell_bg,
+                                            .uniforms = frame.uniforms.buffer,
+                                            .buffers = &.{ null, frame.cells_bg.buffer },
+                                            .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                            .scissor = .{
+                                                .x = back_x,
+                                                .y = back_y,
+                                                .width = rect_w,
+                                                .height = rect_h,
+                                            },
+                                            .block_params = .{
+                                                .block_y_offset = 0,
+                                                .block_first_row = icon_scratch,
+                                                .block_x_offset = -pad_left,
+                                                .block_y_flat = 1.0,
+                                                .block_corner_radius = icon_r,
+                                                .block_scissor_x = bx_f,
+                                                .block_scissor_y = by_f,
+                                                .block_scissor_w = bw_f,
+                                                .block_scissor_h = bh_f,
+                                            },
+                                        });
+                                        // Separator: toolbar-bg rect to create visual gap.
+                                        const sep_x = back_x + offset - 1;
+                                        const sep_y = back_y + offset - 1;
+                                        const sep_w = rect_w + 2;
+                                        const sep_h = rect_h + 2;
+                                        const sx_f: f32 = @floatFromInt(sep_x);
+                                        const sy_f: f32 = @floatFromInt(sep_y);
+                                        const sw_f: f32 = @floatFromInt(sep_w);
+                                        const sh_f: f32 = @floatFromInt(sep_h);
+                                        pass.step(.{
+                                            .pipeline = self.shaders.pipelines.cell_bg,
+                                            .uniforms = frame.uniforms.buffer,
+                                            .buffers = &.{ null, frame.cells_bg.buffer },
+                                            .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                            .scissor = .{
+                                                .x = sep_x,
+                                                .y = sep_y,
+                                                .width = sep_w,
+                                                .height = sep_h,
+                                            },
+                                            .block_params = .{
+                                                .block_y_offset = 0,
+                                                .block_first_row = toolbar_scratch,
+                                                .block_x_offset = -pad_left,
+                                                .block_y_flat = 1.0,
+                                                .block_corner_radius = icon_r,
+                                                .block_scissor_x = sx_f,
+                                                .block_scissor_y = sy_f,
+                                                .block_scissor_w = sw_f,
+                                                .block_scissor_h = sh_f,
+                                            },
+                                        });
+                                        // Front rectangle (lower-right, icon color).
+                                        const front_x = back_x + offset;
+                                        const front_y = back_y + offset;
+                                        const fx_f: f32 = @floatFromInt(front_x);
+                                        const fy_f: f32 = @floatFromInt(front_y);
+                                        pass.step(.{
+                                            .pipeline = self.shaders.pipelines.cell_bg,
+                                            .uniforms = frame.uniforms.buffer,
+                                            .buffers = &.{ null, frame.cells_bg.buffer },
+                                            .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                            .scissor = .{
+                                                .x = front_x,
+                                                .y = front_y,
+                                                .width = rect_w,
+                                                .height = rect_h,
+                                            },
+                                            .block_params = .{
+                                                .block_y_offset = 0,
+                                                .block_first_row = icon_scratch,
+                                                .block_x_offset = -pad_left,
+                                                .block_y_flat = 1.0,
+                                                .block_corner_radius = icon_r,
+                                                .block_scissor_x = fx_f,
+                                                .block_scissor_y = fy_f,
+                                                .block_scissor_w = bw_f,
+                                                .block_scissor_h = bh_f,
+                                            },
+                                        });
                                     },
-                                });
+                                    .collapse => {
+                                        // Right-pointing chevron (triangle).
+                                        const tri_w: u32 = icon_area / 2;
+                                        const tri_h: u32 = icon_area * 2 / 3;
+                                        const tri_x = icon_cx - tri_w / 3;
+                                        const tri_y = icon_cy - tri_h / 2;
+                                        const tx_f: f32 = @floatFromInt(tri_x);
+                                        const ty_f: f32 = @floatFromInt(tri_y);
+                                        const tw_f: f32 = @floatFromInt(tri_w);
+                                        const th_f: f32 = @floatFromInt(tri_h);
+                                        pass.step(.{
+                                            .pipeline = self.shaders.pipelines.cell_bg,
+                                            .uniforms = frame.uniforms.buffer,
+                                            .buffers = &.{ null, frame.cells_bg.buffer },
+                                            .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                            .scissor = .{
+                                                .x = tri_x,
+                                                .y = tri_y,
+                                                .width = tri_w,
+                                                .height = tri_h,
+                                            },
+                                            .block_params = .{
+                                                .block_y_offset = 0,
+                                                .block_first_row = icon_scratch,
+                                                .block_x_offset = -pad_left,
+                                                .block_y_flat = 1.0,
+                                                .block_corner_radius = 1.0,
+                                                .block_scissor_x = tx_f,
+                                                .block_scissor_y = ty_f,
+                                                .block_scissor_w = tw_f,
+                                                .block_scissor_h = th_f,
+                                            },
+                                        });
+                                    },
+                                    .filter => {
+                                        // Three horizontal lines of decreasing width (funnel).
+                                        const line_h: u32 = @max(2, icon_area / 6);
+                                        const line_gap: u32 = @max(1, (icon_area - line_h * 3) / 4);
+                                        const lines_total_h = line_h * 3 + line_gap * 2;
+                                        const line_start_y = icon_cy - lines_total_h / 2;
+                                        var li: u32 = 0;
+                                        while (li < 3) : (li += 1) {
+                                            // Each line gets narrower: 100%, 66%, 33%.
+                                            const line_w: u32 = @max(3, icon_area * (3 - li) / 3);
+                                            const lx = icon_cx - line_w / 2;
+                                            const ly = line_start_y + li * (line_h + line_gap);
+                                            const lx_f: f32 = @floatFromInt(lx);
+                                            const ly_f: f32 = @floatFromInt(ly);
+                                            const lw_f: f32 = @floatFromInt(line_w);
+                                            const lh_f: f32 = @floatFromInt(line_h);
+                                            pass.step(.{
+                                                .pipeline = self.shaders.pipelines.cell_bg,
+                                                .uniforms = frame.uniforms.buffer,
+                                                .buffers = &.{ null, frame.cells_bg.buffer },
+                                                .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                                .scissor = .{
+                                                    .x = lx,
+                                                    .y = ly,
+                                                    .width = line_w,
+                                                    .height = line_h,
+                                                },
+                                                .block_params = .{
+                                                    .block_y_offset = 0,
+                                                    .block_first_row = icon_scratch,
+                                                    .block_x_offset = -pad_left,
+                                                    .block_y_flat = 1.0,
+                                                    .block_corner_radius = @min(icon_r, lh_f / 2.0),
+                                                    .block_scissor_x = lx_f,
+                                                    .block_scissor_y = ly_f,
+                                                    .block_scissor_w = lw_f,
+                                                    .block_scissor_h = lh_f,
+                                                },
+                                            });
+                                        }
+                                    },
+                                }
                             }
                         }
                     }
@@ -2981,7 +3242,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             };
             // Extra rows: 1 separator + num_blocks stripe + num_blocks tint + num_blocks collapse + 1 toolbar.
             const has_toolbar: bool = num_blocks > 0 and self.config.command_blocks_toolbar;
-            const toolbar_scratch_count: u16 = if (has_toolbar) 2 else 0; // bg + dots
+            const toolbar_scratch_count: u16 = if (has_toolbar) 3 else 0; // bg + icon color + icon hover
             const scratch_rows: u16 = if (num_blocks > 0) 1 + num_blocks * 3 + toolbar_scratch_count else 0;
             const total_rows = state.rows + scratch_rows;
 
@@ -3296,26 +3557,35 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     }
                 }
 
-                // Toolbar scratch rows: background pill + dot color.
+                // Toolbar scratch rows: background pill + icon color + icon hover.
                 if (has_toolbar) {
                     const toolbar_bg_row: usize = sep_row + 1 + @as(usize, num_blocks) * 3;
-                    const toolbar_dot_row: usize = toolbar_bg_row + 1;
+                    const toolbar_icon_row: usize = toolbar_bg_row + 1;
+                    const toolbar_hover_row: usize = toolbar_icon_row + 1;
                     const tb_color: [4]u8 = if (self.config.command_blocks_toolbar_color) |c|
                         .{ c.r, c.g, c.b, 230 }
                     else
                         .{ 0x1a, 0x1a, 0x2e, 230 };
-                    // Dots: lighter version of fg color.
+                    // Icon color: lighter version of fg.
                     const fg = state.colors.foreground;
-                    const dot_color: [4]u8 = .{
+                    const icon_color: [4]u8 = .{
                         @intCast((@as(u16, fg.r) * 2 + 255) / 3),
                         @intCast((@as(u16, fg.g) * 2 + 255) / 3),
                         @intCast((@as(u16, fg.b) * 2 + 255) / 3),
                         200,
                     };
+                    // Hover color: semi-transparent lighter version of toolbar bg.
+                    const hover_color: [4]u8 = .{
+                        @intCast(@min(255, @as(u16, tb_color[0]) + 40)),
+                        @intCast(@min(255, @as(u16, tb_color[1]) + 40)),
+                        @intCast(@min(255, @as(u16, tb_color[2]) + 40)),
+                        200,
+                    };
                     var tbx: usize = 0;
                     while (tbx < cols_u) : (tbx += 1) {
                         self.cells.bgCell(@intCast(toolbar_bg_row), @intCast(tbx)).* = tb_color;
-                        self.cells.bgCell(@intCast(toolbar_dot_row), @intCast(tbx)).* = dot_color;
+                        self.cells.bgCell(@intCast(toolbar_icon_row), @intCast(tbx)).* = icon_color;
+                        self.cells.bgCell(@intCast(toolbar_hover_row), @intCast(tbx)).* = hover_color;
                     }
                 }
             }

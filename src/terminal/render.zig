@@ -111,6 +111,10 @@ pub const RenderState = struct {
     /// or null if the mouse is not over any completed block.
     hovered_block_idx: ?usize = null,
 
+    /// Index of the toolbar icon under the mouse cursor (0-based in display
+    /// order), or null if not hovering over any icon.
+    hovered_toolbar_icon: ?u32 = null,
+
     /// The cached selection so we can avoid expensive selection calculations
     /// if possible.
     selection_cache: ?SelectionCache = null,
@@ -629,7 +633,11 @@ pub const RenderState = struct {
             // Detect hover changes (for toolbar rendering).
             const prev_hovered = self.hovered_block_idx;
             self.hovered_block_idx = t.hovered_block_idx;
-            if (!std.meta.eql(prev_hovered, self.hovered_block_idx)) {
+            const prev_hovered_icon = self.hovered_toolbar_icon;
+            self.hovered_toolbar_icon = t.hovered_toolbar_icon;
+            if (!std.meta.eql(prev_hovered, self.hovered_block_idx) or
+                !std.meta.eql(prev_hovered_icon, self.hovered_toolbar_icon))
+            {
                 self.dirty = .full;
             }
 
@@ -703,6 +711,7 @@ pub const RenderState = struct {
         } else {
             self.highlighted_block_idx = null;
             self.hovered_block_idx = null;
+            self.hovered_toolbar_icon = null;
             self.block_render_list.clearRetainingCapacity();
             self.total_doc_height_px = 0;
             self.block_layout_cell_height = 0;

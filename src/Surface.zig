@@ -17,6 +17,7 @@ pub const Message = apprt.surface.Message;
 
 const std = @import("std");
 const builtin = @import("builtin");
+const objc = if (builtin.os.tag.isDarwin()) @import("objc") else struct {};
 const assert = @import("quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -337,6 +338,8 @@ const DerivedConfig = struct {
     notify_on_command_finish_after: Duration,
     key_remaps: input.KeyRemapSet,
     command_blocks_toolbar: bool,
+    command_blocks_toolbar_icons: configpkg.Config.ToolbarIcons,
+    command_blocks_toolbar_position: configpkg.Config.ToolbarPosition,
     command_blocks_padding_right: u16,
 
     const Link = struct {
@@ -417,6 +420,8 @@ const DerivedConfig = struct {
             .notify_on_command_finish_after = config.@"notify-on-command-finish-after",
             .key_remaps = try config.@"key-remap".clone(alloc),
             .command_blocks_toolbar = config.@"command-blocks-toolbar",
+            .command_blocks_toolbar_icons = config.@"command-blocks-toolbar-icons",
+            .command_blocks_toolbar_position = config.@"command-blocks-toolbar-position",
             .command_blocks_padding_right = config.@"command-blocks-padding-right",
 
             // Assignments happen sequentially so we have to do this last
@@ -2213,6 +2218,83 @@ fn copyBlockToClipboard(self: *Surface, t: *terminal.Terminal, block_idx: usize)
     ) catch |err| {
         log.err("copy block to clipboard failed: {}", .{err});
     };
+}
+
+/// Show a dropdown menu for the block toolbar at the given screen position.
+/// On macOS, uses NSMenu via the objc bridge; on other platforms, this is a no-op.
+fn showBlockToolbarMenu(self: *Surface, block_idx: usize, menu_x_px: u32, menu_y_px: u32, margin_px: u32) void {
+    _ = block_idx;
+
+    if (comptime !builtin.os.tag.isDarwin()) return;
+
+    // Get the NSView from our surface (only available for embedded apprt on macOS).
+    const RtSurface = @TypeOf(self.rt_surface.*);
+    const nsview = if (comptime @hasField(RtSurface, "platform"))
+        switch (self.rt_surface.platform) {
+            .macos => |p| p.nsview,
+            .ios => return,
+        }
+    else
+        return;
+
+    const NSMenuClass = objc.getClass("NSMenu") orelse return;
+    const NSMenuItem = objc.getClass("NSMenuItem") orelse return;
+    const NSString = objc.getClass("NSString") orelse return;
+    const empty = NSString.msgSend(objc.Object, objc.sel("string"), .{});
+
+    // Create menu.
+    const menu_obj: objc.Object = NSMenuClass.msgSend(objc.Object, objc.sel("alloc"), .{})
+        .msgSend(objc.Object, objc.sel("initWithTitle:"), .{empty});
+
+    // Add menu items.
+    const Item = struct { title: [*:0]const u8, sep: bool };
+    const entries = [_]Item{
+        .{ .title = "Copy Command", .sep = false },
+        .{ .title = "Copy Output", .sep = false },
+        .{ .title = "Copy Block", .sep = false },
+        .{ .title = "", .sep = true },
+        .{ .title = "Scroll to Top", .sep = false },
+        .{ .title = "Scroll to Bottom", .sep = false },
+    };
+    for (entries) |entry| {
+        if (entry.sep) {
+            const sep: objc.Object = NSMenuItem.msgSend(objc.Object, objc.sel("separatorItem"), .{});
+            menu_obj.msgSend(void, objc.sel("addItem:"), .{sep});
+        } else {
+            const ns_title = NSString.msgSend(objc.Object, objc.sel("stringWithUTF8String:"), .{
+                @as([*c]const u8, entry.title),
+            });
+            const item: objc.Object = NSMenuItem.msgSend(objc.Object, objc.sel("alloc"), .{})
+                .msgSend(objc.Object, objc.sel("initWithTitle:action:keyEquivalent:"), .{
+                ns_title, @as(objc.c.SEL, null), empty,
+            });
+            menu_obj.msgSend(void, objc.sel("addItem:"), .{item});
+        }
+    }
+
+    // Convert pixel coordinates to NSView point coordinates.
+    // NSView has origin at bottom-left (Y goes up); our Y is top-down pixels.
+    const content_scale = self.rt_surface.getContentScale() catch .{ .x = 1, .y = 1 };
+    const view_h_points: f64 = @as(f64, @floatFromInt(self.size.screen.height)) / content_scale.y;
+    const point_x: f64 = @as(f64, @floatFromInt(menu_x_px)) / content_scale.x;
+    // menu_y_px is the bottom of the toolbar; add margin to position the dropdown below it.
+    // Double the margin to account for NSMenu's own internal top padding.
+    const point_y: f64 = view_h_points - @as(f64, @floatFromInt(menu_y_px + margin_px * 2)) / content_scale.y;
+
+    // Force the menu to compute its layout so we can query its actual size.
+    menu_obj.msgSend(void, objc.sel("update"), .{});
+    const NSSize = extern struct { width: f64, height: f64 };
+    const menu_size: NSSize = menu_obj.msgSend(NSSize, objc.sel("size"), .{});
+    const menu_width: f64 = if (menu_size.width > 0) menu_size.width else 170;
+    // Right-align: menu's right edge aligns with the toolbar's right edge (menu_x_px).
+    const adjusted_x: f64 = point_x - menu_width;
+
+    const NSPoint = extern struct { x: f64, y: f64 };
+    _ = menu_obj.msgSend(
+        bool,
+        objc.sel("popUpMenuPositioningItem:atLocation:inView:"),
+        .{ @as(objc.c.id, null), NSPoint{ .x = adjusted_x, .y = point_y }, nsview },
+    );
 }
 
 fn copySelectionToClipboards(
@@ -4096,6 +4178,10 @@ pub fn mouseButtonCallback(
 
     // For left button clicks we always record some information for
     // selection/highlighting purposes.
+    // Deferred menu popup info (must be shown after mutex is released).
+    const DeferredMenu = struct { block_idx: usize, menu_x_px: u32, menu_y_px: u32, margin_px: u32 };
+    var deferred_menu: ?DeferredMenu = null;
+
     if (button == .left and action == .press) click: {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
@@ -4217,8 +4303,12 @@ pub fn mouseButtonCallback(
                     for (brl) |info| {
                         const block_end = info.virtual_y_px + info.visible_height_px;
                         if (virtual_y >= info.virtual_y_px and virtual_y < block_end) {
-                            // Check if click is on the toolbar pill (upper-right of block).
+                            // Check if click is on the toolbar pill.
                             if (self.config.command_blocks_toolbar) toolbar_check: {
+                                const icons_cfg = self.config.command_blocks_toolbar_icons;
+                                const icon_count = icons_cfg.count();
+                                if (icon_count == 0) break :toolbar_check;
+
                                 // Skip active block (last in layout).
                                 if (info.block_list_index == brl[brl.len - 1].block_list_index) break :toolbar_check;
 
@@ -4229,11 +4319,23 @@ pub fn mouseButtonCallback(
                                 const block_screen_y: u32 = @intCast(block_screen_y_i64);
 
                                 const toolbar_h = cell_h;
-                                const toolbar_w = cell_w * 3;
+                                const icon_slot_w = toolbar_h; // square slots, same as renderer
+                                const icon_padding: u32 = @max(2, toolbar_h / 6);
+                                const toolbar_w = icon_count * icon_slot_w + icon_padding * 2;
                                 const grid_cols = t.cols;
                                 const grid_right = self.size.padding.left + grid_cols * cell_w;
-                                const toolbar_x = grid_right -| toolbar_w -| cell_w;
-                                const toolbar_y = block_screen_y;
+                                const is_right = self.config.command_blocks_toolbar_position == .@"upper-right" or
+                                    self.config.command_blocks_toolbar_position == .@"lower-right";
+                                const is_upper = self.config.command_blocks_toolbar_position == .@"upper-right" or
+                                    self.config.command_blocks_toolbar_position == .@"upper-left";
+                                const toolbar_x: u32 = if (is_right)
+                                    grid_right -| toolbar_w -| cell_w
+                                else
+                                    self.size.padding.left + cell_w;
+                                const toolbar_y: u32 = if (is_upper)
+                                    block_screen_y
+                                else
+                                    (block_screen_y + info.visible_height_px) -| toolbar_h;
 
                                 const click_x: u32 = @intFromFloat(@max(0, pos.x));
                                 const click_y: u32 = @intFromFloat(@max(0, pos.y));
@@ -4241,8 +4343,37 @@ pub fn mouseButtonCallback(
                                 if (click_x >= toolbar_x and click_x < toolbar_x + toolbar_w and
                                     click_y >= toolbar_y and click_y < toolbar_y + toolbar_h)
                                 {
-                                    // Toolbar click: copy block text to clipboard.
-                                    self.copyBlockToClipboard(t, info.block_list_index);
+                                    // Determine which icon was clicked.
+                                    const rel_x = click_x - toolbar_x - icon_padding;
+                                    const icon_idx = @min(rel_x / icon_slot_w, icon_count - 1);
+                                    const enabled = icons_cfg.enabledIcons();
+                                    if (icon_idx < enabled.len) {
+                                        switch (enabled.icons[icon_idx]) {
+                                            .copy => {
+                                                self.copyBlockToClipboard(t, info.block_list_index);
+                                            },
+                                            .collapse => {
+                                                t.highlighted_block_idx = info.block_list_index;
+                                                t.toggleHighlightedBlockCollapse();
+                                            },
+                                            .ellipsis => {
+                                                // Defer menu popup to after mutex is released,
+                                                // since NSMenu runs a modal event loop that
+                                                // needs to render (which requires the mutex).
+                                                // Position dropdown: right-aligned with toolbar,
+                                                // appearing below the toolbar.
+                                                deferred_menu = .{
+                                                    .block_idx = info.block_list_index,
+                                                    .menu_x_px = toolbar_x + toolbar_w,
+                                                    .menu_y_px = toolbar_y + toolbar_h,
+                                                    .margin_px = icon_padding,
+                                                };
+                                            },
+                                            .filter => {
+                                                // TODO: toggle inline filter
+                                            },
+                                        }
+                                    }
                                     try self.queueRender();
                                     break;
                                 }
@@ -4308,6 +4439,11 @@ pub fn mouseButtonCallback(
             // We should be bounded by 1 to 3
             else => unreachable,
         }
+    }
+
+    // Show deferred menu popup (after mutex is released).
+    if (deferred_menu) |dm| {
+        self.showBlockToolbarMenu(dm.block_idx, dm.menu_x_px, dm.menu_y_px, dm.margin_px);
     }
 
     // Middle-click pastes from our selection clipboard
@@ -4808,6 +4944,7 @@ pub fn cursorPosCallback(
 
         // Clear hovered block when mouse is outside viewport.
         self.renderer_state.terminal.hovered_block_idx = null;
+        self.renderer_state.terminal.hovered_toolbar_icon = null;
 
         // Mark the link's row as dirty, but continue with updating the
         // mouse state below so we can scroll when our position is negative.
@@ -4908,6 +5045,7 @@ pub fn cursorPosCallback(
             if (content_y_f < 0) {
                 // Above content area — treat as history (pointer cursor).
                 t.hovered_block_idx = null;
+                t.hovered_toolbar_icon = null;
                 _ = try self.rt_app.performAction(
                     .{ .surface = self },
                     .mouse_shape,
@@ -4939,7 +5077,72 @@ pub fn cursorPosCallback(
 
             const prev_hovered = t.hovered_block_idx;
             t.hovered_block_idx = hovered_idx;
-            if (!std.meta.eql(prev_hovered, hovered_idx)) {
+
+            // Determine which toolbar icon the mouse is over (if any).
+            var new_hovered_icon: ?u32 = null;
+            if (hovered_idx != null and self.config.command_blocks_toolbar) icon_detect: {
+                const icons_cfg = self.config.command_blocks_toolbar_icons;
+                const icon_count = icons_cfg.count();
+                if (icon_count == 0) break :icon_detect;
+
+                const cell_w: u32 = self.size.cell.width;
+                const toolbar_h = cell_h;
+                const icon_slot_w = toolbar_h; // square slots, same as renderer
+                const icon_padding_val: u32 = @max(2, toolbar_h / 6);
+                const icon_margin: u32 = @max(1, toolbar_h / 8);
+                const toolbar_w = icon_count * icon_slot_w + icon_padding_val * 2;
+                const grid_cols = t.cols;
+                const grid_right = self.size.padding.left + grid_cols * cell_w;
+                const is_right = self.config.command_blocks_toolbar_position == .@"upper-right" or
+                    self.config.command_blocks_toolbar_position == .@"lower-right";
+                const is_upper = self.config.command_blocks_toolbar_position == .@"upper-right" or
+                    self.config.command_blocks_toolbar_position == .@"upper-left";
+                const toolbar_x: u32 = if (is_right)
+                    grid_right -| toolbar_w -| cell_w
+                else
+                    self.size.padding.left + cell_w;
+
+                // Compute toolbar screen Y from the hovered block's virtual position.
+                for (brl) |info| {
+                    if (info.block_list_index == hovered_idx.?) {
+                        const block_screen_y_i64: i64 = @as(i64, @intCast(padding_top)) +
+                            @as(i64, @intCast(info.virtual_y_px)) - viewport_top_i64;
+                        if (block_screen_y_i64 < 0) break :icon_detect;
+                        const block_screen_y: u32 = @intCast(block_screen_y_i64);
+                        const toolbar_y: u32 = if (is_upper)
+                            block_screen_y
+                        else
+                            (block_screen_y + info.visible_height_px) -| toolbar_h;
+
+                        const mx: u32 = @intFromFloat(@max(0, pos.x));
+                        const my: u32 = @intFromFloat(@max(0, pos.y));
+
+                        if (mx >= toolbar_x and mx < toolbar_x + toolbar_w and
+                            my >= toolbar_y and my < toolbar_y + toolbar_h)
+                        {
+                            const rel_x = mx -| toolbar_x -| icon_padding_val;
+                            const icon_idx = @min(rel_x / icon_slot_w, icon_count - 1);
+                            // Check if within the icon's active area (excluding margins).
+                            const icon_start_x = toolbar_x + icon_padding_val + icon_idx * icon_slot_w + icon_margin;
+                            const icon_end_x = toolbar_x + icon_padding_val + (icon_idx + 1) * icon_slot_w -| icon_margin;
+                            const icon_start_y = toolbar_y + icon_margin;
+                            const icon_end_y = toolbar_y + toolbar_h -| icon_margin;
+                            if (mx >= icon_start_x and mx < icon_end_x and
+                                my >= icon_start_y and my < icon_end_y)
+                            {
+                                new_hovered_icon = icon_idx;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            const prev_hovered_icon = t.hovered_toolbar_icon;
+            t.hovered_toolbar_icon = new_hovered_icon;
+
+            if (!std.meta.eql(prev_hovered, hovered_idx) or
+                !std.meta.eql(prev_hovered_icon, new_hovered_icon))
+            {
                 try self.queueRender();
             }
 

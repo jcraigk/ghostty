@@ -92,6 +92,11 @@ highlighted_block_idx: ?usize = null,
 /// Set by Surface.zig during mouse move; read by the renderer for toolbar.
 hovered_block_idx: ?usize = null,
 
+/// Index of the toolbar icon currently under the mouse cursor (0-based,
+/// in display order), or null if not hovering over any icon.
+/// Set by Surface.zig during mouse move; read by the renderer for hover highlight.
+hovered_toolbar_icon: ?u32 = null,
+
 /// Auto-collapse threshold: when a new block is created, automatically
 /// collapse the block N positions back from the newest. Set by the
 /// renderer from config. null = disabled.
@@ -1449,6 +1454,7 @@ pub fn gotoBlock(self: *Terminal, is_previous: bool) void {
 
     // Clear mouse hover so keyboard-selected block gets the toolbar.
     self.hovered_block_idx = null;
+    self.hovered_toolbar_icon = null;
 
     // Last completed block index (active block is items.len - 1).
     const last_completed = items.len - 2;

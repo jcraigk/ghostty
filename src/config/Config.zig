@@ -2948,9 +2948,25 @@ keybind: Keybinds = .{},
 /// menu for additional operations.
 @"command-blocks-toolbar": bool = false,
 
+/// Which icons to show in the toolbar. Each icon is a boolean flag;
+/// enabled icons appear in a fixed order: copy, filter, collapse, ellipsis.
+/// The ellipsis icon opens a dropdown menu with additional actions.
+/// By default only the ellipsis is shown.
+@"command-blocks-toolbar-icons": ToolbarIcons = .{ .ellipsis = true },
+
+/// Corner the toolbar attaches to within each block.
+/// Icons grow inward from the anchor corner.
+@"command-blocks-toolbar-position": ToolbarPosition = .@"upper-right",
+
 /// Background color for the toolbar pill. Specified as a typical color
 /// value (hex, named, etc.). Empty string disables the toolbar background.
 @"command-blocks-toolbar-color": ?Color = .{ .r = 0x1a, .g = 0x1a, .b = 0x2e },
+
+/// Border radius (in points) for the toolbar container.
+@"command-blocks-toolbar-radius": u16 = 6,
+
+/// Border radius (in points) for individual icon buttons within the toolbar.
+@"command-blocks-toolbar-icon-radius": u16 = 4,
 
 /// Custom entries into the command palette.
 ///
@@ -9536,6 +9552,58 @@ pub const AlphaBlending = enum {
             .linear, .@"linear-corrected" => true,
         };
     }
+};
+
+/// See command-blocks-toolbar-icons
+pub const ToolbarIcons = packed struct {
+    copy: bool = false,
+    filter: bool = false,
+    collapse: bool = false,
+    ellipsis: bool = false,
+
+    /// Returns the total number of enabled icons.
+    pub fn count(self: ToolbarIcons) u32 {
+        var n: u32 = 0;
+        if (self.copy) n += 1;
+        if (self.filter) n += 1;
+        if (self.collapse) n += 1;
+        if (self.ellipsis) n += 1;
+        return n;
+    }
+
+    /// Icon identifiers in display order (left-to-right for upper-right position).
+    pub const Icon = enum { copy, filter, collapse, ellipsis };
+
+    /// Iterates enabled icons in display order, returning up to 4 icons.
+    pub fn enabledIcons(self: ToolbarIcons) struct { icons: [4]Icon, len: u32 } {
+        var result: [4]Icon = undefined;
+        var n: u32 = 0;
+        if (self.copy) {
+            result[n] = .copy;
+            n += 1;
+        }
+        if (self.filter) {
+            result[n] = .filter;
+            n += 1;
+        }
+        if (self.collapse) {
+            result[n] = .collapse;
+            n += 1;
+        }
+        if (self.ellipsis) {
+            result[n] = .ellipsis;
+            n += 1;
+        }
+        return .{ .icons = result, .len = n };
+    }
+};
+
+/// See command-blocks-toolbar-position
+pub const ToolbarPosition = enum {
+    @"upper-right",
+    @"upper-left",
+    @"lower-right",
+    @"lower-left",
 };
 
 /// See background-image-position
