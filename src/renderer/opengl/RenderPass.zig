@@ -44,6 +44,11 @@ pub const Step = struct {
         block_first_row: f32,
         block_x_offset: f32 = 0,
         block_y_flat: f32 = 0,
+        block_corner_radius: f32 = 0,
+        block_scissor_x: f32 = 0,
+        block_scissor_y: f32 = 0,
+        block_scissor_w: f32 = 0,
+        block_scissor_h: f32 = 0,
     };
 
     pub const ScissorRect = struct {

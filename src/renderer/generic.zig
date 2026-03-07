@@ -669,6 +669,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             command_blocks_tint_highlight: ?configpkg.Config.Color,
             command_blocks_collapse_preview_lines: u16,
             command_blocks_auto_collapse_threshold: ?u16,
+            command_blocks_toolbar: bool,
+            command_blocks_toolbar_color: ?configpkg.Config.Color,
+            command_blocks_toolbar_radius: u16,
             scroll_to_bottom_on_output: bool,
 
             pub fn init(
@@ -760,6 +763,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .command_blocks_tint_highlight = config.@"command-blocks-tint-highlight",
                     .command_blocks_collapse_preview_lines = config.@"command-blocks-collapse-preview-lines",
                     .command_blocks_auto_collapse_threshold = config.@"command-blocks-auto-collapse-threshold",
+                    .command_blocks_toolbar = config.@"command-blocks-toolbar",
+                    .command_blocks_toolbar_color = config.@"command-blocks-toolbar-color",
+                    .command_blocks_toolbar_radius = config.@"command-blocks-toolbar-radius",
                     .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
                     .arena = arena,
                 };
@@ -1322,7 +1328,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Update BlockLayout configuration. This must happen before
                 // the render state snapshot so the layout is up to date.
                 if (state.terminal.block_layout) |*layout| {
-                    const Block = @import("../terminal/Block.zig");
                     const active_cursor_row: ?u32 = acr: {
                         if (state.terminal.block_list) |*bl| {
                             if (bl.activeBlock()) |active| {
@@ -1331,10 +1336,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                     // Safety: only compute if cursor is at or after prompt_start.
                                     // If cursor is before prompt_start (e.g. during init), skip.
                                     if (!cursor_pin.before(active.prompt_start.*)) {
-                                        // countRowsBetweenPins returns 1-based count (min 1).
-                                        // Convert to 0-based row index for the layout.
-                                        const rows = Block.countRowsBetweenPins(active.prompt_start.*, cursor_pin);
-                                        break :acr rows -| 1;
+                                        // Count rows from prompt_start to cursor INCLUSIVE.
+                                        // This gives a 0-based row index: same row = 0, next row = 1, etc.
+                                        var row_count: u32 = 0;
+                                        var it = active.prompt_start.rowIterator(.right_down, cursor_pin);
+                                        while (it.next()) |row_pin| {
+                                            if (row_pin.node == cursor_pin.node and row_pin.y == cursor_pin.y) break;
+                                            row_count += 1;
+                                        }
+                                        break :acr row_count;
                                     }
                                 }
                             }
@@ -1793,10 +1803,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     region.instance_offset = cursor_cells;
                     region.instance_count = count;
                     cursor_cells += count;
-
-                    // log.debug("block_instance: ri={} first_row={} row_count={} inst_offset={} inst_count={} screen_y={} height={} grid_y_off={d:.1}", .{
-                    //     ri, region.first_row, region.row_count, region.instance_offset, region.instance_count, region.screen_y_px, region.height_px, region.grid_y_offset,
-                    // });
                 }
             }
 
@@ -2148,6 +2154,102 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                         });
                                     }
                                 }
+                            }
+                        }
+                    }
+
+                    // Toolbar: draw a pill-shaped background on the hovered or highlighted block.
+                    // Rendered after all block content so it appears on top.
+                    if (self.config.command_blocks_toolbar and num_blocks > 0) toolbar: {
+                        const hovered_bl_idx = ts.hovered_block_idx orelse
+                            (ts.highlighted_block_idx orelse break :toolbar);
+                        // Find the BlockRegion for the hovered block.
+                        const hovered_region: ?BlockRegion = for (self.block_regions.items) |reg| {
+                            if (reg.block_idx < ts.block_render_list.items.len and
+                                ts.block_render_list.items[reg.block_idx].block_list_index == hovered_bl_idx)
+                                break reg;
+                        } else null;
+                        const region = hovered_region orelse break :toolbar;
+
+                        // Toolbar dimensions: pill in upper-right corner of block.
+                        const cell_h = self.grid_metrics.cell_height;
+                        const cell_w = self.grid_metrics.cell_width;
+                        const toolbar_h: u32 = @min(cell_h *| 3 / 4, region.height_px);
+                        const toolbar_w: u32 = cell_w * 3;
+                        // Position at the right edge of the text grid, inset by 1 cell.
+                        const grid_cols: u32 = self.cells.size.columns;
+                        const grid_right: u32 = self.size.padding.left + grid_cols * cell_w;
+                        const inset_y: u32 = (cell_h -| toolbar_h) / 2;
+                        const toolbar_x: u32 = grid_right -| toolbar_w -| cell_w;
+                        const toolbar_y: u32 = region.screen_y_px + inset_y;
+                        const corner_radius: f32 = @floatFromInt(self.config.command_blocks_toolbar_radius);
+
+                        if (toolbar_h > 0 and toolbar_w > 0) {
+                            const toolbar_scratch: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(num_blocks)) * 3.0;
+                            const tb_x_f: f32 = @floatFromInt(toolbar_x);
+                            const tb_y_f: f32 = @floatFromInt(toolbar_y);
+                            const tb_w_f: f32 = @floatFromInt(toolbar_w);
+                            const tb_h_f: f32 = @floatFromInt(toolbar_h);
+                            // Toolbar pill background.
+                            pass.step(.{
+                                .pipeline = self.shaders.pipelines.cell_bg,
+                                .uniforms = frame.uniforms.buffer,
+                                .buffers = &.{ null, frame.cells_bg.buffer },
+                                .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                .scissor = .{
+                                    .x = toolbar_x,
+                                    .y = toolbar_y,
+                                    .width = toolbar_w,
+                                    .height = toolbar_h,
+                                },
+                                .block_params = .{
+                                    .block_y_offset = 0,
+                                    .block_first_row = toolbar_scratch,
+                                    .block_x_offset = -pad_left,
+                                    .block_y_flat = 1.0,
+                                    .block_corner_radius = corner_radius,
+                                    .block_scissor_x = tb_x_f,
+                                    .block_scissor_y = tb_y_f,
+                                    .block_scissor_w = tb_w_f,
+                                    .block_scissor_h = tb_h_f,
+                                },
+                            });
+
+                            // Ellipsis dots: 3 small circles inside the pill.
+                            const dot_scratch: f32 = toolbar_scratch + 1.0;
+                            const dot_size: u32 = @max(3, toolbar_h / 5);
+                            const dot_y = toolbar_y + (toolbar_h - dot_size) / 2;
+                            const dot_spacing = toolbar_w / 4;
+                            const dot_start_x = toolbar_x + dot_spacing - dot_size / 2;
+                            var dot_i: u32 = 0;
+                            while (dot_i < 3) : (dot_i += 1) {
+                                const dx = dot_start_x + dot_spacing * dot_i;
+                                const dx_f: f32 = @floatFromInt(dx);
+                                const dy_f: f32 = @floatFromInt(dot_y);
+                                const ds_f: f32 = @floatFromInt(dot_size);
+                                pass.step(.{
+                                    .pipeline = self.shaders.pipelines.cell_bg,
+                                    .uniforms = frame.uniforms.buffer,
+                                    .buffers = &.{ null, frame.cells_bg.buffer },
+                                    .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                    .scissor = .{
+                                        .x = dx,
+                                        .y = dot_y,
+                                        .width = dot_size,
+                                        .height = dot_size,
+                                    },
+                                    .block_params = .{
+                                        .block_y_offset = 0,
+                                        .block_first_row = dot_scratch,
+                                        .block_x_offset = -pad_left,
+                                        .block_y_flat = 1.0,
+                                        .block_corner_radius = ds_f / 2.0,
+                                        .block_scissor_x = dx_f,
+                                        .block_scissor_y = dy_f,
+                                        .block_scissor_w = ds_f,
+                                        .block_scissor_h = ds_f,
+                                    },
+                                });
                             }
                         }
                     }
@@ -2903,8 +3005,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (!self.config.command_blocks) break :blk 0;
                 break :blk @intCast(@min(state.block_render_list.items.len, std.math.maxInt(u16)));
             };
-            // Extra rows: 1 separator + num_blocks stripe + num_blocks tint + num_blocks collapse.
-            const scratch_rows: u16 = if (num_blocks > 0) 1 + num_blocks * 3 else 0;
+            // Extra rows: 1 separator + num_blocks stripe + num_blocks tint + num_blocks collapse + 1 toolbar.
+            const has_toolbar: bool = num_blocks > 0 and self.config.command_blocks_toolbar;
+            const toolbar_scratch_count: u16 = if (has_toolbar) 2 else 0; // bg + dots
+            const scratch_rows: u16 = if (num_blocks > 0) 1 + num_blocks * 3 + toolbar_scratch_count else 0;
             const total_rows = state.rows + scratch_rows;
 
             const grid_size_diff =
@@ -2924,6 +3028,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             const rebuild = state.dirty == .full or grid_size_diff;
+
             if (rebuild) {
                 // If we are doing a full rebuild, then we clear the entire cell buffer.
                 self.cells.reset();
@@ -3059,9 +3164,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                         const hidden: u16 = @intCast(@min(info.hiddenLines(), std.math.maxInt(u16)));
 
-                        // log.debug("block_region: idx={} vp_first_row={} first_row={} display_rc={} rows_above={} visible_rc={} screen_y={} virt_y={} vp_top={}", .{
-                        //     layout_i, info.viewport_first_row, first_row, display_rc, rows_above, visible_rc, screen_y, info.virtual_y_px, @as(u32, @intCast(viewport_top_px)),
-                        // });
                         self.block_regions.append(self.alloc, .{
                             .first_row = first_row,
                             .row_count = display_rc,
@@ -3238,6 +3340,29 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     var ccx: usize = 0;
                     while (ccx < cols_u) : (ccx += 1) {
                         self.cells.bgCell(@intCast(collapse_row), @intCast(ccx)).* = collapse_color;
+                    }
+                }
+
+                // Toolbar scratch rows: background pill + dot color.
+                if (has_toolbar) {
+                    const toolbar_bg_row: usize = sep_row + 1 + @as(usize, num_blocks) * 3;
+                    const toolbar_dot_row: usize = toolbar_bg_row + 1;
+                    const tb_color: [4]u8 = if (self.config.command_blocks_toolbar_color) |c|
+                        .{ c.r, c.g, c.b, 230 }
+                    else
+                        .{ 0x1a, 0x1a, 0x2e, 230 };
+                    // Dots: lighter version of fg color.
+                    const fg = state.colors.foreground;
+                    const dot_color: [4]u8 = .{
+                        @intCast((@as(u16, fg.r) * 2 + 255) / 3),
+                        @intCast((@as(u16, fg.g) * 2 + 255) / 3),
+                        @intCast((@as(u16, fg.b) * 2 + 255) / 3),
+                        200,
+                    };
+                    var tbx: usize = 0;
+                    while (tbx < cols_u) : (tbx += 1) {
+                        self.cells.bgCell(@intCast(toolbar_bg_row), @intCast(tbx)).* = tb_color;
+                        self.cells.bgCell(@intCast(toolbar_dot_row), @intCast(tbx)).* = dot_color;
                     }
                 }
             }

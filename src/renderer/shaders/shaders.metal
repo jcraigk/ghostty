@@ -448,6 +448,11 @@ struct BlockParams {
   float block_first_row;
   float block_x_offset;
   float block_y_flat;
+  float block_corner_radius;
+  float block_scissor_x;
+  float block_scissor_y;
+  float block_scissor_w;
+  float block_scissor_h;
 };
 
 //-------------------------------------------------------------------
@@ -506,6 +511,21 @@ fragment float4 cell_bg_fragment(
 
   // Load the color for the cell.
   uchar4 cell_color = cells[grid_pos.y * uniforms.grid_size.x + grid_pos.x];
+
+  // Rounded corners: discard fragments outside the rounded rect.
+  if (block_params.block_corner_radius > 0.0) {
+    float r = block_params.block_corner_radius;
+    float2 rect_origin = float2(block_params.block_scissor_x, block_params.block_scissor_y);
+    float2 rect_size = float2(block_params.block_scissor_w, block_params.block_scissor_h);
+    // SDF for rounded rectangle: position relative to rect center.
+    float2 center = rect_origin + rect_size * 0.5;
+    float2 half_size = rect_size * 0.5;
+    float2 q = abs(in.position.xy - center) - half_size + float2(r);
+    float d = length(max(q, float2(0.0))) - r;
+    if (d > 0.0) {
+      return float4(0.0);
+    }
+  }
 
   // Convert the color and return it.
   //

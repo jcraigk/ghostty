@@ -87,6 +87,11 @@ scroll_offset_px: u32 = 0,
 /// at a time. The active (last) block cannot be highlighted.
 highlighted_block_idx: ?usize = null,
 
+/// Index into BlockList.blocks of the block currently under the mouse
+/// cursor, or null if the mouse is not over any completed block.
+/// Set by Surface.zig during mouse move; read by the renderer for toolbar.
+hovered_block_idx: ?usize = null,
+
 /// Auto-collapse threshold: when a new block is created, automatically
 /// collapse the block N positions back from the newest. Set by the
 /// renderer from config. null = disabled.
@@ -1974,14 +1979,19 @@ pub fn syncPageListViewport(self: *Terminal) void {
     const layout = &(self.block_layout orelse return);
     layout.ensureValid();
 
+    // When following (scroll_offset_px == 0), keep the PageList viewport at
+    // the active area (bottom). This ensures the cursor is always in the cell
+    // buffer, even when collapsed blocks have many hidden rows that would
+    // otherwise consume cell buffer slots.
+    if (self.scroll_offset_px == 0) {
+        self.screens.active.scroll(.{ .active = {} });
+        return;
+    }
+
     const doc_h = layout.total_height_px;
     const viewport_h = self.height_px;
 
     // viewport_top_px: virtual Y at the top of the visible area.
-    // Clamped to 0 for small documents (same as renderer).
-    // This is computed the same way whether following (scroll_offset_px=0) or
-    // scrolled up, ensuring the PageList viewport always covers the rows that
-    // the renderer will actually draw.
     const viewport_top_px: u32 = if (doc_h > viewport_h + self.scroll_offset_px)
         doc_h - viewport_h - self.scroll_offset_px
     else

@@ -336,6 +336,8 @@ const DerivedConfig = struct {
     notify_on_command_finish_action: configpkg.Config.NotifyOnCommandFinishAction,
     notify_on_command_finish_after: Duration,
     key_remaps: input.KeyRemapSet,
+    command_blocks_toolbar: bool,
+    command_blocks_padding_right: u16,
 
     const Link = struct {
         regex: oni.Regex,
@@ -414,6 +416,8 @@ const DerivedConfig = struct {
             .notify_on_command_finish_action = config.@"notify-on-command-finish-action",
             .notify_on_command_finish_after = config.@"notify-on-command-finish-after",
             .key_remaps = try config.@"key-remap".clone(alloc),
+            .command_blocks_toolbar = config.@"command-blocks-toolbar",
+            .command_blocks_padding_right = config.@"command-blocks-padding-right",
 
             // Assignments happen sequentially so we have to do this last
             // so that the memory is captured from allocs above.
@@ -2180,6 +2184,34 @@ fn clipboardWrite(self: *const Surface, data: []const u8, loc: apprt.Clipboard) 
     }}, confirm) catch |err| {
         log.err("error setting clipboard string err={}", .{err});
         return;
+    };
+}
+
+/// Copy the text of a specific block (by block_list_index) to the system clipboard.
+/// Used by the toolbar click handler.
+fn copyBlockToClipboard(self: *Surface, t: *terminal.Terminal, block_idx: usize) void {
+    const bl = &(t.block_list orelse return);
+    if (block_idx >= bl.blocks.items.len) return;
+    const block = bl.blocks.items[block_idx];
+
+    const start_pin: terminal.PageList.Pin = pin: {
+        var p = block.prompt_start.*;
+        p.x = 0;
+        break :pin p;
+    };
+    const end_pin: terminal.PageList.Pin = pin: {
+        const e = block.end orelse break :pin start_pin;
+        var p = e.up(1) orelse e.*;
+        p.x = t.screens.active.pages.cols - 1;
+        break :pin p;
+    };
+    const sel = terminal.Selection.init(start_pin, end_pin, false);
+    self.copySelectionToClipboards(
+        sel,
+        &.{.standard},
+        .plain,
+    ) catch |err| {
+        log.err("copy block to clipboard failed: {}", .{err});
     };
 }
 
@@ -4153,6 +4185,8 @@ pub fn mouseButtonCallback(
 
                 // Command blocks: toggle block highlight on single click.
                 // Use BlockLayout to map click position to block.
+                // If toolbar is enabled and click is on the toolbar pill,
+                // open the dropdown menu instead of toggling highlight.
                 if (t.block_list != null) blk: {
                     const layout = t.block_layout orelse break :blk;
                     const brl = layout.block_offsets.items;
@@ -4160,6 +4194,7 @@ pub fn mouseButtonCallback(
 
                     const cell_h: u32 = self.size.cell.height;
                     if (cell_h == 0) break :blk;
+                    const cell_w: u32 = self.size.cell.width;
                     const padding_top: u32 = self.size.padding.top;
                     // Use rows * cell_height for viewport_h to match Terminal.height_px
                     // and the renderer's viewport_top_px computation.
@@ -4182,6 +4217,38 @@ pub fn mouseButtonCallback(
                     for (brl) |info| {
                         const block_end = info.virtual_y_px + info.visible_height_px;
                         if (virtual_y >= info.virtual_y_px and virtual_y < block_end) {
+                            // Check if click is on the toolbar pill (upper-right of block).
+                            if (self.config.command_blocks_toolbar) toolbar_check: {
+                                // Skip active block (last in layout).
+                                if (info.block_list_index == brl[brl.len - 1].block_list_index) break :toolbar_check;
+
+                                // Compute toolbar screen bounds (same as renderer).
+                                const block_screen_y_i64: i64 = @as(i64, @intCast(padding_top)) +
+                                    @as(i64, @intCast(info.virtual_y_px)) - viewport_top_i64;
+                                if (block_screen_y_i64 < 0) break :toolbar_check;
+                                const block_screen_y: u32 = @intCast(block_screen_y_i64);
+
+                                const toolbar_h = cell_h *| 3 / 4;
+                                const toolbar_w = cell_w * 3;
+                                const grid_cols = t.cols;
+                                const grid_right = self.size.padding.left + grid_cols * cell_w;
+                                const inset_y = (cell_h -| toolbar_h) / 2;
+                                const toolbar_x = grid_right -| toolbar_w -| cell_w;
+                                const toolbar_y = block_screen_y + inset_y;
+
+                                const click_x: u32 = @intFromFloat(@max(0, pos.x));
+                                const click_y: u32 = @intFromFloat(@max(0, pos.y));
+
+                                if (click_x >= toolbar_x and click_x < toolbar_x + toolbar_w and
+                                    click_y >= toolbar_y and click_y < toolbar_y + toolbar_h)
+                                {
+                                    // Toolbar click: copy block text to clipboard.
+                                    self.copyBlockToClipboard(t, info.block_list_index);
+                                    try self.queueRender();
+                                    break;
+                                }
+                            }
+
                             t.toggleBlockHighlight(info.block_list_index);
                             try self.queueRender();
                             break;
@@ -4740,6 +4807,9 @@ pub fn cursorPosCallback(
         // No mouse point so we don't highlight links
         self.renderer_state.mouse.point = null;
 
+        // Clear hovered block when mouse is outside viewport.
+        self.renderer_state.terminal.hovered_block_idx = null;
+
         // Mark the link's row as dirty, but continue with updating the
         // mouse state below so we can scroll when our position is negative.
         self.renderer_state.terminal.screens.active.dirty.hyperlink_hover = true;
@@ -4814,6 +4884,7 @@ pub fn cursorPosCallback(
 
     // Command blocks: determine if the mouse is over a completed block
     // (pointer cursor) vs. the active block (text cursor).
+    // Also track hovered_block_idx for toolbar rendering.
     // Use BlockLayout to map mouse position to the virtual document.
     if (self.io.terminal.block_list != null and !self.mouse.over_link) {
         const t: *terminal.Terminal = self.renderer_state.terminal;
@@ -4837,6 +4908,7 @@ pub fn cursorPosCallback(
             const content_y_f: f64 = pos.y - @as(f64, @floatFromInt(padding_top));
             if (content_y_f < 0) {
                 // Above content area — treat as history (pointer cursor).
+                t.hovered_block_idx = null;
                 _ = try self.rt_app.performAction(
                     .{ .surface = self },
                     .mouse_shape,
@@ -4850,12 +4922,27 @@ pub fn cursorPosCallback(
             // If the mouse virtual Y is before the active block's start,
             // we're over completed blocks (pointer cursor).
             const active_info = brl[brl.len - 1];
+            var hovered_idx: ?usize = null;
             const in_history = if (virtual_y_i64 < 0)
                 true
             else ih: {
                 const virtual_y: u32 = @intCast(@min(virtual_y_i64, @as(i64, @intCast(doc_h))));
+                // Find which completed block contains this virtual Y.
+                for (brl[0 .. brl.len - 1]) |info| {
+                    const block_end = info.virtual_y_px + info.visible_height_px;
+                    if (virtual_y >= info.virtual_y_px and virtual_y < block_end) {
+                        hovered_idx = info.block_list_index;
+                        break;
+                    }
+                }
                 break :ih virtual_y < active_info.virtual_y_px;
             };
+
+            const prev_hovered = t.hovered_block_idx;
+            t.hovered_block_idx = hovered_idx;
+            if (!std.meta.eql(prev_hovered, hovered_idx)) {
+                try self.queueRender();
+            }
 
             _ = try self.rt_app.performAction(
                 .{ .surface = self },

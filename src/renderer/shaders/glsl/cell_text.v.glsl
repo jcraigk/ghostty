@@ -47,6 +47,11 @@ layout(binding = 3, std140) uniform BlockParamsBlock {
     float block_first_row;
     float block_x_offset;
     float block_y_flat;
+    float block_corner_radius;
+    float block_scissor_x;
+    float block_scissor_y;
+    float block_scissor_w;
+    float block_scissor_h;
 };
 
 void main() {

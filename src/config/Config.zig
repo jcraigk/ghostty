@@ -2943,6 +2943,18 @@ keybind: Keybinds = .{},
 /// Leave empty (default) to disable auto-collapse entirely.
 @"command-blocks-auto-collapse-threshold": ?u16 = null,
 
+/// Enable the block toolbar that appears on hover over completed blocks.
+/// The toolbar provides quick actions like copy, collapse, and a dropdown
+/// menu for additional operations.
+@"command-blocks-toolbar": bool = false,
+
+/// Background color for the toolbar pill. Specified as a typical color
+/// value (hex, named, etc.). Empty string disables the toolbar background.
+@"command-blocks-toolbar-color": ?Color = .{ .r = 0x1a, .g = 0x1a, .b = 0x2e },
+
+/// Border radius in points for the toolbar pill. Set to 0 for sharp corners.
+@"command-blocks-toolbar-radius": u16 = 6,
+
 /// Custom entries into the command palette.
 ///
 /// Each entry requires the title, the corresponding action, and an optional

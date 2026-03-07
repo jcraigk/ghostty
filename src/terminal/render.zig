@@ -107,6 +107,10 @@ pub const RenderState = struct {
     /// if no block is currently highlighted. Matches Terminal.highlighted_block_idx.
     highlighted_block_idx: ?usize = null,
 
+    /// Index into BlockList.blocks of the block under the mouse cursor,
+    /// or null if the mouse is not over any completed block.
+    hovered_block_idx: ?usize = null,
+
     /// The cached selection so we can avoid expensive selection calculations
     /// if possible.
     selection_cache: ?SelectionCache = null,
@@ -622,11 +626,21 @@ pub const RenderState = struct {
                 self.dirty = .full;
             }
 
-            // Detect collapsed state changes by comparing against previous snapshot.
+            // Detect hover changes (for toolbar rendering).
+            const prev_hovered = self.hovered_block_idx;
+            self.hovered_block_idx = t.hovered_block_idx;
+            if (!std.meta.eql(prev_hovered, self.hovered_block_idx)) {
+                self.dirty = .full;
+            }
+
+            // Detect collapsed state or visible row count changes by comparing
+            // against previous snapshot. visible_rows changes when the active
+            // block grows (e.g., continuation lines), which requires a full
+            // rebuild so cell buffer slots get refreshed with correct row data.
             const prev = self.block_render_list.items;
             if (prev.len == src.len) {
                 for (prev, src) |old, new| {
-                    if (old.collapsed != new.collapsed) {
+                    if (old.collapsed != new.collapsed or old.visible_rows != new.visible_rows) {
                         self.dirty = .full;
                         break;
                     }
@@ -688,6 +702,7 @@ pub const RenderState = struct {
             self.block_layout_gap_px = layout.config.gapPx();
         } else {
             self.highlighted_block_idx = null;
+            self.hovered_block_idx = null;
             self.block_render_list.clearRetainingCapacity();
             self.total_doc_height_px = 0;
             self.block_layout_cell_height = 0;
