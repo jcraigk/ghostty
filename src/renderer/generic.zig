@@ -2043,34 +2043,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                         // Collapse indicator: semi-transparent overlay on the
                         // last visible row of collapsed blocks. Signals that
-                        // output is hidden below. Starts after the stripe so
-                        // the stripe color remains visible.
-                        if (region.collapsed and region.hidden_lines > 0 and region.height_px > 0) {
-                            const cell_h = self.grid_metrics.cell_height;
-                            const indicator_h = @min(cell_h, region.height_px);
-                            const indicator_y = region.screen_y_px + region.height_px - indicator_h;
-                            const collapse_scratch: f32 = sep_row + 1.0 +
-                                @as(f32, @floatFromInt(num_blocks)) * 2.0 +
-                                @as(f32, @floatFromInt(block_idx));
-                            pass.step(.{
-                                .pipeline = self.shaders.pipelines.cell_bg,
-                                .uniforms = frame.uniforms.buffer,
-                                .buffers = &.{ null, frame.cells_bg.buffer },
-                                .draw = .{ .type = .triangle, .vertex_count = 3 },
-                                .scissor = .{
-                                    .x = stripe_w,
-                                    .y = indicator_y,
-                                    .width = self.size.screen.width -| stripe_w,
-                                    .height = indicator_h,
-                                },
-                                .block_params = .{
-                                    .block_y_offset = 0,
-                                    .block_first_row = collapse_scratch,
-                                    .block_x_offset = -pad_left,
-                                    .block_y_flat = 1.0,
-                                },
-                            });
-                        }
+                        // Collapse indicator: no separate background draw needed.
+                        // The block tint already covers the last visible row.
+                        // Only the text overlay (added by addCollapseIndicatorText)
+                        // is drawn on top.
 
                         // Separator + stripe through gap to next block.
                         if (ri > 0) {
@@ -3309,35 +3285,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         self.cells.bgCell(@intCast(tint_row), @intCast(tcx)).* = tc;
                     }
 
-                    // Collapse indicator scratch row: semi-transparent overlay
-                    // drawn on the last visible row of collapsed blocks.
-                    // Uses the block's tint/highlight color as base so the
-                    // indicator blends correctly with the block's background.
+                    // Collapse indicator scratch row: fully transparent so the
+                    // underlying block tint shows through unchanged. The collapse
+                    // indicator draw call still needs a valid scratch row, but with
+                    // alpha=0 it won't alter the block's appearance.
                     const collapse_row: usize = sep_row + 1 + @as(usize, num_blocks) * 2 + bi;
-                    const collapse_color: [4]u8 = blk: {
-                        // Start with the tint color for this block (same logic as tint scratch row above).
-                        const base: [4]u8 = if (is_highlighted)
-                            self.blendHighlightTint(bg_rgba)
-                        else if (ec >= 128 and ec <= 255)
-                            self.blendSignalTint(bg_rgba)
-                        else if (ec > 0)
-                            self.blendErrorTint(bg_rgba)
-                        else if (ec == 0)
-                            self.blendSuccessTint(bg_rgba)
-                        else
-                            bg_rgba;
-                        // Blend the tint toward terminal bg to create
-                        // the dimming effect, with moderate opacity.
-                        break :blk .{
-                            @intCast((@as(u16, base[0]) * 3 + @as(u16, bg.r)) / 4),
-                            @intCast((@as(u16, base[1]) * 3 + @as(u16, bg.g)) / 4),
-                            @intCast((@as(u16, base[2]) * 3 + @as(u16, bg.b)) / 4),
-                            200,
-                        };
-                    };
                     var ccx: usize = 0;
                     while (ccx < cols_u) : (ccx += 1) {
-                        self.cells.bgCell(@intCast(collapse_row), @intCast(ccx)).* = collapse_color;
+                        self.cells.bgCell(@intCast(collapse_row), @intCast(ccx)).* = .{ 0, 0, 0, 0 };
                     }
                 }
 
@@ -4294,7 +4249,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ) void {
             // Format the indicator string into a stack buffer.
             var buf: [64]u8 = undefined;
-            const text = std.fmt.bufPrint(&buf, " ... {d} lines hidden ", .{hidden_lines}) catch return;
+            const text = std.fmt.bufPrint(&buf, " ... {d} {s} hidden ", .{ hidden_lines, if (hidden_lines == 1) @as([]const u8, "line") else @as([]const u8, "lines") }) catch return;
 
             // Compute right-aligned starting column. Leave 1 cell margin
             // on the right so the text doesn't touch the edge.
