@@ -2952,9 +2952,6 @@ keybind: Keybinds = .{},
 /// value (hex, named, etc.). Empty string disables the toolbar background.
 @"command-blocks-toolbar-color": ?Color = .{ .r = 0x1a, .g = 0x1a, .b = 0x2e },
 
-/// Border radius in points for the toolbar pill. Set to 0 for sharp corners.
-@"command-blocks-toolbar-radius": u16 = 6,
-
 /// Custom entries into the command palette.
 ///
 /// Each entry requires the title, the corresponding action, and an optional

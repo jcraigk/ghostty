@@ -4228,13 +4228,12 @@ pub fn mouseButtonCallback(
                                 if (block_screen_y_i64 < 0) break :toolbar_check;
                                 const block_screen_y: u32 = @intCast(block_screen_y_i64);
 
-                                const toolbar_h = cell_h *| 3 / 4;
+                                const toolbar_h = cell_h;
                                 const toolbar_w = cell_w * 3;
                                 const grid_cols = t.cols;
                                 const grid_right = self.size.padding.left + grid_cols * cell_w;
-                                const inset_y = (cell_h -| toolbar_h) / 2;
                                 const toolbar_x = grid_right -| toolbar_w -| cell_w;
-                                const toolbar_y = block_screen_y + inset_y;
+                                const toolbar_y = block_screen_y;
 
                                 const click_x: u32 = @intFromFloat(@max(0, pos.x));
                                 const click_y: u32 = @intFromFloat(@max(0, pos.y));

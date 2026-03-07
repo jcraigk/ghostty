@@ -671,7 +671,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             command_blocks_auto_collapse_threshold: ?u16,
             command_blocks_toolbar: bool,
             command_blocks_toolbar_color: ?configpkg.Config.Color,
-            command_blocks_toolbar_radius: u16,
             scroll_to_bottom_on_output: bool,
 
             pub fn init(
@@ -765,7 +764,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .command_blocks_auto_collapse_threshold = config.@"command-blocks-auto-collapse-threshold",
                     .command_blocks_toolbar = config.@"command-blocks-toolbar",
                     .command_blocks_toolbar_color = config.@"command-blocks-toolbar-color",
-                    .command_blocks_toolbar_radius = config.@"command-blocks-toolbar-radius",
                     .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
                     .arena = arena,
                 };
@@ -2171,18 +2169,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         } else null;
                         const region = hovered_region orelse break :toolbar;
 
-                        // Toolbar dimensions: pill in upper-right corner of block.
+                        // Toolbar dimensions: one cell height, scales with font size.
                         const cell_h = self.grid_metrics.cell_height;
                         const cell_w = self.grid_metrics.cell_width;
-                        const toolbar_h: u32 = @min(cell_h *| 3 / 4, region.height_px);
+                        const toolbar_h: u32 = @min(cell_h, region.height_px);
                         const toolbar_w: u32 = cell_w * 3;
                         // Position at the right edge of the text grid, inset by 1 cell.
                         const grid_cols: u32 = self.cells.size.columns;
                         const grid_right: u32 = self.size.padding.left + grid_cols * cell_w;
-                        const inset_y: u32 = (cell_h -| toolbar_h) / 2;
                         const toolbar_x: u32 = grid_right -| toolbar_w -| cell_w;
-                        const toolbar_y: u32 = region.screen_y_px + inset_y;
-                        const corner_radius: f32 = @floatFromInt(self.config.command_blocks_toolbar_radius);
+                        const toolbar_y: u32 = region.screen_y_px;
+                        // Corner radius scales with cell height (roughly 1/4 height for pill look).
+                        const corner_radius: f32 = @as(f32, @floatFromInt(toolbar_h)) / 4.0;
 
                         if (toolbar_h > 0 and toolbar_w > 0) {
                             const toolbar_scratch: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(num_blocks)) * 3.0;
