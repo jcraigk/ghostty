@@ -1422,6 +1422,9 @@ pub fn gotoBlock(self: *Terminal, is_previous: bool) void {
     const items = bl.blocks.items;
     if (items.len < 2) return; // Need at least active + 1 completed block.
 
+    // Clear mouse hover so keyboard-selected block gets the toolbar.
+    self.hovered_block_idx = null;
+
     // Last completed block index (active block is items.len - 1).
     const last_completed = items.len - 2;
 
