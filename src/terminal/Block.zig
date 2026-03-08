@@ -30,6 +30,10 @@ end: ?*Pin = null,
 /// Exit code from OSC 133 D. Null while the command is still running.
 exit_code: ?i32 = null,
 
+/// Snapshot of the working directory at block creation (from Terminal.pwd
+/// at OSC 133 A time). Owned by the BlockList allocator.
+cwd: ?[]const u8 = null,
+
 /// Whether this block has been manually collapsed by the user.
 collapsed: bool = false,
 
@@ -70,9 +74,47 @@ pub fn countRowsFromPin(start: Pin) u32 {
 /// Reads cell codepoints between `input_start` and `output_start`
 /// (or `end` if no output). Returns the filled portion of `buf`.
 pub fn commandText(self: Block, pages: *PageList, buf: []u8) []const u8 {
-    const start_pin = self.input_start orelse return buf[0..0];
     const limit_pin = self.output_start orelse (self.end orelse return buf[0..0]);
-    return readPinRangeText(pages, start_pin.*, limit_pin.*, buf);
+    if (self.input_start) |is| {
+        return readPinRangeText(pages, is.*, limit_pin.*, buf);
+    }
+    // input_start is null (e.g. first block without OSC 133 B).
+    // Scan for the first .input cell, or failing that, find where .prompt
+    // cells end (the command follows the prompt on the same row).
+    const start = self.prompt_start.*;
+
+    var row_it = start.rowIterator(.right_down, limit_pin.*);
+    while (row_it.next()) |row_pin| {
+        if (row_pin.node == limit_pin.node and row_pin.y == limit_pin.y) break;
+        const cells = row_pin.cells(.all);
+        // First try: look for .input cells.
+        for (cells, 0..) |cell, col| {
+            if (cell.semantic_content == .input) {
+                var pin = row_pin;
+                pin.x = @intCast(col);
+                return readPinRangeText(pages, pin, limit_pin.*, buf);
+            }
+        }
+        // Second try: find where .prompt cells end, and read from the
+        // first non-prompt cell. This handles shells that mark the prompt
+        // but not the input (no OSC 133 B).
+        var last_prompt_col: ?usize = null;
+        for (cells, 0..) |cell, col| {
+            if (cell.semantic_content == .prompt) {
+                last_prompt_col = col;
+            }
+        }
+        if (last_prompt_col) |lpc| {
+            if (lpc + 1 < cells.len) {
+                var pin = row_pin;
+                pin.x = @intCast(lpc + 1);
+                return readPinRangeText(pages, pin, limit_pin.*, buf);
+            }
+        }
+    }
+    // Final fallback: no .input cells and no .prompt boundary found.
+    // Read the entire range (prompt + command) — better than nothing.
+    return readPinRangeText(pages, start, limit_pin.*, buf);
 }
 
 /// Extract command output text from the terminal buffer.
@@ -92,15 +134,40 @@ fn readPinRangeText(pages: *PageList, start: Pin, limit: Pin, buf: []u8) []const
 
     if (buf.len == 0) return buf[0..0];
 
+    // Same-row case: read cells from start.x up to (but not including) limit.x.
+    if (start.node == limit.node and start.y == limit.y) {
+        var written: usize = 0;
+        const row_cells = start.cells(.all);
+        const end_col: usize = if (limit.x > 0) limit.x else row_cells.len;
+        for (row_cells[start.x..end_col]) |cell| {
+            if (!cell.hasText()) continue;
+            if (cell.wide == .spacer_tail) continue;
+            const cp = cell.content.codepoint;
+            const len = std.unicode.utf8CodepointSequenceLength(cp) catch continue;
+            if (written + len > buf.len) return buf[0..written];
+            _ = std.unicode.utf8Encode(cp, buf[written..]) catch continue;
+            written += len;
+        }
+        // Trim trailing spaces.
+        while (written > 0 and buf[written - 1] == ' ') written -= 1;
+        return buf[0..written];
+    }
+
     var written: usize = 0;
     var row_it = start.rowIterator(.right_down, limit);
+    var is_first_row = true;
 
     while (row_it.next()) |row_pin| {
         // Don't include the limit row itself.
         if (row_pin.node == limit.node and row_pin.y == limit.y) break;
 
         const row_cells = row_pin.cells(.all);
-        for (row_cells) |cell| {
+        // On the first row, skip cells before start.x to respect the pin's column.
+        const start_col: usize = if (is_first_row) start.x else 0;
+        is_first_row = false;
+
+        const row_start = written;
+        for (row_cells[start_col..]) |cell| {
             if (!cell.hasText()) continue;
             if (cell.wide == .spacer_tail) continue;
 
@@ -109,6 +176,11 @@ fn readPinRangeText(pages: *PageList, start: Pin, limit: Pin, buf: []u8) []const
             if (written + len > buf.len) return buf[0..written];
             _ = std.unicode.utf8Encode(cp, buf[written..]) catch continue;
             written += len;
+        }
+
+        // Trim trailing spaces from this row.
+        while (written > row_start and buf[written - 1] == ' ') {
+            written -= 1;
         }
 
         // Insert a newline between rows (unless we'd overflow).
@@ -144,6 +216,7 @@ pub const BlockList = struct {
             if (block.input_start) |p| self.pages.untrackPin(p);
             if (block.output_start) |p| self.pages.untrackPin(p);
             if (block.end) |p| self.pages.untrackPin(p);
+            if (block.cwd) |s| self.alloc.free(s);
         }
         self.blocks.deinit(self.alloc);
     }
@@ -229,6 +302,7 @@ pub const BlockList = struct {
                 if (block.input_start) |p| self.pages.untrackPin(p);
                 if (block.output_start) |p| self.pages.untrackPin(p);
                 if (block.end) |p| self.pages.untrackPin(p);
+                if (block.cwd) |s| self.alloc.free(s);
 
                 _ = self.blocks.orderedRemove(i);
             } else {
@@ -336,13 +410,15 @@ test "BlockList: pruneGarbage removes blocks with garbage pins" {
     defer bl.deinit();
 
     const node = s.pages.pages.first.?;
-    const b1 = try bl.addBlock(.{ .node = node, .y = 0 });
+    _ = try bl.addBlock(.{ .node = node, .y = 0 });
     _ = try bl.addBlock(.{ .node = node, .y = 5 });
 
     try testing.expectEqual(@as(usize, 2), bl.blockCount());
 
     // Simulate garbage collection of first block's page.
-    b1.prompt_start.garbage = true;
+    // Access via items slice (not the pointer returned by addBlock,
+    // which may be invalidated by subsequent appends).
+    bl.blocks.items[0].prompt_start.garbage = true;
 
     bl.pruneGarbage();
 

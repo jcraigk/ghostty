@@ -2221,16 +2221,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             // Draw each icon shape in its slot with margins and hover highlight.
                             const icon_scratch: f32 = toolbar_scratch + 1.0;
                             const hover_scratch: f32 = icon_scratch + 1.0;
+                            const pressed_scratch: f32 = hover_scratch + 1.0;
                             const icon_margin: u32 = @max(1, toolbar_h / 8);
                             // Icon drawing area: ~55% of the slot for clean look inside container.
                             const icon_area: u32 = @max(6, (toolbar_h -| icon_margin * 2) * 55 / 100);
                             const hovered_icon_idx: ?u32 = ts.hovered_toolbar_icon;
+                            const pressed_icon_idx: ?u32 = ts.pressed_toolbar_icon;
                             var icon_i: u32 = 0;
                             while (icon_i < icon_count) : (icon_i += 1) {
                                 const slot_x = toolbar_x + icon_padding + icon_i * icon_slot_w;
 
-                                // Draw hover highlight background for this icon.
-                                if (hovered_icon_idx != null and hovered_icon_idx.? == icon_i) {
+                                // Draw hover or pressed highlight background for this icon.
+                                const is_pressed = pressed_icon_idx != null and pressed_icon_idx.? == icon_i;
+                                const is_hovered = hovered_icon_idx != null and hovered_icon_idx.? == icon_i;
+                                if (is_pressed or is_hovered) {
                                     const hx = slot_x + icon_margin;
                                     const hy = toolbar_y + icon_margin;
                                     const hw = icon_slot_w -| icon_margin * 2;
@@ -2256,7 +2260,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                         },
                                         .block_params = .{
                                             .block_y_offset = 0,
-                                            .block_first_row = hover_scratch,
+                                            .block_first_row = if (is_pressed) pressed_scratch else hover_scratch,
                                             .block_x_offset = -pad_left,
                                             .block_y_flat = 1.0,
                                             .block_corner_radius = hover_radius,
@@ -2410,38 +2414,103 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                         });
                                     },
                                     .collapse => {
-                                        // Right-pointing chevron (triangle).
-                                        const tri_w: u32 = icon_area / 2;
-                                        const tri_h: u32 = icon_area * 2 / 3;
-                                        const tri_x = icon_cx - tri_w / 3;
-                                        const tri_y = icon_cy - tri_h / 2;
-                                        const tx_f: f32 = @floatFromInt(tri_x);
-                                        const ty_f: f32 = @floatFromInt(tri_y);
-                                        const tw_f: f32 = @floatFromInt(tri_w);
-                                        const th_f: f32 = @floatFromInt(tri_h);
-                                        pass.step(.{
-                                            .pipeline = self.shaders.pipelines.cell_bg,
-                                            .uniforms = frame.uniforms.buffer,
-                                            .buffers = &.{ null, frame.cells_bg.buffer },
-                                            .draw = .{ .type = .triangle, .vertex_count = 3 },
-                                            .scissor = .{
-                                                .x = tri_x,
-                                                .y = tri_y,
-                                                .width = tri_w,
-                                                .height = tri_h,
-                                            },
-                                            .block_params = .{
-                                                .block_y_offset = 0,
-                                                .block_first_row = icon_scratch,
-                                                .block_x_offset = -pad_left,
-                                                .block_y_flat = 1.0,
-                                                .block_corner_radius = 1.0,
-                                                .block_scissor_x = tx_f,
-                                                .block_scissor_y = ty_f,
-                                                .block_scissor_w = tw_f,
-                                                .block_scissor_h = th_f,
-                                            },
-                                        });
+                                        // Chevron icon: ">" when expanded, "v" when collapsed.
+                                        // Drawn as two arms of densely overlapping circles
+                                        // to form a smooth diagonal line.
+                                        const is_collapsed = region.collapsed;
+                                        const bar_th: u32 = @max(2, icon_area / 5);
+                                        const arm_len: u32 = icon_area * 2 / 3;
+                                        const half_spread: u32 = arm_len / 2;
+                                        // Dense steps: 1px per step for smooth appearance.
+                                        const num_steps: u32 = @max(3, half_spread);
+                                        const bt_f: f32 = @floatFromInt(bar_th);
+
+                                        var si: u32 = 0;
+                                        while (si <= num_steps) : (si += 1) {
+                                            // Two points per step: one on each arm.
+                                            // Right chevron ">": tip at center-right,
+                                            //   arm1: top-left to center-right
+                                            //   arm2: bottom-left to center-right
+                                            // Down chevron "v": tip at center-bottom,
+                                            //   arm1: top-left to center-bottom
+                                            //   arm2: top-right to center-bottom
+                                            const frac_x: u32 = si * half_spread / num_steps;
+                                            const frac_y: u32 = si * half_spread / num_steps;
+
+                                            // Arm 1 and Arm 2 positions.
+                                            const a1x: u32, const a1y: u32, const a2x: u32, const a2y: u32 = if (is_collapsed) blk: {
+                                                // Down chevron "v": arms go from top-left and top-right to center-bottom.
+                                                const tip_x = icon_cx;
+                                                const tip_y = icon_cy + half_spread / 2;
+                                                const left_x = tip_x -| half_spread;
+                                                const right_x = tip_x + half_spread;
+                                                const top_y = tip_y -| half_spread;
+                                                break :blk .{
+                                                    left_x + frac_x, top_y + frac_y, // arm1: top-left → tip
+                                                    right_x -| frac_x, top_y + frac_y, // arm2: top-right → tip
+                                                };
+                                            } else blk: {
+                                                // Right chevron ">": arms go from top-left and bottom-left to center-right.
+                                                const tip_x = icon_cx + half_spread / 2;
+                                                const tip_y = icon_cy;
+                                                const left_x = tip_x -| half_spread;
+                                                const top_y = tip_y -| half_spread;
+                                                const bot_y = tip_y + half_spread;
+                                                break :blk .{
+                                                    left_x + frac_x, top_y + frac_y, // arm1: top-left → tip
+                                                    left_x + frac_x, bot_y -| frac_y, // arm2: bot-left → tip
+                                                };
+                                            };
+
+                                            // Draw arm 1 dot.
+                                            const a1x_off = a1x -| bar_th / 2;
+                                            const a1y_off = a1y -| bar_th / 2;
+                                            const a1xf: f32 = @floatFromInt(a1x_off);
+                                            const a1yf: f32 = @floatFromInt(a1y_off);
+                                            pass.step(.{
+                                                .pipeline = self.shaders.pipelines.cell_bg,
+                                                .uniforms = frame.uniforms.buffer,
+                                                .buffers = &.{ null, frame.cells_bg.buffer },
+                                                .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                                .scissor = .{ .x = a1x_off, .y = a1y_off, .width = bar_th, .height = bar_th },
+                                                .block_params = .{
+                                                    .block_y_offset = 0,
+                                                    .block_first_row = icon_scratch,
+                                                    .block_x_offset = -pad_left,
+                                                    .block_y_flat = 1.0,
+                                                    .block_corner_radius = bt_f / 2.0,
+                                                    .block_scissor_x = a1xf,
+                                                    .block_scissor_y = a1yf,
+                                                    .block_scissor_w = bt_f,
+                                                    .block_scissor_h = bt_f,
+                                                },
+                                            });
+                                            // Draw arm 2 dot (skip when arms overlap at tip).
+                                            const a2x_off = a2x -| bar_th / 2;
+                                            const a2y_off = a2y -| bar_th / 2;
+                                            if (a2x_off != a1x_off or a2y_off != a1y_off) {
+                                                const a2xf: f32 = @floatFromInt(a2x_off);
+                                                const a2yf: f32 = @floatFromInt(a2y_off);
+                                                pass.step(.{
+                                                    .pipeline = self.shaders.pipelines.cell_bg,
+                                                    .uniforms = frame.uniforms.buffer,
+                                                    .buffers = &.{ null, frame.cells_bg.buffer },
+                                                    .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                                    .scissor = .{ .x = a2x_off, .y = a2y_off, .width = bar_th, .height = bar_th },
+                                                    .block_params = .{
+                                                        .block_y_offset = 0,
+                                                        .block_first_row = icon_scratch,
+                                                        .block_x_offset = -pad_left,
+                                                        .block_y_flat = 1.0,
+                                                        .block_corner_radius = bt_f / 2.0,
+                                                        .block_scissor_x = a2xf,
+                                                        .block_scissor_y = a2yf,
+                                                        .block_scissor_w = bt_f,
+                                                        .block_scissor_h = bt_f,
+                                                    },
+                                                });
+                                            }
+                                        }
                                     },
                                     .filter => {
                                         // Three horizontal lines of decreasing width (funnel).
@@ -3242,7 +3311,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             };
             // Extra rows: 1 separator + num_blocks stripe + num_blocks tint + num_blocks collapse + 1 toolbar.
             const has_toolbar: bool = num_blocks > 0 and self.config.command_blocks_toolbar;
-            const toolbar_scratch_count: u16 = if (has_toolbar) 3 else 0; // bg + icon color + icon hover
+            const toolbar_scratch_count: u16 = if (has_toolbar) 4 else 0; // bg + icon color + icon hover + icon pressed
             const scratch_rows: u16 = if (num_blocks > 0) 1 + num_blocks * 3 + toolbar_scratch_count else 0;
             const total_rows = state.rows + scratch_rows;
 
@@ -3562,6 +3631,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const toolbar_bg_row: usize = sep_row + 1 + @as(usize, num_blocks) * 3;
                     const toolbar_icon_row: usize = toolbar_bg_row + 1;
                     const toolbar_hover_row: usize = toolbar_icon_row + 1;
+                    const toolbar_pressed_row: usize = toolbar_hover_row + 1;
                     const tb_color: [4]u8 = if (self.config.command_blocks_toolbar_color) |c|
                         .{ c.r, c.g, c.b, 230 }
                     else
@@ -3581,11 +3651,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         @intCast(@min(255, @as(u16, tb_color[2]) + 40)),
                         200,
                     };
+                    // Pressed color: brighter than hover for click feedback.
+                    const pressed_color: [4]u8 = .{
+                        @intCast(@min(255, @as(u16, tb_color[0]) + 80)),
+                        @intCast(@min(255, @as(u16, tb_color[1]) + 80)),
+                        @intCast(@min(255, @as(u16, tb_color[2]) + 80)),
+                        230,
+                    };
                     var tbx: usize = 0;
                     while (tbx < cols_u) : (tbx += 1) {
                         self.cells.bgCell(@intCast(toolbar_bg_row), @intCast(tbx)).* = tb_color;
                         self.cells.bgCell(@intCast(toolbar_icon_row), @intCast(tbx)).* = icon_color;
                         self.cells.bgCell(@intCast(toolbar_hover_row), @intCast(tbx)).* = hover_color;
+                        self.cells.bgCell(@intCast(toolbar_pressed_row), @intCast(tbx)).* = pressed_color;
                     }
                 }
             }

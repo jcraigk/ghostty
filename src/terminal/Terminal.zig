@@ -97,6 +97,10 @@ hovered_block_idx: ?usize = null,
 /// Set by Surface.zig during mouse move; read by the renderer for hover highlight.
 hovered_toolbar_icon: ?u32 = null,
 
+/// Index of the toolbar icon currently pressed (mouse-down), for visual
+/// feedback. Cleared on mouse-up or mouse-move off the toolbar.
+pressed_toolbar_icon: ?u32 = null,
+
 /// Auto-collapse threshold: when a new block is created, automatically
 /// collapse the block N positions back from the newest. Set by the
 /// renderer from config. null = disabled.
@@ -1377,6 +1381,13 @@ fn blockListAddBlock(self: *Terminal) !void {
     }
 
     _ = try bl.addBlock(screen.cursor.page_pin.*);
+
+    // Set CWD on the newly created block from the current Terminal.pwd.
+    if (bl.activeBlock()) |new_block| {
+        if (self.pwd.items.len > 0) {
+            new_block.cwd = self.gpa().dupe(u8, self.pwd.items) catch null;
+        }
+    }
 
     // Auto-collapse: when a new block is created and auto_collapse_threshold
     // is set, collapse the block N+1 positions back from the end.

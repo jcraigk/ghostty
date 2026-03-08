@@ -2223,8 +2223,6 @@ fn copyBlockToClipboard(self: *Surface, t: *terminal.Terminal, block_idx: usize)
 /// Show a dropdown menu for the block toolbar at the given screen position.
 /// On macOS, uses NSMenu via the objc bridge; on other platforms, this is a no-op.
 fn showBlockToolbarMenu(self: *Surface, block_idx: usize, menu_x_px: u32, menu_y_px: u32, margin_px: u32) void {
-    _ = block_idx;
-
     if (comptime !builtin.os.tag.isDarwin()) return;
 
     // Get the NSView from our surface (only available for embedded apprt on macOS).
@@ -2237,25 +2235,83 @@ fn showBlockToolbarMenu(self: *Surface, block_idx: usize, menu_x_px: u32, menu_y
     else
         return;
 
+    // Menu item tags for identifying the selected action.
+    const tag_copy_command: c_long = 1;
+    const tag_copy_output: c_long = 2;
+    const tag_copy_block: c_long = 3;
+    const tag_copy_cwd: c_long = 4;
+    const tag_scroll_top: c_long = 5;
+    const tag_scroll_bottom: c_long = 6;
+    const tag_collapse: c_long = 7;
+    const tag_expand: c_long = 8;
+
+    // Register a runtime ObjC class to act as menu item target. The class
+    // has a single method (menuItemClicked:) that records the sender's tag
+    // in a struct-level static. Since popUpMenuPositioningItem: is
+    // modal/synchronous, we read the tag after it returns.
+    const MenuHelperImp = struct {
+        var selected_tag: c_long = 0;
+
+        fn imp(target: objc.c.id, sel_cmd: objc.c.SEL, sender: objc.c.id) callconv(.c) void {
+            _ = target;
+            _ = sel_cmd;
+            if (sender == null) return;
+            const sender_obj: objc.Object = .{ .value = @ptrCast(sender) };
+            selected_tag = sender_obj.msgSend(c_long, objc.sel("tag"), .{});
+        }
+    };
+
+    const helper_cls = blk: {
+        if (objc.getClass("GhosttyMenuHelper")) |existing| {
+            break :blk existing;
+        }
+        const NSObject = objc.getClass("NSObject") orelse return;
+        const cls = objc.allocateClassPair(NSObject, "GhosttyMenuHelper") orelse return;
+        _ = cls.addMethod("menuItemClicked:", MenuHelperImp.imp);
+        objc.registerClassPair(cls);
+        break :blk objc.getClass("GhosttyMenuHelper") orelse return;
+    };
+
+    const helper: objc.Object = helper_cls.msgSend(objc.Object, objc.sel("alloc"), .{})
+        .msgSend(objc.Object, objc.sel("init"), .{});
+
+    MenuHelperImp.selected_tag = 0;
+
     const NSMenuClass = objc.getClass("NSMenu") orelse return;
     const NSMenuItem = objc.getClass("NSMenuItem") orelse return;
     const NSString = objc.getClass("NSString") orelse return;
     const empty = NSString.msgSend(objc.Object, objc.sel("string"), .{});
 
-    // Create menu.
     const menu_obj: objc.Object = NSMenuClass.msgSend(objc.Object, objc.sel("alloc"), .{})
         .msgSend(objc.Object, objc.sel("initWithTitle:"), .{empty});
 
-    // Add menu items.
-    const Item = struct { title: [*:0]const u8, sep: bool };
-    const entries = [_]Item{
-        .{ .title = "Copy Command", .sep = false },
-        .{ .title = "Copy Output", .sep = false },
-        .{ .title = "Copy Block", .sep = false },
-        .{ .title = "", .sep = true },
-        .{ .title = "Scroll to Top", .sep = false },
-        .{ .title = "Scroll to Bottom", .sep = false },
+    // Check block state (collapsed, has output) under the lock.
+    const is_collapsed, const has_output = blk: {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        const t: *terminal.Terminal = self.renderer_state.terminal;
+        const bl = &(t.block_list orelse break :blk .{ false, false });
+        if (block_idx >= bl.blocks.items.len) break :blk .{ false, false };
+        const block = bl.blocks.items[block_idx];
+        break :blk .{ block.collapsed, block.output_start != null };
     };
+
+    const action_sel = objc.sel("menuItemClicked:");
+    const Item = struct { title: [*:0]const u8, tag: c_long, sep: bool };
+    const entries = [_]Item{
+        .{ .title = "Copy Command", .tag = tag_copy_command, .sep = false },
+        .{ .title = "Copy Output", .tag = tag_copy_output, .sep = false },
+        .{ .title = "Copy Block", .tag = tag_copy_block, .sep = false },
+        .{ .title = "Copy Working Directory", .tag = tag_copy_cwd, .sep = false },
+        .{ .title = "", .tag = 0, .sep = true },
+        .{ .title = if (is_collapsed) "Expand Block" else "Collapse Block",
+           .tag = if (is_collapsed) tag_expand else tag_collapse,
+           .sep = false },
+        .{ .title = "", .tag = 0, .sep = true },
+        .{ .title = "Scroll to Top", .tag = tag_scroll_top, .sep = false },
+        .{ .title = "Scroll to Bottom", .tag = tag_scroll_bottom, .sep = false },
+    };
+
     for (entries) |entry| {
         if (entry.sep) {
             const sep: objc.Object = NSMenuItem.msgSend(objc.Object, objc.sel("separatorItem"), .{});
@@ -2266,27 +2322,29 @@ fn showBlockToolbarMenu(self: *Surface, block_idx: usize, menu_x_px: u32, menu_y
             });
             const item: objc.Object = NSMenuItem.msgSend(objc.Object, objc.sel("alloc"), .{})
                 .msgSend(objc.Object, objc.sel("initWithTitle:action:keyEquivalent:"), .{
-                ns_title, @as(objc.c.SEL, null), empty,
+                ns_title, action_sel, empty,
             });
+            item.msgSend(void, objc.sel("setTag:"), .{entry.tag});
+            item.msgSend(void, objc.sel("setTarget:"), .{helper});
+            // Disable collapse/expand when the block has no output.
+            if ((entry.tag == tag_collapse or entry.tag == tag_expand) and !has_output) {
+                item.msgSend(void, objc.sel("setEnabled:"), .{false});
+            }
             menu_obj.msgSend(void, objc.sel("addItem:"), .{item});
         }
     }
 
     // Convert pixel coordinates to NSView point coordinates.
-    // NSView has origin at bottom-left (Y goes up); our Y is top-down pixels.
     const content_scale = self.rt_surface.getContentScale() catch .{ .x = 1, .y = 1 };
     const view_h_points: f64 = @as(f64, @floatFromInt(self.size.screen.height)) / content_scale.y;
     const point_x: f64 = @as(f64, @floatFromInt(menu_x_px)) / content_scale.x;
-    // menu_y_px is the bottom of the toolbar; add margin to position the dropdown below it.
-    // Double the margin to account for NSMenu's own internal top padding.
     const point_y: f64 = view_h_points - @as(f64, @floatFromInt(menu_y_px + margin_px * 2)) / content_scale.y;
 
-    // Force the menu to compute its layout so we can query its actual size.
+    // Force layout to get actual menu size for right-alignment.
     menu_obj.msgSend(void, objc.sel("update"), .{});
     const NSSize = extern struct { width: f64, height: f64 };
     const menu_size: NSSize = menu_obj.msgSend(NSSize, objc.sel("size"), .{});
     const menu_width: f64 = if (menu_size.width > 0) menu_size.width else 170;
-    // Right-align: menu's right edge aligns with the toolbar's right edge (menu_x_px).
     const adjusted_x: f64 = point_x - menu_width;
 
     const NSPoint = extern struct { x: f64, y: f64 };
@@ -2295,6 +2353,120 @@ fn showBlockToolbarMenu(self: *Surface, block_idx: usize, menu_x_px: u32, menu_y
         objc.sel("popUpMenuPositioningItem:atLocation:inView:"),
         .{ @as(objc.c.id, null), NSPoint{ .x = adjusted_x, .y = point_y }, nsview },
     );
+
+    // Read the tag that was set by the callback during the modal popup.
+    const selected_tag = MenuHelperImp.selected_tag;
+
+    // Release the helper now that the popup is done.
+    helper.msgSend(void, objc.sel("release"), .{});
+
+    // Reset mouse state so that mouse-move after the menu closes
+    // doesn't start a text selection. The menu consumed this click.
+    self.mouse.left_click_count = 0;
+    self.mouse.click_state[@intFromEnum(input.MouseButton.left)] = .release;
+
+    if (selected_tag == 0) return;
+
+    switch (selected_tag) {
+        tag_copy_command => self.copyBlockPartToClipboard(block_idx, .command),
+        tag_copy_output => self.copyBlockPartToClipboard(block_idx, .output),
+        tag_copy_block => self.copyBlockPartToClipboard(block_idx, .block),
+        tag_copy_cwd => self.copyBlockPartToClipboard(block_idx, .cwd),
+        tag_scroll_top => self.scrollToBlock(block_idx, .top),
+        tag_scroll_bottom => self.scrollToBlock(block_idx, .bottom),
+        tag_collapse, tag_expand => self.toggleBlockCollapse(block_idx),
+        else => {},
+    }
+}
+
+/// Copy a specific part of a block to the system clipboard.
+fn copyBlockPartToClipboard(self: *Surface, block_idx: usize, part: enum { command, output, block, cwd }) void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    const t: *terminal.Terminal = self.renderer_state.terminal;
+
+    if (part == .block) {
+        self.copyBlockToClipboard(t, block_idx);
+        return;
+    }
+
+    const bl = &(t.block_list orelse return);
+    if (block_idx >= bl.blocks.items.len) return;
+    const block = bl.blocks.items[block_idx];
+
+    var buf: [64 * 1024]u8 = undefined;
+    const text: []const u8 = switch (part) {
+        .command => block.commandText(&t.screens.active.pages, &buf),
+        .output => block.outputText(&t.screens.active.pages, &buf),
+        .cwd => block.cwd orelse return,
+        .block => unreachable,
+    };
+    if (text.len == 0) return;
+
+    const data = self.alloc.dupeZ(u8, text) catch return;
+    defer self.alloc.free(data);
+    self.rt_surface.setClipboard(.standard, &.{.{
+        .mime = "text/plain",
+        .data = data,
+    }}, false) catch |err| {
+        log.err("copy block part to clipboard failed: {}", .{err});
+    };
+}
+
+/// Scroll the viewport to the top or bottom of a specific block.
+fn scrollToBlock(self: *Surface, block_idx: usize, position: enum { top, bottom }) void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    const t: *terminal.Terminal = self.renderer_state.terminal;
+
+    const layout = &(t.block_layout orelse return);
+    layout.ensureValid();
+
+    const block_y = layout.virtualYForBlock(block_idx) orelse return;
+    const doc_h = layout.total_height_px;
+    const viewport_h = t.height_px;
+    if (doc_h <= viewport_h) return;
+
+    const max_scroll = doc_h - viewport_h;
+
+    switch (position) {
+        .top => {
+            // Scroll so the block's top is at the viewport top.
+            t.scroll_offset_px = @min(
+                if (block_y < max_scroll) max_scroll - block_y else 0,
+                max_scroll,
+            );
+        },
+        .bottom => {
+            // Scroll so the block's bottom is at the viewport bottom.
+            // Find the layout info for this block to get its height.
+            const info = for (layout.block_offsets.items) |info| {
+                if (info.block_list_index == block_idx) break info;
+            } else return;
+            const block_bottom = block_y + info.visible_height_px;
+            t.scroll_offset_px = @min(
+                if (block_bottom < doc_h) doc_h - block_bottom else 0,
+                max_scroll,
+            );
+        },
+    }
+    t.syncPageListViewport();
+    self.queueRender() catch {};
+}
+
+/// Toggle the collapsed state of a specific block by index.
+fn toggleBlockCollapse(self: *Surface, block_idx: usize) void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    const t: *terminal.Terminal = self.renderer_state.terminal;
+
+    const bl = &(t.block_list orelse return);
+    if (block_idx >= bl.blocks.items.len) return;
+    const block = &bl.blocks.items[block_idx];
+    if (block.output_start == null) return;
+    block.collapsed = !block.collapsed;
+    if (t.block_layout) |*layout| layout.invalidate();
+    self.queueRender() catch {};
 }
 
 fn copySelectionToClipboards(
@@ -4090,6 +4262,13 @@ pub fn mouseButtonCallback(
     }
 
     if (button == .left and action == .release) {
+        // Clear pressed toolbar icon state on mouse-up.
+        {
+            self.renderer_state.mutex.lock();
+            defer self.renderer_state.mutex.unlock();
+            self.renderer_state.terminal.pressed_toolbar_icon = null;
+        }
+
         // Stop selection scrolling when releasing the left mouse button
         // but only when selection scrolling is active.
         if (self.selection_scroll_active) {
@@ -4348,6 +4527,8 @@ pub fn mouseButtonCallback(
                                     const icon_idx = @min(rel_x / icon_slot_w, icon_count - 1);
                                     const enabled = icons_cfg.enabledIcons();
                                     if (icon_idx < enabled.len) {
+                                        // Set pressed state for visual feedback.
+                                        t.pressed_toolbar_icon = @intCast(icon_idx);
                                         switch (enabled.icons[icon_idx]) {
                                             .copy => {
                                                 self.copyBlockToClipboard(t, info.block_list_index);

@@ -115,6 +115,9 @@ pub const RenderState = struct {
     /// order), or null if not hovering over any icon.
     hovered_toolbar_icon: ?u32 = null,
 
+    /// Index of the toolbar icon currently pressed (for click highlight).
+    pressed_toolbar_icon: ?u32 = null,
+
     /// The cached selection so we can avoid expensive selection calculations
     /// if possible.
     selection_cache: ?SelectionCache = null,
@@ -641,6 +644,13 @@ pub const RenderState = struct {
                 self.dirty = .full;
             }
 
+            // Pressed icon state for click highlight.
+            const prev_pressed = self.pressed_toolbar_icon;
+            self.pressed_toolbar_icon = t.pressed_toolbar_icon;
+            if (!std.meta.eql(prev_pressed, self.pressed_toolbar_icon)) {
+                self.dirty = .full;
+            }
+
             // Detect collapsed state or visible row count changes by comparing
             // against previous snapshot. visible_rows changes when the active
             // block grows (e.g., continuation lines), which requires a full
@@ -712,6 +722,7 @@ pub const RenderState = struct {
             self.highlighted_block_idx = null;
             self.hovered_block_idx = null;
             self.hovered_toolbar_icon = null;
+            self.pressed_toolbar_icon = null;
             self.block_render_list.clearRetainingCapacity();
             self.total_doc_height_px = 0;
             self.block_layout_cell_height = 0;
