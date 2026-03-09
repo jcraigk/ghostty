@@ -101,6 +101,13 @@ hovered_toolbar_icon: ?u32 = null,
 /// feedback. Cleared on mouse-up or mouse-move off the toolbar.
 pressed_toolbar_icon: ?u32 = null,
 
+/// Block index with an active filter input, or null if no filter is active.
+/// When set, keyboard input is captured for the filter text field.
+filter_input_block_idx: ?usize = null,
+
+/// Text being typed into the filter input. Owned by gpa.
+filter_input_buf: std.ArrayListUnmanaged(u8) = .empty,
+
 /// Auto-collapse threshold: when a new block is created, automatically
 /// collapse the block N positions back from the newest. Set by the
 /// renderer from config. null = disabled.
@@ -298,6 +305,7 @@ pub fn init(
 pub fn deinit(self: *Terminal, alloc: Allocator) void {
     if (self.block_layout) |*layout| layout.deinit();
     if (self.block_list) |*bl| bl.deinit();
+    self.filter_input_buf.deinit(self.gpa());
     self.tabstops.deinit(alloc);
     self.screens.deinit(alloc);
     self.pwd.deinit(alloc);
@@ -1535,6 +1543,59 @@ pub fn toggleHighlightedBlockCollapse(self: *Terminal) void {
     if (block.output_start == null) return;
     block.collapsed = !block.collapsed;
     // Invalidate the layout so it recomputes with the new collapse state.
+    if (self.block_layout) |*layout| layout.invalidate();
+}
+
+/// Start or update filter input for a block. Opens the filter bar.
+pub fn startFilterInput(self: *Terminal, block_idx: usize) void {
+    if (self.filter_input_block_idx != null and self.filter_input_block_idx.? != block_idx) {
+        // Switching blocks: clear previous filter.
+        self.dismissFilterInput();
+    }
+    self.filter_input_block_idx = block_idx;
+}
+
+/// Append UTF-8 text to the filter input buffer and reapply the filter.
+pub fn appendFilterText(self: *Terminal, text: []const u8) void {
+    const bi = self.filter_input_block_idx orelse return;
+    self.filter_input_buf.appendSlice(self.gpa(), text) catch return;
+    self.applyFilterToBlock(bi);
+}
+
+/// Remove the last UTF-8 codepoint from the filter input buffer.
+pub fn backspaceFilterText(self: *Terminal) void {
+    const bi = self.filter_input_block_idx orelse return;
+    if (self.filter_input_buf.items.len == 0) return;
+    // Walk backwards to find the start of the last UTF-8 codepoint.
+    var i = self.filter_input_buf.items.len;
+    while (i > 0) {
+        i -= 1;
+        // UTF-8 continuation bytes start with 10xxxxxx.
+        if (self.filter_input_buf.items[i] & 0xC0 != 0x80) break;
+    }
+    self.filter_input_buf.shrinkRetainingCapacity(i);
+    self.applyFilterToBlock(bi);
+}
+
+/// Dismiss (close) the filter input and clear the filter on the block.
+pub fn dismissFilterInput(self: *Terminal) void {
+    if (self.filter_input_block_idx) |bi| {
+        const bl = &(self.block_list orelse return);
+        if (bi < bl.blocks.items.len) {
+            bl.blocks.items[bi].clearFilter(bl.alloc);
+        }
+    }
+    self.filter_input_block_idx = null;
+    self.filter_input_buf.clearRetainingCapacity();
+    if (self.block_layout) |*layout| layout.invalidate();
+}
+
+/// Apply the current filter text to the given block.
+fn applyFilterToBlock(self: *Terminal, block_idx: usize) void {
+    const bl = &(self.block_list orelse return);
+    if (block_idx >= bl.blocks.items.len) return;
+    var block = &bl.blocks.items[block_idx];
+    block.applyFilter(bl.alloc, self.filter_input_buf.items);
     if (self.block_layout) |*layout| layout.invalidate();
 }
 

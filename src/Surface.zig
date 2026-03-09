@@ -2244,6 +2244,7 @@ fn showBlockToolbarMenu(self: *Surface, block_idx: usize, menu_x_px: u32, menu_y
     const tag_scroll_bottom: c_long = 6;
     const tag_collapse: c_long = 7;
     const tag_expand: c_long = 8;
+    const tag_filter: c_long = 9;
 
     // Register a runtime ObjC class to act as menu item target. The class
     // has a single method (menuItemClicked:) that records the sender's tag
@@ -2304,6 +2305,7 @@ fn showBlockToolbarMenu(self: *Surface, block_idx: usize, menu_x_px: u32, menu_y
         .{ .title = "Copy Block", .tag = tag_copy_block, .sep = false },
         .{ .title = "Copy Working Directory", .tag = tag_copy_cwd, .sep = false },
         .{ .title = "", .tag = 0, .sep = true },
+        .{ .title = "Filter\u{2026}", .tag = tag_filter, .sep = false },
         .{ .title = if (is_collapsed) "Expand Block" else "Collapse Block",
            .tag = if (is_collapsed) tag_expand else tag_collapse,
            .sep = false },
@@ -2326,8 +2328,8 @@ fn showBlockToolbarMenu(self: *Surface, block_idx: usize, menu_x_px: u32, menu_y
             });
             item.msgSend(void, objc.sel("setTag:"), .{entry.tag});
             item.msgSend(void, objc.sel("setTarget:"), .{helper});
-            // Disable collapse/expand when the block has no output.
-            if ((entry.tag == tag_collapse or entry.tag == tag_expand) and !has_output) {
+            // Disable collapse/expand/filter when the block has no output.
+            if ((entry.tag == tag_collapse or entry.tag == tag_expand or entry.tag == tag_filter) and !has_output) {
                 item.msgSend(void, objc.sel("setEnabled:"), .{false});
             }
             menu_obj.msgSend(void, objc.sel("addItem:"), .{item});
@@ -2375,6 +2377,7 @@ fn showBlockToolbarMenu(self: *Surface, block_idx: usize, menu_x_px: u32, menu_y
         tag_scroll_top => self.scrollToBlock(block_idx, .top),
         tag_scroll_bottom => self.scrollToBlock(block_idx, .bottom),
         tag_collapse, tag_expand => self.toggleBlockCollapse(block_idx),
+        tag_filter => self.startBlockFilter(block_idx),
         else => {},
     }
 }
@@ -2466,6 +2469,14 @@ fn toggleBlockCollapse(self: *Surface, block_idx: usize) void {
     if (block.output_start == null) return;
     block.collapsed = !block.collapsed;
     if (t.block_layout) |*layout| layout.invalidate();
+    self.queueRender() catch {};
+}
+
+fn startBlockFilter(self: *Surface, block_idx: usize) void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    const t: *terminal.Terminal = self.renderer_state.terminal;
+    t.startFilterInput(block_idx);
     self.queueRender() catch {};
 }
 
@@ -2934,6 +2945,42 @@ pub fn keyCallback(
         event,
         if (insp_ev) |*ev| ev else null,
     )) |v| return v;
+
+    // Intercept keys when block filter input is active.
+    if (event.action == .press or event.action == .repeat) {
+        self.renderer_state.mutex.lock();
+        const filter_active = self.renderer_state.terminal.filter_input_block_idx != null;
+        if (filter_active) {
+            const t = self.renderer_state.terminal;
+            if (event.key == .escape) {
+                t.dismissFilterInput();
+                self.renderer_state.mutex.unlock();
+                try self.queueRender();
+                return .consumed;
+            } else if (event.key == .backspace) {
+                t.backspaceFilterText();
+                self.renderer_state.mutex.unlock();
+                try self.queueRender();
+                return .consumed;
+            } else if (event.key == .enter or event.key == .numpad_enter) {
+                // Enter dismisses the filter but keeps the filter applied
+                t.filter_input_block_idx = null;
+                t.filter_input_buf.clearRetainingCapacity();
+                self.renderer_state.mutex.unlock();
+                try self.queueRender();
+                return .consumed;
+            } else if (event.utf8.len > 0) {
+                t.appendFilterText(event.utf8);
+                self.renderer_state.mutex.unlock();
+                try self.queueRender();
+                return .consumed;
+            }
+            self.renderer_state.mutex.unlock();
+        } else {
+            self.renderer_state.mutex.unlock();
+        }
+    }
+
     // If we allow KAM and KAM is enabled then we do nothing.
     if (self.config.vt_kam_allowed) {
         self.renderer_state.mutex.lock();
@@ -4482,6 +4529,36 @@ pub fn mouseButtonCallback(
                     for (brl) |info| {
                         const block_end = info.virtual_y_px + info.visible_height_px;
                         if (virtual_y >= info.virtual_y_px and virtual_y < block_end) {
+                            // Check if click is on the filter bar close button.
+                            if (t.filter_input_block_idx) |fbi| filter_check: {
+                                if (info.block_list_index != fbi) break :filter_check;
+                                const block_screen_y_fc: i64 = @as(i64, @intCast(padding_top)) +
+                                    @as(i64, @intCast(info.virtual_y_px)) - viewport_top_i64;
+                                if (block_screen_y_fc < 0) break :filter_check;
+                                const f_screen_y: u32 = @intCast(block_screen_y_fc);
+                                const f_bar_h_c = cell_h;
+                                const grid_right_c = self.size.padding.left + t.cols * cell_w;
+                                const f_bar_w_c: u32 = @min(grid_right_c -| self.size.padding.left -| cell_w * 2, cell_w * 30);
+                                const f_bar_x_c: u32 = grid_right_c -| f_bar_w_c -| cell_w;
+                                const click_x_fc: u32 = @intFromFloat(@max(0, pos.x));
+                                const click_y_fc: u32 = @intFromFloat(@max(0, pos.y));
+
+                                if (click_y_fc >= f_screen_y and click_y_fc < f_screen_y + f_bar_h_c and
+                                    click_x_fc >= f_bar_x_c and click_x_fc < f_bar_x_c + f_bar_w_c)
+                                {
+                                    // Check if click is on the X close button (right portion of bar).
+                                    const close_region_x = (f_bar_x_c + f_bar_w_c) -| f_bar_h_c;
+                                    if (click_x_fc >= close_region_x) {
+                                        t.dismissFilterInput();
+                                        try self.queueRender();
+                                        break;
+                                    }
+                                    // Click is on the filter text area — consume but don't dismiss.
+                                    try self.queueRender();
+                                    break;
+                                }
+                            }
+
                             // Check if click is on the toolbar pill.
                             if (self.config.command_blocks_toolbar) toolbar_check: {
                                 const icons_cfg = self.config.command_blocks_toolbar_icons;
@@ -4551,7 +4628,17 @@ pub fn mouseButtonCallback(
                                                 };
                                             },
                                             .filter => {
-                                                // TODO: toggle inline filter
+                                                // Toggle: if filter active, clear it; else start.
+                                                const bl_idx = info.block_list_index;
+                                                const has_filter = if (t.block_list) |*bl_l|
+                                                    bl_idx < bl_l.blocks.items.len and bl_l.blocks.items[bl_idx].filter_match_rows != null
+                                                else
+                                                    false;
+                                                if (has_filter) {
+                                                    t.dismissFilterInput();
+                                                } else {
+                                                    t.startFilterInput(bl_idx);
+                                                }
                                             },
                                         }
                                     }

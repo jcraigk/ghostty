@@ -46,6 +46,13 @@ pub const BlockLayoutInfo = struct {
     /// Whether this block is collapsed.
     collapsed: bool,
 
+    /// Whether this block has an active output filter.
+    filtered: bool,
+
+    /// Matched output row indices (0-based from output_start) when filtered.
+    /// Null when not filtered.
+    filter_match_rows: ?[]const u32,
+
     /// Index into BlockList.blocks. Stable across viewport changes.
     block_list_index: usize,
 
@@ -157,10 +164,12 @@ pub fn rebuild(self: *BlockLayout) void {
         // Compute output_row_offset (rows before output_start).
         const output_row_offset: u16 = self.countOutputOffset(block);
 
-        // Compute visible rows (accounting for collapse).
-        // When collapsed, show 1 prompt/input line + preview_lines of output.
-        // This keeps multi-line inputs (continuations, heredocs) compact.
-        const visible_rows: u32 = if (block.collapsed)
+        // Compute visible rows (accounting for collapse and filter).
+        // Filter takes priority: show prompt/input rows + matched output rows.
+        // When collapsed (and no filter), show 1 prompt/input + preview_lines.
+        const visible_rows: u32 = if (block.filter_match_rows) |matches|
+            @min(total_rows, @as(u32, output_row_offset) + @as(u32, @intCast(matches.len)))
+        else if (block.collapsed)
             @max(1, @min(total_rows, 1 + @as(u32, self.config.preview_lines)))
         else
             total_rows;
@@ -177,6 +186,8 @@ pub fn rebuild(self: *BlockLayout) void {
             .output_row_offset = output_row_offset,
             .exit_code = block.exit_code orelse -1,
             .collapsed = block.collapsed,
+            .filtered = block.filter_match_rows != null,
+            .filter_match_rows = block.filter_match_rows,
             .block_list_index = i,
             .prompt_start_pin = block.prompt_start.*,
             .total_extent_px = total_extent,

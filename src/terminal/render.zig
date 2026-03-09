@@ -118,6 +118,11 @@ pub const RenderState = struct {
     /// Index of the toolbar icon currently pressed (for click highlight).
     pressed_toolbar_icon: ?u32 = null,
 
+    /// Block index that currently has active filter input, or null.
+    filter_input_block_idx: ?usize = null,
+    /// The current filter input text (snapshot from Terminal).
+    filter_input_text: std.ArrayListUnmanaged(u8) = .empty,
+
     /// The cached selection so we can avoid expensive selection calculations
     /// if possible.
     selection_cache: ?SelectionCache = null,
@@ -293,6 +298,10 @@ pub const RenderState = struct {
         prompt_start_pin: PageList.Pin,
         /// Total extent including trailing gap.
         total_extent_px: u32,
+        /// Whether this block has an active filter.
+        filtered: bool = false,
+        /// Matched output row indices when filtered (0-based from output_start).
+        filter_match_rows: ?[]const u32 = null,
         /// First row of this block in the cell buffer (viewport-relative).
         /// Set to max(u16) if the block's prompt_start is not in the viewport.
         viewport_first_row: u16 = std.math.maxInt(u16),
@@ -319,6 +328,7 @@ pub const RenderState = struct {
         }
         self.row_data.deinit(alloc);
         self.block_render_list.deinit(alloc);
+        self.filter_input_text.deinit(alloc);
     }
 
     /// Update the render state to the latest terminal state.
@@ -651,6 +661,20 @@ pub const RenderState = struct {
                 self.dirty = .full;
             }
 
+            // Filter input state.
+            const prev_filter_idx = self.filter_input_block_idx;
+            self.filter_input_block_idx = t.filter_input_block_idx;
+            {
+                const text = t.filter_input_buf.items;
+                if (!std.mem.eql(u8, self.filter_input_text.items, text)) {
+                    self.filter_input_text.clearRetainingCapacity();
+                    self.filter_input_text.appendSlice(alloc, text) catch {};
+                    self.dirty = .full;
+                } else if (!std.meta.eql(prev_filter_idx, self.filter_input_block_idx)) {
+                    self.dirty = .full;
+                }
+            }
+
             // Detect collapsed state or visible row count changes by comparing
             // against previous snapshot. visible_rows changes when the active
             // block grows (e.g., continuation lines), which requires a full
@@ -712,6 +736,8 @@ pub const RenderState = struct {
                     .block_list_index = info.block_list_index,
                     .prompt_start_pin = info.prompt_start_pin,
                     .total_extent_px = info.total_extent_px,
+                    .filtered = info.filtered,
+                    .filter_match_rows = info.filter_match_rows,
                     .viewport_first_row = vp_row,
                 }) catch {};
             }
@@ -723,6 +749,8 @@ pub const RenderState = struct {
             self.hovered_block_idx = null;
             self.hovered_toolbar_icon = null;
             self.pressed_toolbar_icon = null;
+            self.filter_input_block_idx = null;
+            self.filter_input_text.clearRetainingCapacity();
             self.block_render_list.clearRetainingCapacity();
             self.total_doc_height_px = 0;
             self.block_layout_cell_height = 0;

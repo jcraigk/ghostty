@@ -235,6 +235,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Populated in rebuildCells from block_render_list.
         block_regions: std.ArrayListUnmanaged(BlockRegion) = .empty,
 
+        /// Filter text glyph rendering state (populated in rebuildCells, drawn in drawFrame).
+        filter_text_base_instance: usize = 0,
+        filter_text_glyph_count: usize = 0,
+
 
         const BlockRegion = struct {
             first_row: u16,
@@ -257,6 +261,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             /// Block index for scratch row lookup (0-based across all regions).
             /// When using BlockLayout, this is the index within block_render_list.
             block_idx: u16 = 0,
+            /// Whether this block has an active filter.
+            filtered: bool = false,
+            /// Matched output row indices (0-based from output_start) when filtered.
+            filter_match_rows: ?[]const u32 = null,
+            /// Number of prompt/input rows before output.
+            output_row_offset: u16 = 0,
         };
 
         /// Map a block exit code to an RGBA stripe color using config values.
@@ -2140,9 +2150,227 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         }
                     }
 
-                    // Toolbar: draw a pill-shaped background with icon shapes on the hovered or highlighted block.
-                    // Rendered after all block content so it appears on top.
+                    // Filter bar or Toolbar: rendered on the hovered/highlighted block.
                     if (self.config.command_blocks_toolbar and num_blocks > 0) toolbar: {
+                        // Check if filter input is active on any visible block.
+                        const filter_block_idx = ts.filter_input_block_idx;
+                        const filter_text = ts.filter_input_text.items;
+
+                        // Find the filter block's region (if active).
+                        const filter_region: ?BlockRegion = if (filter_block_idx) |fbi| blk: {
+                            for (self.block_regions.items) |reg| {
+                                if (reg.block_idx < ts.block_render_list.items.len and
+                                    ts.block_render_list.items[reg.block_idx].block_list_index == fbi)
+                                    break :blk reg;
+                            }
+                            break :blk null;
+                        } else null;
+
+                        // If filter is active, render filter bar instead of toolbar.
+                        if (filter_region) |f_region| {
+                            const f_cell_h = self.grid_metrics.cell_height;
+                            const f_cell_w = self.grid_metrics.cell_width;
+                            const f_bar_h: u32 = @min(f_cell_h, f_region.height_px);
+                            const grid_cols_f: u32 = self.cells.size.columns;
+                            const grid_right_f: u32 = self.size.padding.left + grid_cols_f * f_cell_w;
+                            // Filter bar spans most of the block width.
+                            const f_bar_w: u32 = @min(grid_right_f -| self.size.padding.left -| f_cell_w * 2, f_cell_w * 30);
+                            const f_bar_x: u32 = grid_right_f -| f_bar_w -| f_cell_w;
+                            const f_bar_y: u32 = f_region.screen_y_px;
+
+                            const f_corner_radius: f32 = if (self.config.command_blocks_toolbar_radius > 0)
+                                @floatFromInt(self.config.command_blocks_toolbar_radius)
+                            else
+                                @as(f32, @floatFromInt(f_bar_h)) / 4.0;
+
+                            if (f_bar_h > 0 and f_bar_w > 0) {
+                                const f_toolbar_scratch: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(num_blocks)) * 3.0;
+                                const fb_x_f: f32 = @floatFromInt(f_bar_x);
+                                const fb_y_f: f32 = @floatFromInt(f_bar_y);
+                                const fb_w_f: f32 = @floatFromInt(f_bar_w);
+                                const fb_h_f: f32 = @floatFromInt(f_bar_h);
+
+                                // Filter bar background pill.
+                                pass.step(.{
+                                    .pipeline = self.shaders.pipelines.cell_bg,
+                                    .uniforms = frame.uniforms.buffer,
+                                    .buffers = &.{ null, frame.cells_bg.buffer },
+                                    .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                    .scissor = .{
+                                        .x = f_bar_x,
+                                        .y = f_bar_y,
+                                        .width = f_bar_w,
+                                        .height = f_bar_h,
+                                    },
+                                    .block_params = .{
+                                        .block_y_offset = 0,
+                                        .block_first_row = f_toolbar_scratch,
+                                        .block_x_offset = -pad_left,
+                                        .block_y_flat = 1.0,
+                                        .block_corner_radius = f_corner_radius,
+                                        .block_scissor_x = fb_x_f,
+                                        .block_scissor_y = fb_y_f,
+                                        .block_scissor_w = fb_w_f,
+                                        .block_scissor_h = fb_h_f,
+                                    },
+                                });
+
+                                // Draw filter text using the icon scratch row color.
+                                const f_icon_scratch: f32 = f_toolbar_scratch + 1.0;
+
+                                // Render filter text as actual glyphs and a cursor bar.
+                                // We add glyph cells to fg_rows[0] and issue a separate
+                                // cell_text draw call with block_params that map grid positions
+                                // to the filter bar's pixel location.
+                                const padding_top_u: u32 = self.size.padding.top;
+                                const padding_left_u: u32 = self.size.padding.left;
+                                const filter_text_x_start: u32 = f_bar_x + f_bar_h / 4 + 4;
+                                // block_params map: grid_pos(col, 0) → pixel (padding_left + x_off + col*cell_w, padding_top + y_off)
+                                // We want col 0 at filter_text_x_start, row 0 at f_bar_y
+                                const filter_block_y_off: f32 = @as(f32, @floatFromInt(f_bar_y)) - @as(f32, @floatFromInt(padding_top_u));
+                                const filter_block_x_off: f32 = @as(f32, @floatFromInt(filter_text_x_start)) - @as(f32, @floatFromInt(padding_left_u));
+                                const filter_bp: @TypeOf(pass).Step.BlockParams = .{
+                                    .block_y_offset = filter_block_y_off,
+                                    .block_first_row = 0,
+                                    .block_x_offset = filter_block_x_off,
+                                    .block_y_flat = 0,
+                                };
+
+                                // Use pre-computed filter text glyphs (populated in rebuildCells,
+                                // already synced to GPU buffer).
+                                // filter_text used below for cursor positioning
+
+                                // Cursor bar using cell_bg (thin vertical rectangle).
+                                // Use actual input text length for cursor, not glyph count
+                                // (glyph count may include placeholder "Filter" text).
+                                const filter_input_len: u32 = @intCast(@min(filter_text.len, std.math.maxInt(u32)));
+                                const cursor_px_x = filter_text_x_start + filter_input_len * f_cell_w;
+                                const cursor_bar_w: u32 = @max(2, f_cell_w / 5);
+                                const close_region_w: u32 = f_bar_h;
+                                const max_text_x: u32 = (f_bar_x + f_bar_w) -| close_region_w;
+                                if (cursor_px_x + cursor_bar_w < max_text_x) {
+                                    const cb_y_top = f_bar_y + f_bar_h / 6;
+                                    const cb_h_px = f_bar_h -| f_bar_h / 3;
+                                    const cb_x_f: f32 = @floatFromInt(cursor_px_x);
+                                    const cb_y_f: f32 = @floatFromInt(cb_y_top);
+                                    const cb_w_f: f32 = @floatFromInt(cursor_bar_w);
+                                    const cb_h_f: f32 = @floatFromInt(cb_h_px);
+                                    pass.step(.{
+                                        .pipeline = self.shaders.pipelines.cell_bg,
+                                        .uniforms = frame.uniforms.buffer,
+                                        .buffers = &.{ null, frame.cells_bg.buffer },
+                                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                        .scissor = .{
+                                            .x = cursor_px_x,
+                                            .y = cb_y_top,
+                                            .width = cursor_bar_w,
+                                            .height = cb_h_px,
+                                        },
+                                        .block_params = .{
+                                            .block_y_offset = 0,
+                                            .block_first_row = f_icon_scratch,
+                                            .block_x_offset = -pad_left,
+                                            .block_y_flat = 1.0,
+                                            .block_corner_radius = 1.0,
+                                            .block_scissor_x = cb_x_f,
+                                            .block_scissor_y = cb_y_f,
+                                            .block_scissor_w = cb_w_f,
+                                            .block_scissor_h = cb_h_f,
+                                        },
+                                    });
+                                }
+
+                                // Issue cell_text draw call for the pre-computed filter text glyphs.
+                                if (self.filter_text_glyph_count > 0) {
+                                    pass.step(.{
+                                        .pipeline = self.shaders.pipelines.cell_text,
+                                        .uniforms = frame.uniforms.buffer,
+                                        .buffers = &.{
+                                            frame.cells.buffer,
+                                            frame.cells_bg.buffer,
+                                        },
+                                        .textures = &.{
+                                            frame.grayscale,
+                                            frame.color,
+                                        },
+                                        .draw = .{
+                                            .type = .triangle_strip,
+                                            .vertex_count = 4,
+                                            .instance_count = self.filter_text_glyph_count,
+                                            .base_instance = self.filter_text_base_instance,
+                                        },
+                                        .scissor = .{
+                                            .x = f_bar_x,
+                                            .y = f_bar_y,
+                                            .width = f_bar_w,
+                                            .height = f_bar_h,
+                                        },
+                                        .block_params = filter_bp,
+                                    });
+                                }
+
+                                // "X" close button on the right side.
+                                const close_size: u32 = @max(6, f_bar_h / 3);
+                                const close_x: u32 = (f_bar_x + f_bar_w) -| f_bar_h / 2 -| close_size / 2;
+                                const close_y: u32 = f_bar_y + f_bar_h / 2 - close_size / 2;
+                                const close_th: u32 = @max(2, close_size / 4);
+                                const close_steps: u32 = @max(3, close_size);
+                                const ct_f: f32 = @floatFromInt(close_th);
+                                {
+                                    var csi: u32 = 0;
+                                    while (csi <= close_steps) : (csi += 1) {
+                                        // Diagonal 1: top-left to bottom-right.
+                                        const d1x = close_x + csi * close_size / close_steps;
+                                        const d1y = close_y + csi * close_size / close_steps;
+                                        const d1x_f: f32 = @floatFromInt(d1x);
+                                        const d1y_f: f32 = @floatFromInt(d1y);
+                                        pass.step(.{
+                                            .pipeline = self.shaders.pipelines.cell_bg,
+                                            .uniforms = frame.uniforms.buffer,
+                                            .buffers = &.{ null, frame.cells_bg.buffer },
+                                            .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                            .scissor = .{ .x = d1x, .y = d1y, .width = close_th, .height = close_th },
+                                            .block_params = .{
+                                                .block_y_offset = 0,
+                                                .block_first_row = f_icon_scratch,
+                                                .block_x_offset = -pad_left,
+                                                .block_y_flat = 1.0,
+                                                .block_corner_radius = ct_f / 2.0,
+                                                .block_scissor_x = d1x_f,
+                                                .block_scissor_y = d1y_f,
+                                                .block_scissor_w = ct_f,
+                                                .block_scissor_h = ct_f,
+                                            },
+                                        });
+                                        // Diagonal 2: top-right to bottom-left.
+                                        const d2x = (close_x + close_size) -| csi * close_size / close_steps;
+                                        const d2y = close_y + csi * close_size / close_steps;
+                                        const d2x_f: f32 = @floatFromInt(d2x);
+                                        const d2y_f: f32 = @floatFromInt(d2y);
+                                        pass.step(.{
+                                            .pipeline = self.shaders.pipelines.cell_bg,
+                                            .uniforms = frame.uniforms.buffer,
+                                            .buffers = &.{ null, frame.cells_bg.buffer },
+                                            .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                            .scissor = .{ .x = d2x, .y = d2y, .width = close_th, .height = close_th },
+                                            .block_params = .{
+                                                .block_y_offset = 0,
+                                                .block_first_row = f_icon_scratch,
+                                                .block_x_offset = -pad_left,
+                                                .block_y_flat = 1.0,
+                                                .block_corner_radius = ct_f / 2.0,
+                                                .block_scissor_x = d2x_f,
+                                                .block_scissor_y = d2y_f,
+                                                .block_scissor_w = ct_f,
+                                                .block_scissor_h = ct_f,
+                                            },
+                                        });
+                                    }
+                                }
+                            }
+                            break :toolbar;
+                        }
+
                         const hovered_bl_idx = ts.hovered_block_idx orelse
                             (ts.highlighted_block_idx orelse break :toolbar);
                         // Find the BlockRegion for the hovered block.
@@ -2562,7 +2790,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // first), bar/hollow/underline cursors go to lists[rows+1]
                     // (drawn last). Both need the active block's params/scissor.
                     const lists = self.cells.fg_rows.lists;
-                    const block_cursor_count = if (lists.len > 0) lists[0].items.len else 0;
+                    const block_cursor_count = if (lists.len > 0) lists[0].items.len -| self.filter_text_glyph_count else 0;
                     const overlay_cursor_idx = self.cells.size.rows + 1;
                     const overlay_cursor_count = if (overlay_cursor_idx < lists.len) lists[overlay_cursor_idx].items.len else 0;
 
@@ -3478,6 +3706,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .collapsed = info.collapsed,
                             .hidden_lines = hidden,
                             .block_idx = @intCast(@min(layout_i, std.math.maxInt(u16))),
+                            .filtered = info.filtered,
+                            .filter_match_rows = info.filter_match_rows,
+                            .output_row_offset = info.output_row_offset,
                         }) catch {};
                     }
 
@@ -3549,6 +3780,61 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Block tint is applied as a draw-level background layer,
                 // not per-cell, so it covers gaps and supports hover/click.
+            }
+
+            // Remap cell buffer rows for filtered blocks.
+            // Only on full rebuild — on partial rebuilds the display rows already
+            // have correct content from the previous full rebuild. Re-running the
+            // remap on partial frames would read from source rows that may have been
+            // overwritten by a previous remap (since source rows overlap with display
+            // positions from earlier matches).
+            if (rebuild) {
+                for (self.block_regions.items) |region| {
+                    if (!region.filtered) continue;
+                    const matches = region.filter_match_rows orelse continue;
+                    if (matches.len == 0) continue;
+                    const out_off: u16 = region.output_row_offset;
+                    const cols_u: usize = self.cells.size.columns;
+                    const lists = self.cells.fg_rows.lists;
+
+                    // For each match, copy the fg list and bg cells from the source row
+                    // to the display position. Since matches are sorted and source >= display,
+                    // processing in order is safe (we never overwrite a source we still need).
+                    // We use copy (not swap) to avoid corrupting source rows that may be
+                    // display targets for later matches, and to avoid frame-to-frame instability
+                    // from repeated swaps.
+                    for (matches, 0..) |match_row_idx, mi| {
+                        const display_row: u16 = region.first_row + out_off + @as(u16, @intCast(mi));
+                        const source_row: u16 = region.first_row + out_off + @as(u16, @intCast(match_row_idx));
+                        if (display_row == source_row) continue;
+                        if (display_row >= row_len or source_row >= row_len) continue;
+
+                        // Copy fg row list from source to display (lists[0] is cursor, so +1).
+                        const di: usize = @as(usize, display_row) + 1;
+                        const si: usize = @as(usize, source_row) + 1;
+                        if (di < lists.len and si < lists.len) {
+                            lists[di].clearRetainingCapacity();
+                            lists[di].appendSlice(self.alloc, lists[si].items) catch {};
+                            // Fix grid_pos.y: copied glyphs have source_row as their Y,
+                            // but they need display_row for correct shader positioning.
+                            for (lists[di].items) |*glyph| {
+                                glyph.grid_pos[1] = display_row;
+                            }
+                        }
+
+                        // Copy bg cell data for this row.
+                        const d_start = @as(usize, display_row) * cols_u;
+                        const s_start = @as(usize, source_row) * cols_u;
+                        if (d_start + cols_u <= self.cells.bg_cells.len and
+                            s_start + cols_u <= self.cells.bg_cells.len)
+                        {
+                            @memcpy(
+                                self.cells.bg_cells[d_start..][0..cols_u],
+                                self.cells.bg_cells[s_start..][0..cols_u],
+                            );
+                        }
+                    }
+                }
             }
 
             // Populate scratch rows for separator and per-row stripes.
@@ -3833,6 +4119,50 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     };
 
                     x += if (cp.wide) 2 else 1;
+                }
+            }
+
+            // Populate filter text glyphs into fg_rows[0].
+            // This MUST be after cursor setup (setCursor clears fg_rows[0]).
+            self.filter_text_glyph_count = 0;
+            self.filter_text_base_instance = 0;
+            if (state.filter_input_block_idx != null) {
+                const lists_ft = self.cells.fg_rows.lists;
+                if (lists_ft.len > 0) {
+                    self.filter_text_base_instance = lists_ft[0].items.len;
+                    const has_text = state.filter_input_text.items.len > 0;
+                    const fg_ft = state.colors.foreground;
+                    // Dimmer color for placeholder, full brightness for typed text.
+                    const filter_fg_ft: [4]u8 = if (has_text)
+                        .{ fg_ft.r, fg_ft.g, fg_ft.b, 255 }
+                    else
+                        .{ fg_ft.r / 2, fg_ft.g / 2, fg_ft.b / 2, 255 };
+                    const text_to_render: []const u8 = if (has_text)
+                        state.filter_input_text.items
+                    else
+                        "Filter";
+                    var ft_col: u16 = 0;
+                    for (text_to_render) |ch| {
+                        if (ch < 0x20 or ch > 0x7e) continue;
+                        const render_ft = self.font_grid.renderCodepoint(
+                            self.alloc,
+                            @intCast(ch),
+                            .regular,
+                            .text,
+                            .{ .grid_metrics = self.grid_metrics },
+                        ) catch continue;
+                        const glyph_ft = render_ft orelse continue;
+                        lists_ft[0].append(self.alloc, .{
+                            .atlas = .grayscale,
+                            .grid_pos = .{ ft_col, 0 },
+                            .color = filter_fg_ft,
+                            .glyph_pos = .{ glyph_ft.glyph.atlas_x, glyph_ft.glyph.atlas_y },
+                            .glyph_size = .{ glyph_ft.glyph.width, glyph_ft.glyph.height },
+                            .bearings = .{ @intCast(glyph_ft.glyph.offset_x), @intCast(glyph_ft.glyph.offset_y) },
+                        }) catch continue;
+                        ft_col += 1;
+                    }
+                    self.filter_text_glyph_count = lists_ft[0].items.len - self.filter_text_base_instance;
                 }
             }
 

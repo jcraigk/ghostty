@@ -42,6 +42,15 @@ collapsed: bool = false,
 /// (whose extent is still growing) and blocks not yet closed.
 cached_row_count: ?u32 = null,
 
+/// Per-block filter: indices of output rows (0-based from output_start)
+/// that match the filter text. Null when no filter is active.
+/// Owned by the BlockList allocator.
+filter_match_rows: ?[]const u32 = null,
+
+/// The filter text that produced `filter_match_rows`. Owned by the
+/// BlockList allocator. Null when no filter is active.
+filter_text: ?[]const u8 = null,
+
 /// Count rows between two pins (exclusive of limit pin's row).
 /// Used for computing block row counts from prompt_start to end.
 pub fn countRowsBetweenPins(start: Pin, limit: Pin) u32 {
@@ -125,6 +134,74 @@ pub fn outputText(self: Block, pages: *PageList, buf: []u8) []const u8 {
     const start_pin = self.output_start orelse return buf[0..0];
     const limit_pin = self.end orelse return buf[0..0];
     return readPinRangeText(pages, start_pin.*, limit_pin.*, buf);
+}
+
+/// Apply a case-insensitive literal filter to this block's output rows.
+/// Stores matching row indices (0-based from output_start) and the filter text.
+/// Passing an empty needle clears the filter.
+pub fn applyFilter(self: *Block, alloc: Allocator, needle: []const u8) void {
+    // Free previous filter data.
+    if (self.filter_match_rows) |m| alloc.free(m);
+    if (self.filter_text) |t| alloc.free(t);
+    self.filter_match_rows = null;
+    self.filter_text = null;
+
+    if (needle.len == 0) return;
+
+    const os = self.output_start orelse return;
+    const limit = self.end orelse return;
+
+    // Store needle.
+    self.filter_text = alloc.dupe(u8, needle) catch return;
+
+    // Scan output rows and collect indices of matching ones.
+    var matches: std.ArrayListUnmanaged(u32) = .empty;
+    var row_idx: u32 = 0;
+    var row_it = os.rowIterator(.right_down, limit.*);
+    while (row_it.next()) |row_pin| {
+        if (row_pin.node == limit.node and row_pin.y == limit.y) break;
+        // Extract row text into a temp buffer.
+        var row_buf: [4096]u8 = undefined;
+        var written: usize = 0;
+        const cells = row_pin.cells(.all);
+        for (cells) |cell| {
+            if (!cell.hasText()) continue;
+            if (cell.wide == .spacer_tail) continue;
+            const cp = cell.content.codepoint;
+            // Convert codepoint to lowercase for case-insensitive match.
+            const lower_cp = if (cp >= 'A' and cp <= 'Z') cp + 32 else cp;
+            const len = std.unicode.utf8CodepointSequenceLength(lower_cp) catch continue;
+            if (written + len > row_buf.len) break;
+            _ = std.unicode.utf8Encode(lower_cp, row_buf[written..]) catch continue;
+            written += len;
+        }
+        // Trim trailing spaces.
+        while (written > 0 and row_buf[written - 1] == ' ') written -= 1;
+
+        // Lowercase needle for comparison.
+        var needle_lower: [256]u8 = undefined;
+        const nl = @min(needle.len, needle_lower.len);
+        for (needle[0..nl], 0..) |c, ci| {
+            needle_lower[ci] = if (c >= 'A' and c <= 'Z') c + 32 else c;
+        }
+
+        if (written >= nl and nl > 0) {
+            // Search for needle in row text.
+            if (std.mem.indexOf(u8, row_buf[0..written], needle_lower[0..nl]) != null) {
+                matches.append(alloc, row_idx) catch {};
+            }
+        }
+        row_idx += 1;
+    }
+    self.filter_match_rows = matches.toOwnedSlice(alloc) catch null;
+}
+
+/// Clear any active filter on this block.
+pub fn clearFilter(self: *Block, alloc: Allocator) void {
+    if (self.filter_match_rows) |m| alloc.free(m);
+    if (self.filter_text) |t| alloc.free(t);
+    self.filter_match_rows = null;
+    self.filter_text = null;
 }
 
 /// Read text from cells between two pins, writing UTF-8 into `buf`.
@@ -217,6 +294,8 @@ pub const BlockList = struct {
             if (block.output_start) |p| self.pages.untrackPin(p);
             if (block.end) |p| self.pages.untrackPin(p);
             if (block.cwd) |s| self.alloc.free(s);
+            if (block.filter_match_rows) |m| self.alloc.free(m);
+            if (block.filter_text) |t| self.alloc.free(t);
         }
         self.blocks.deinit(self.alloc);
     }
@@ -303,6 +382,8 @@ pub const BlockList = struct {
                 if (block.output_start) |p| self.pages.untrackPin(p);
                 if (block.end) |p| self.pages.untrackPin(p);
                 if (block.cwd) |s| self.alloc.free(s);
+                if (block.filter_match_rows) |m| self.alloc.free(m);
+                if (block.filter_text) |t| self.alloc.free(t);
 
                 _ = self.blocks.orderedRemove(i);
             } else {

@@ -600,7 +600,7 @@ vertex CellTextVertexOut cell_text_vertex(
   // Convert the grid x, y into world space x, y by accounting for cell size.
   // When block rendering is active, position relative to block origin.
   float2 cell_pos;
-  cell_pos.x = uniforms.cell_size.x * float(in.grid_pos.x);
+  cell_pos.x = uniforms.cell_size.x * float(in.grid_pos.x) + block_params.block_x_offset;
   cell_pos.y = float(int(in.grid_pos.y) - int(block_params.block_first_row)) * uniforms.cell_size.y + block_params.block_y_offset;
 
   // We use a triangle strip with 4 vertices to render quads,
