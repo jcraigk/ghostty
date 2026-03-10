@@ -1906,7 +1906,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 if (self.block_regions.items.len >= 1) {
                     const ts = &self.terminal_state;
-                    const sep_row: f32 = @floatFromInt(ts.rows);
+                    // sep_row is the first scratch row index, matching rebuildCells.
+                    const sep_row: f32 = if (ts.block_cell_row_count > 0)
+                        @floatFromInt(ts.block_cell_row_count)
+                    else
+                        @floatFromInt(ts.rows);
                     const pad_left: f32 = @floatFromInt(self.size.padding.left);
                     const stripe_w: u32 = self.config.command_blocks_stripe_width;
                     const num_blocks: u16 = @intCast(@min(ts.block_render_list.items.len, std.math.maxInt(u16)));
@@ -1951,11 +1955,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             if (next.screen_y_px <= this_end) break :blk this_end;
                             const gap_mid = this_end + (next.screen_y_px - this_end) / 2;
                             break :blk gap_mid;
-                        } else if (region.exit_code < 0)
-                            // Active block: extend tint/stripe to screen bottom.
+                        } else if (region.exit_code < 0 and ts.scroll_offset_px == 0)
+                            // Active block when following: extend tint/stripe to screen bottom.
                             self.size.screen.height
                         else
-                            // Last completed block: extend only to content + footer padding.
+                            // Completed block, or active block when scrolled up:
+                            // extend only to content + footer padding.
                             @min(region.screen_y_px + region.height_px + self.config.command_blocks_padding_footer, self.size.screen.height);
 
                         // Block tint: background layer spanning the full visual block
@@ -3540,8 +3545,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Extra rows: 1 separator + num_blocks stripe + num_blocks tint + num_blocks collapse + 1 toolbar.
             const has_toolbar: bool = num_blocks > 0 and self.config.command_blocks_toolbar;
             const toolbar_scratch_count: u16 = if (has_toolbar) 4 else 0; // bg + icon color + icon hover + icon pressed
+            // Extra rows: 1 separator + num_blocks stripe + num_blocks tint + num_blocks collapse + 1 toolbar.
             const scratch_rows: u16 = if (num_blocks > 0) 1 + num_blocks * 3 + toolbar_scratch_count else 0;
-            const total_rows = state.rows + scratch_rows;
+            // When block-aware rendering is active, use block_cell_row_count
+            // (the actual number of populated rows) instead of state.rows.
+            const content_rows: u16 = if (state.block_cell_row_count > 0)
+                @intCast(@min(state.block_cell_row_count, std.math.maxInt(u16)))
+            else
+                state.rows;
+            const total_rows = content_rows + scratch_rows;
 
             const grid_size_diff =
                 self.cells.size.rows != total_rows or
@@ -3612,10 +3624,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // we render the rows that fit, starting from the bottom. If instead
             // the viewport is shorter than the cell contents buffer, we align
             // the top of the viewport with the top of the contents buffer.
-            const row_len: usize = @min(
-                state.rows,
-                self.cells.size.rows,
-            );
+            //
+            // When block-aware rendering is active, block_cell_row_count gives
+            // the actual number of populated rows (may differ from state.rows).
+            const row_len: usize = if (state.block_cell_row_count > 0)
+                @min(state.block_cell_row_count, self.cells.size.rows)
+            else
+                @min(state.rows, self.cells.size.rows);
 
             // Compute block regions for per-block scissored rendering.
             {
@@ -3629,20 +3644,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // BlockLayout provides stable, viewport-independent virtual coordinates.
                     // We compute viewport_top_px from the scroll offset, then map each
                     // block's virtual_y_px to screen coordinates.
+                    //
+                    // With block-aware rendering, the cell buffer is populated directly
+                    // from block pins (decoupled from PageList viewport). Each block's
+                    // viewport_first_row is a contiguous cell buffer offset assigned by
+                    // RenderState.populateBlockRows(). No skip_top logic is needed —
+                    // the scissor rect clips partial rows and grid_y_offset positions
+                    // content at sub-cell-height pixel precision for smooth scrolling.
                     const padding_top = self.size.padding.top;
                     const screen_h = self.size.screen.height;
                     const cell_h_vp = self.grid_metrics.cell_height;
                     const doc_h = state.total_doc_height_px;
-                    const viewport_h: u32 = @as(u32, @intCast(row_len)) * cell_h_vp;
+                    // Use rows * cell_height to match Terminal.height_px, which is
+                    // the same value used by BlockLayout for scroll calculations.
+                    const viewport_h: u32 = @as(u32, state.rows) * cell_h_vp;
                     const scroll_px = state.scroll_offset_px;
 
                     const viewport_top_px: i64 = @max(0, @as(i64, @intCast(doc_h)) -
                         @as(i64, @intCast(viewport_h)) -
                         @as(i64, @intCast(scroll_px)));
 
-                    // log.debug("rebuildCells_blocks: n_blocks={} doc_h={} vp_h={} scroll={} vp_top={} cell_h={} screen_h={} pad_top={} row_len={}", .{
-                    //     brl.len, doc_h, viewport_h, scroll_px, @as(u32, @intCast(viewport_top_px)), cell_h_vp, screen_h, padding_top, row_len,
-                    // });
+                    const vp_top_u32: u32 = @intCast(viewport_top_px);
 
                     for (brl, 0..) |info, layout_i| {
                         // screen_y = padding_top + (block.virtual_y_px - viewport_top_px)
@@ -3654,14 +3676,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         if (block_bottom_i64 <= 0) continue;
                         if (block_screen_y_i64 >= @as(i64, @intCast(screen_h))) continue;
 
-                        // Clip to screen bounds.
-                        const screen_y: u32 = if (block_screen_y_i64 >= 0)
+                        // Clip to grid area (content starts at padding_top, not screen top).
+                        // This ensures rows sliding into view from above are smoothly
+                        // clipped at the padding boundary, not fully revealed in the
+                        // padding area.
+                        const min_y: i64 = @as(i64, @intCast(padding_top));
+                        const screen_y: u32 = if (block_screen_y_i64 >= min_y)
                             @intCast(block_screen_y_i64)
                         else
-                            0;
+                            @intCast(min_y);
 
-                        const clip_top: u32 = if (block_screen_y_i64 < 0)
-                            @intCast(-block_screen_y_i64)
+                        const clip_top: u32 = if (block_screen_y_i64 < min_y)
+                            @intCast(min_y - block_screen_y_i64)
                         else
                             0;
 
@@ -3670,29 +3696,49 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                         if (height == 0) continue;
 
-                        // Map to cell buffer rows using viewport_first_row from RenderState.
-                        // viewport_first_row is computed during the render state snapshot
-                        // using screen-space coordinates (handles blocks above viewport).
-                        // If maxInt, the block's rows are not in the cell buffer at all
-                        // (the PageList viewport doesn't cover this block), so skip it.
+                        // viewport_first_row is the contiguous cell buffer offset assigned
+                        // by populateBlockRows. maxInt means this block's rows weren't
+                        // populated (block not visible).
                         if (info.viewport_first_row == std.math.maxInt(u16)) continue;
                         const first_row: u16 = info.viewport_first_row;
 
-                        // Compute how many rows of this block to render.
-                        // rows_above: rows of this block that are above the viewport
-                        // (only non-zero when the block starts above viewport_top_px).
-                        const visible_rc: u16 = @intCast(@min(info.visible_rows, std.math.maxInt(u16)));
-                        const vp_top_u32: u32 = @intCast(viewport_top_px);
-                        const rows_above: u16 = if (info.virtual_y_px < vp_top_u32 and cell_h_vp > 0)
-                            @intCast(@min((vp_top_u32 - info.virtual_y_px) / cell_h_vp, std.math.maxInt(u16)))
-                        else
-                            0;
-                        const display_rc: u16 = visible_rc -| rows_above;
+                        // Row count and skip values: use pre-computed values from
+                        // populateBlockRows when available (block-aware path) to
+                        // ensure perfect consistency between cell buffer population
+                        // and rendering. Falls back to recomputation for the
+                        // standard (non-block-layout) path.
+                        const rows_above: u32 = if (info.viewport_row_count > 0)
+                            info.viewport_rows_skipped_top
+                        else blk: {
+                            const px_above: u32 = if (info.virtual_y_px < vp_top_u32)
+                                vp_top_u32 - info.virtual_y_px
+                            else
+                                0;
+                            break :blk if (cell_h_vp > 0) px_above / cell_h_vp else 0;
+                        };
+                        const display_rc: u16 = if (info.viewport_row_count > 0)
+                            @min(info.viewport_row_count, @as(u16, @intCast(@min(
+                                @as(usize, row_len) -| @as(usize, first_row),
+                                std.math.maxInt(u16),
+                            ))))
+                        else blk: {
+                            const visible_rc: u16 = @intCast(@min(info.visible_rows -| rows_above, std.math.maxInt(u16)));
+                            const max_rows: u16 = @intCast(@min(
+                                @as(usize, row_len) -| @as(usize, first_row),
+                                std.math.maxInt(u16),
+                            ));
+                            break :blk @min(visible_rc, max_rows);
+                        };
 
-                        // Grid Y offset: the shader needs to know where this block
-                        // sits relative to the grid origin.
-                        const grid_y: f32 = @as(f32, @floatFromInt(screen_y)) -
-                            @as(f32, @floatFromInt(padding_top));
+                        // Grid Y offset: pixel-precise position for the first rendered
+                        // row. The block's virtual_y_px + rows_above * cell_h gives the
+                        // pixel position of the first row in the cell buffer. Subtracting
+                        // viewport_top_px converts to screen space. This naturally handles
+                        // sub-cell-height offsets for smooth scrolling — the scissor rect
+                        // clips partial rows at the top and bottom.
+                        const grid_y: f32 = @as(f32, @floatFromInt(info.virtual_y_px)) -
+                            @as(f32, @floatFromInt(vp_top_u32)) +
+                            @as(f32, @floatFromInt(rows_above * cell_h_vp));
 
                         const hidden: u16 = @intCast(@min(info.hiddenLines(), std.math.maxInt(u16)));
 
@@ -3838,8 +3884,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // Populate scratch rows for separator and per-row stripes.
+            // sep_row is the index of the first scratch row, after all content rows.
+            const sep_row: usize = content_rows;
             if (scratch_rows > 0) {
-                const sep_row: usize = state.rows;
                 const cols_u: usize = state.cols;
 
                 // Scratch row for separator: all columns use config separator color.

@@ -2073,100 +2073,17 @@ fn applyBlockScrollDelta(self: *Terminal, delta: i64) void {
 
 /// Synchronize the PageList viewport with scroll_offset_px.
 ///
-/// The cell buffer (used by the renderer) is populated from the PageList
-/// viewport rows. When BlockLayout drives scrolling via scroll_offset_px,
-/// we must keep the PageList viewport approximately in sync so the cell
-/// buffer contains the rows that are actually visible on screen.
-///
-/// When following (scroll_offset_px == 0), the viewport is reset to the
-/// active area (bottom). Otherwise, we find the block at the top of the
-/// visible area and scroll the PageList to its prompt_start pin.
+/// With block-aware rendering, the cell buffer is populated directly from
+/// block pins in RenderState.populateBlockRows(), decoupled from the
+/// PageList viewport. The PageList viewport is kept pinned at the active
+/// area so the cursor is always accessible. No row-offset computation is
+/// needed here — that's handled entirely by the renderer.
 pub fn syncPageListViewport(self: *Terminal) void {
-    const layout = &(self.block_layout orelse return);
-    layout.ensureValid();
-
-    // When following (scroll_offset_px == 0), keep the PageList viewport at
-    // the active area (bottom). This ensures the cursor is always in the cell
-    // buffer, even when collapsed blocks have many hidden rows that would
-    // otherwise consume cell buffer slots.
-    if (self.scroll_offset_px == 0) {
-        self.screens.active.scroll(.{ .active = {} });
-        return;
-    }
-
-    const doc_h = layout.total_height_px;
-    const viewport_h = self.height_px;
-
-    // viewport_top_px: virtual Y at the top of the visible area.
-    const viewport_top_px: u32 = if (doc_h > viewport_h + self.scroll_offset_px)
-        doc_h - viewport_h - self.scroll_offset_px
-    else
-        0;
-
-    // Find the first block that overlaps the viewport.
-    const range = layout.viewportBlockRange(viewport_top_px, viewport_h);
-    if (range.start_idx >= layout.block_offsets.items.len) {
-        // No blocks visible — stay at active.
-        self.screens.active.scroll(.{ .active = {} });
-        return;
-    }
-
-    const cell_h: u32 = if (self.rows > 0 and viewport_h > 0)
-        viewport_h / @as(u32, self.rows)
-    else
-        16;
-
-    // Find the first block whose content actually overlaps the viewport.
-    // viewportBlockRange may return a block whose content is above viewport_top
-    // (only its trailing gap overlaps). Starting the PageList viewport at such
-    // a block wastes rows on content above the screen, potentially pushing
-    // later blocks' rows past the cell buffer boundary.
-    const items = layout.block_offsets.items;
-    var effective_start = range.start_idx;
-    var row_offset: u32 = 0;
-
-    while (effective_start < range.end_idx) {
-        const info = items[effective_start];
-        const content_end_px = info.virtual_y_px + info.visible_height_px;
-        if (content_end_px > viewport_top_px) {
-            // This block has content in the viewport.
-            const px_into_block: u32 = if (viewport_top_px > info.virtual_y_px)
-                viewport_top_px - info.virtual_y_px
-            else
-                0;
-            row_offset = if (cell_h > 0) px_into_block / cell_h else 0;
-            break;
-        }
-        // Block's content is entirely above viewport_top — skip it.
-        effective_start += 1;
-    }
-
-    if (effective_start >= items.len) {
-        // No blocks with visible content — stay at active.
-        self.screens.active.scroll(.{ .active = {} });
-        return;
-    }
-
-    const info = items[effective_start];
-
-    // Count total content rows we need across all visible blocks.
-    var total_visible_content_rows: u32 = 0;
-    for (items[effective_start..@min(range.end_idx, items.len)]) |blk_info| {
-        total_visible_content_rows += blk_info.visible_rows;
-    }
-
-    // log.debug("syncPageListViewport: doc_h={} vp_h={} scroll={} vp_top={} range=[{},{}] eff_start={} total_visible_rows={} grid_rows={} row_offset={}", .{
-    //     doc_h, viewport_h, self.scroll_offset_px, viewport_top_px,
-    //     range.start_idx, range.end_idx, effective_start, total_visible_content_rows, self.rows, row_offset,
-    // });
-
-    // Get a pin at that row in the block and scroll the PageList to it.
-    if (layout.pinAtBlockRow(info.block_list_index, row_offset)) |pin| {
-        self.screens.active.scroll(.{ .pin = pin });
-    } else {
-        // Fallback: scroll to the block's prompt start.
-        self.screens.active.scroll(.{ .pin = info.prompt_start_pin });
-    }
+    if (self.block_layout == null) return;
+    // Always keep the PageList viewport at the active area (bottom).
+    // The block-aware renderer fetches rows directly from block pins,
+    // independent of the PageList viewport position.
+    self.screens.active.scroll(.{ .active = {} });
 }
 
 /// To be called before shifting a row (as in insertLines and deleteLines)

@@ -103,6 +103,16 @@ pub const RenderState = struct {
     block_layout_cell_height: u32 = 0,
     block_layout_gap_px: u32 = 0,
 
+    /// Number of rows actually populated in row_data for block-aware rendering.
+    /// When block_layout is active, row_data may hold more or fewer rows than
+    /// self.rows (the terminal grid height). The renderer uses this as row_len
+    /// instead of self.rows. 0 means use self.rows (standard viewport path).
+    block_cell_row_count: u32 = 0,
+
+    /// Temporary buffer used during update() to communicate per-block cell
+    /// buffer offsets from populateBlockRows to the block_render_list builder.
+    block_render_info_buf: std.ArrayListUnmanaged(BlockCellBufInfo) = .empty,
+
     /// Index into BlockList.blocks of the highlighted block, or null
     /// if no block is currently highlighted. Matches Terminal.highlighted_block_idx.
     highlighted_block_idx: ?usize = null,
@@ -305,6 +315,10 @@ pub const RenderState = struct {
         /// First row of this block in the cell buffer (viewport-relative).
         /// Set to max(u16) if the block's prompt_start is not in the viewport.
         viewport_first_row: u16 = std.math.maxInt(u16),
+        /// Number of rows populated in the cell buffer for this block.
+        viewport_row_count: u16 = 0,
+        /// Number of rows skipped at top due to viewport clipping.
+        viewport_rows_skipped_top: u16 = 0,
 
         pub fn hiddenLines(self: BlockRenderInfo) u32 {
             return self.total_rows -| self.visible_rows;
@@ -315,6 +329,18 @@ pub const RenderState = struct {
         selection: Selection,
         tl_pin: PageList.Pin,
         br_pin: PageList.Pin,
+    };
+
+    /// Per-block cell buffer mapping computed by populateBlockRows.
+    pub const BlockCellBufInfo = struct {
+        /// Index into BlockLayout.block_offsets / block_render_list.
+        layout_idx: usize,
+        /// First row in the cell buffer for this block's content.
+        cell_buf_row: u16,
+        /// Number of rows populated for this block.
+        row_count: u16,
+        /// Number of rows skipped at the top (for partial clip above viewport).
+        rows_skipped_top: u16,
     };
 
     pub fn deinit(self: *RenderState, alloc: Allocator) void {
@@ -328,6 +354,7 @@ pub const RenderState = struct {
         }
         self.row_data.deinit(alloc);
         self.block_render_list.deinit(alloc);
+        self.block_render_info_buf.deinit(alloc);
         self.filter_input_text.deinit(alloc);
     }
 
@@ -375,6 +402,12 @@ pub const RenderState = struct {
                 if (!old.eql(viewport_pin)) break :redraw true;
             }
 
+            // If the block scroll offset changed, we need a full rebuild
+            // because block-aware row population depends on scroll position.
+            if (t.block_layout != null and self.scroll_offset_px != t.scroll_offset_px) {
+                break :redraw true;
+            }
+
             break :redraw false;
         };
 
@@ -414,22 +447,26 @@ pub const RenderState = struct {
             }
         }
 
-        // Ensure our row length is exactly our height, freeing or allocating
-        // data as necessary. In most cases we'll have a perfectly matching
-        // size.
-        if (self.row_data.len != self.rows) {
+        // Determine the number of rows to populate in the cell buffer.
+        // When block_layout is active, we populate rows from block pins
+        // (decoupled from the PageList viewport) to enable true per-pixel
+        // smooth scrolling. The cell buffer size may differ from self.rows.
+        const use_block_rows = t.block_layout != null;
+        const needed_rows: size.CellCountInt = if (use_block_rows)
+            self.blockCellRowCount(t)
+        else
+            self.rows;
+
+        // Ensure our row length matches what we need.
+        if (self.row_data.len != needed_rows) {
             @branchHint(.unlikely);
 
-            if (self.row_data.len < self.rows) {
-                // Resize our rows to the desired length, marking any added
-                // values undefined.
+            if (self.row_data.len < needed_rows) {
                 const old_len = self.row_data.len;
-                try self.row_data.resize(alloc, self.rows);
+                try self.row_data.resize(alloc, needed_rows);
 
-                // Initialize all our values. Its faster to use slice() + set()
-                // because appendAssumeCapacity does this multiple times.
                 var row_data = self.row_data.slice();
-                for (old_len..self.rows) |y| {
+                for (old_len..needed_rows) |y| {
                     row_data.set(y, .{
                         .arena = .{},
                         .pin = undefined,
@@ -443,14 +480,14 @@ pub const RenderState = struct {
             } else {
                 const row_data = self.row_data.slice();
                 for (
-                    row_data.items(.arena)[self.rows..],
-                    row_data.items(.cells)[self.rows..],
+                    row_data.items(.arena)[needed_rows..],
+                    row_data.items(.cells)[needed_rows..],
                 ) |state, *cell| {
                     var arena: ArenaAllocator = state.promote(alloc);
                     arena.deinit();
                     cell.deinit(alloc);
                 }
-                self.row_data.shrinkRetainingCapacity(self.rows);
+                self.row_data.shrinkRetainingCapacity(needed_rows);
             }
         }
 
@@ -464,169 +501,140 @@ pub const RenderState = struct {
         const row_highlights = row_data.items(.highlights);
         const row_dirties = row_data.items(.dirty);
 
-        // Track the last page that we know was dirty. This lets us
-        // more quickly do the full-page dirty check.
+        var any_dirty: bool = false;
         var last_dirty_page: ?*page.Page = null;
 
-        // Go through and setup our rows.
-        var row_it = s.pages.rowIterator(
-            .right_down,
-            .{ .viewport = .{} },
-            null,
-        );
-        var y: size.CellCountInt = 0;
-        var any_dirty: bool = false;
-        while (row_it.next()) |row_pin| : (y = y + 1) {
-            // Find our cursor if we haven't found it yet. We do this even
-            // if the row is not dirty because the cursor is unrelated.
-            if (self.cursor.viewport == null and
-                row_pin.node == s.cursor.page_pin.node and
-                row_pin.y == s.cursor.page_pin.y)
-            {
-                self.cursor.viewport = .{
-                    .y = y,
-                    .x = s.cursor.x,
-
-                    // Future: we should use our own state here to look this
-                    // up rather than calling this.
-                    .wide_tail = if (s.cursor.x > 0)
-                        s.cursorCellLeft(1).wide == .wide
-                    else
-                        false,
-                };
-            }
-
-            // Store our pin. We have to store these even if we're not dirty
-            // because dirty is only a renderer optimization. It doesn't
-            // apply to memory movement. This will let us remap any cell
-            // pins back to an exact entry in our RenderState.
-            row_pins[y] = row_pin;
-
-            // Get all our cells in the page.
-            const p: *page.Page = &row_pin.node.data;
-            const page_rac = row_pin.rowAndCell();
-
-            dirty: {
-                // If we're redrawing then we're definitely dirty.
-                if (redraw) break :dirty;
-
-                // If our page is the same as last time then its dirty.
-                if (p == last_dirty_page) break :dirty;
-                if (p.dirty) {
-                    // If this page is dirty then clear the dirty flag
-                    // of the last page and then store this one. This benchmarks
-                    // faster than iterating pages again later.
-                    if (last_dirty_page) |last_p| last_p.dirty = false;
-                    last_dirty_page = p;
-                    break :dirty;
-                }
-
-                // If our row is dirty then we're dirty.
-                if (page_rac.row.dirty) break :dirty;
-
-                // Not dirty!
-                continue;
-            }
-
-            // Set that at least one row was dirty.
-            any_dirty = true;
-
-            // Clear our row dirty, we'll clear our page dirty later.
-            // We can't clear it now because we have more rows to go through.
-            page_rac.row.dirty = false;
-
-            // Promote our arena. State is copied by value so we need to
-            // restore it on all exit paths so we don't leak memory.
-            var arena = row_arenas[y].promote(alloc);
-            defer row_arenas[y] = arena.state;
-
-            // Reset our cells if we're rebuilding this row.
-            if (row_cells[y].len > 0) {
-                _ = arena.reset(.retain_capacity);
-                row_cells[y].clearRetainingCapacity();
-                row_sels[y] = null;
-                row_highlights[y] = .empty;
-            }
-            row_dirties[y] = true;
-
-            // Get all our cells in the page.
-            const page_cells: []const page.Cell = p.getCells(page_rac.row);
-            assert(page_cells.len == self.cols);
-
-            // Copy our raw row data
-            row_rows[y] = page_rac.row.*;
-
-            // Note: our cells MultiArrayList uses our general allocator.
-            // We do this on purpose because as rows become dirty, we do
-            // not want to reallocate space for cells (which are large). This
-            // was a source of huge slowdown.
-            //
-            // Our per-row arena is only used for temporary allocations
-            // pertaining to cells directly (e.g. graphemes, hyperlinks).
-            const cells: *std.MultiArrayList(Cell) = &row_cells[y];
-            try cells.resize(alloc, self.cols);
-
-            // We always copy our raw cell data. In the case we have no
-            // managed memory, we can skip setting any other fields.
-            //
-            // This is an important optimization. For plain-text screens
-            // this ends up being something around 300% faster based on
-            // the `screen-clone` benchmark.
-            const cells_slice = cells.slice();
-            fastmem.copy(
-                page.Cell,
-                cells_slice.items(.raw),
-                page_cells,
+        if (use_block_rows) {
+            // ── Block-aware row population ──────────────────────────────
+            // Populate row_data directly from block pins, decoupled from
+            // the PageList viewport. This enables true per-pixel scrolling
+            // because the cell buffer contains exactly the rows needed by
+            // each visible block (including +1 partial rows for clipping).
+            any_dirty = try self.populateBlockRows(
+                alloc,
+                t,
+                redraw,
+                needed_rows,
+                row_arenas,
+                row_pins,
+                row_rows,
+                row_cells,
+                row_sels,
+                row_highlights,
+                row_dirties,
+                s,
             );
-            if (!page_rac.row.managedMemory()) continue;
+        } else {
+            // ── Standard viewport row population (unchanged) ───────────
 
-            const arena_alloc = arena.allocator();
-            const cells_grapheme = cells_slice.items(.grapheme);
-            const cells_style = cells_slice.items(.style);
-            for (page_cells, 0..) |*page_cell, x| {
-                // Append assuming its a single-codepoint, styled cell
-                // (most common by far).
-                if (page_cell.style_id > 0) cells_style[x] = p.styles.get(
-                    p.memory,
-                    page_cell.style_id,
-                ).*;
+            // Go through and setup our rows.
+            var row_it = s.pages.rowIterator(
+                .right_down,
+                .{ .viewport = .{} },
+                null,
+            );
+            var y: size.CellCountInt = 0;
+            while (row_it.next()) |row_pin| : (y = y + 1) {
+                // Find our cursor if we haven't found it yet.
+                if (self.cursor.viewport == null and
+                    row_pin.node == s.cursor.page_pin.node and
+                    row_pin.y == s.cursor.page_pin.y)
+                {
+                    self.cursor.viewport = .{
+                        .y = y,
+                        .x = s.cursor.x,
+                        .wide_tail = if (s.cursor.x > 0)
+                            s.cursorCellLeft(1).wide == .wide
+                        else
+                            false,
+                    };
+                }
 
-                // Switch on our content tag to handle less likely cases.
-                switch (page_cell.content_tag) {
-                    .codepoint => {
-                        @branchHint(.likely);
-                        // Primary codepoint goes into `raw` field.
-                    },
+                row_pins[y] = row_pin;
 
-                    // If we have a multi-codepoint grapheme, look it up and
-                    // set our content type.
-                    .codepoint_grapheme => {
-                        @branchHint(.unlikely);
-                        cells_grapheme[x] = try arena_alloc.dupe(
-                            u21,
-                            p.lookupGrapheme(page_cell) orelse &.{},
-                        );
-                    },
+                const p: *page.Page = &row_pin.node.data;
+                const page_rac = row_pin.rowAndCell();
 
-                    .bg_color_rgb => {
-                        @branchHint(.unlikely);
-                        cells_style[x] = .{ .bg_color = .{ .rgb = .{
-                            .r = page_cell.content.color_rgb.r,
-                            .g = page_cell.content.color_rgb.g,
-                            .b = page_cell.content.color_rgb.b,
-                        } } };
-                    },
+                dirty: {
+                    if (redraw) break :dirty;
+                    if (p == last_dirty_page) break :dirty;
+                    if (p.dirty) {
+                        if (last_dirty_page) |last_p| last_p.dirty = false;
+                        last_dirty_page = p;
+                        break :dirty;
+                    }
+                    if (page_rac.row.dirty) break :dirty;
+                    continue;
+                }
 
-                    .bg_color_palette => {
-                        @branchHint(.unlikely);
-                        cells_style[x] = .{ .bg_color = .{
-                            .palette = page_cell.content.color_palette,
-                        } };
-                    },
+                any_dirty = true;
+                page_rac.row.dirty = false;
+
+                var arena = row_arenas[y].promote(alloc);
+                defer row_arenas[y] = arena.state;
+
+                if (row_cells[y].len > 0) {
+                    _ = arena.reset(.retain_capacity);
+                    row_cells[y].clearRetainingCapacity();
+                    row_sels[y] = null;
+                    row_highlights[y] = .empty;
+                }
+                row_dirties[y] = true;
+
+                const page_cells: []const page.Cell = p.getCells(page_rac.row);
+                assert(page_cells.len == self.cols);
+                row_rows[y] = page_rac.row.*;
+
+                const cells: *std.MultiArrayList(Cell) = &row_cells[y];
+                try cells.resize(alloc, self.cols);
+
+                const cells_slice = cells.slice();
+                fastmem.copy(
+                    page.Cell,
+                    cells_slice.items(.raw),
+                    page_cells,
+                );
+                if (!page_rac.row.managedMemory()) continue;
+
+                const arena_alloc = arena.allocator();
+                const cells_grapheme = cells_slice.items(.grapheme);
+                const cells_style = cells_slice.items(.style);
+                for (page_cells, 0..) |*page_cell, x| {
+                    if (page_cell.style_id > 0) cells_style[x] = p.styles.get(
+                        p.memory,
+                        page_cell.style_id,
+                    ).*;
+
+                    switch (page_cell.content_tag) {
+                        .codepoint => {
+                            @branchHint(.likely);
+                        },
+                        .codepoint_grapheme => {
+                            @branchHint(.unlikely);
+                            cells_grapheme[x] = try arena_alloc.dupe(
+                                u21,
+                                p.lookupGrapheme(page_cell) orelse &.{},
+                            );
+                        },
+                        .bg_color_rgb => {
+                            @branchHint(.unlikely);
+                            cells_style[x] = .{ .bg_color = .{ .rgb = .{
+                                .r = page_cell.content.color_rgb.r,
+                                .g = page_cell.content.color_rgb.g,
+                                .b = page_cell.content.color_rgb.b,
+                            } } };
+                        },
+                        .bg_color_palette => {
+                            @branchHint(.unlikely);
+                            cells_style[x] = .{ .bg_color = .{
+                                .palette = page_cell.content.color_palette,
+                            } };
+                        },
+                    }
                 }
             }
+            assert(y == self.rows);
         }
-        assert(y == self.rows);
 
         // Pass per-pixel scroll offset for block mode.
         self.scroll_offset_px = t.scroll_offset_px;
@@ -691,55 +699,83 @@ pub const RenderState = struct {
                 self.dirty = .full;
             }
 
-            // Copy layout data and compute viewport_first_row for each block.
-            // We use screen-space coordinates to handle blocks above the viewport:
-            // get the viewport top-left's screen row, then for each block compute
-            // (block_screen_row - viewport_screen_row) to get the viewport-relative row.
-            const vp_screen_y: usize = if (s.pages.pointFromPin(.screen, viewport_pin)) |pt|
-                pt.screen.y
-            else
-                0;
-
+            // Copy layout data to block_render_list.
+            // viewport_first_row is assigned by populateBlockRows (contiguous
+            // cell buffer offsets) when block-aware rows are active. For the
+            // fallback path, compute from PageList viewport coordinates.
             self.block_render_list.clearRetainingCapacity();
             self.block_render_list.ensureTotalCapacity(alloc, src.len) catch {};
-            for (src) |info| {
-                // Find where this block's prompt_start is in the cell buffer (viewport).
-                // Use screen coordinates and subtract viewport top to handle blocks
-                // that start above the viewport (where pointFromPin(.viewport) returns null).
-                const vp_row: u16 = vp_row_calc: {
-                    const screen_pt = s.pages.pointFromPin(.screen, info.prompt_start_pin) orelse
-                        break :vp_row_calc std.math.maxInt(u16);
-                    const block_screen_y: usize = screen_pt.screen.y;
-                    if (block_screen_y >= vp_screen_y) {
-                        // Block starts at or below viewport top.
-                        const offset = block_screen_y - vp_screen_y;
-                        if (offset >= self.rows) {
-                            // Block starts past the cell buffer — mark as not in viewport.
-                            break :vp_row_calc std.math.maxInt(u16);
-                        }
-                        break :vp_row_calc @intCast(@min(offset, std.math.maxInt(u16) - 1));
-                    } else {
-                        // Block starts above viewport. Return 0; the renderer will
-                        // use clip_top_rows to handle the partial visibility.
-                        break :vp_row_calc 0;
-                    }
-                };
 
-                self.block_render_list.append(alloc, .{
-                    .virtual_y_px = info.virtual_y_px,
-                    .visible_height_px = info.visible_height_px,
-                    .visible_rows = info.visible_rows,
-                    .total_rows = info.total_rows,
-                    .output_row_offset = info.output_row_offset,
-                    .exit_code = info.exit_code,
-                    .collapsed = info.collapsed,
-                    .block_list_index = info.block_list_index,
-                    .prompt_start_pin = info.prompt_start_pin,
-                    .total_extent_px = info.total_extent_px,
-                    .filtered = info.filtered,
-                    .filter_match_rows = info.filter_match_rows,
-                    .viewport_first_row = vp_row,
-                }) catch {};
+            if (use_block_rows) {
+                // Block-aware path: viewport_first_row was already set by
+                // populateBlockRows via block_render_info_buf. Copy here.
+                for (src) |info| {
+                    self.block_render_list.append(alloc, .{
+                        .virtual_y_px = info.virtual_y_px,
+                        .visible_height_px = info.visible_height_px,
+                        .visible_rows = info.visible_rows,
+                        .total_rows = info.total_rows,
+                        .output_row_offset = info.output_row_offset,
+                        .exit_code = info.exit_code,
+                        .collapsed = info.collapsed,
+                        .block_list_index = info.block_list_index,
+                        .prompt_start_pin = info.prompt_start_pin,
+                        .total_extent_px = info.total_extent_px,
+                        .filtered = info.filtered,
+                        .filter_match_rows = info.filter_match_rows,
+                        // Will be overwritten below from block_render_info_buf
+                        .viewport_first_row = std.math.maxInt(u16),
+                    }) catch {};
+                }
+                // Overwrite viewport_first_row for visible blocks from our
+                // pre-computed buffer. populateBlockRows stored these in
+                // block_render_info_buf keyed by layout index.
+                for (self.block_render_info_buf.items) |bri| {
+                    if (bri.layout_idx < self.block_render_list.items.len) {
+                        self.block_render_list.items[bri.layout_idx].viewport_first_row = bri.cell_buf_row;
+                        self.block_render_list.items[bri.layout_idx].viewport_row_count = bri.row_count;
+                        self.block_render_list.items[bri.layout_idx].viewport_rows_skipped_top = bri.rows_skipped_top;
+                    }
+                }
+            } else {
+                // Standard path: compute viewport_first_row from PageList viewport.
+                const vp_screen_y: usize = if (s.pages.pointFromPin(.screen, viewport_pin)) |pt|
+                    pt.screen.y
+                else
+                    0;
+
+                for (src) |info| {
+                    const vp_row: u16 = vp_row_calc: {
+                        const screen_pt = s.pages.pointFromPin(.screen, info.prompt_start_pin) orelse
+                            break :vp_row_calc std.math.maxInt(u16);
+                        const block_screen_y: usize = screen_pt.screen.y;
+                        if (block_screen_y >= vp_screen_y) {
+                            const offset = block_screen_y - vp_screen_y;
+                            if (offset >= self.rows) {
+                                break :vp_row_calc std.math.maxInt(u16);
+                            }
+                            break :vp_row_calc @intCast(@min(offset, std.math.maxInt(u16) - 1));
+                        } else {
+                            break :vp_row_calc 0;
+                        }
+                    };
+
+                    self.block_render_list.append(alloc, .{
+                        .virtual_y_px = info.virtual_y_px,
+                        .visible_height_px = info.visible_height_px,
+                        .visible_rows = info.visible_rows,
+                        .total_rows = info.total_rows,
+                        .output_row_offset = info.output_row_offset,
+                        .exit_code = info.exit_code,
+                        .collapsed = info.collapsed,
+                        .block_list_index = info.block_list_index,
+                        .prompt_start_pin = info.prompt_start_pin,
+                        .total_extent_px = info.total_extent_px,
+                        .filtered = info.filtered,
+                        .filter_match_rows = info.filter_match_rows,
+                        .viewport_first_row = vp_row,
+                    }) catch {};
+                }
             }
             self.total_doc_height_px = layout.total_height_px;
             self.block_layout_cell_height = layout.config.cell_height;
@@ -752,6 +788,8 @@ pub const RenderState = struct {
             self.filter_input_block_idx = null;
             self.filter_input_text.clearRetainingCapacity();
             self.block_render_list.clearRetainingCapacity();
+            self.block_render_info_buf.clearRetainingCapacity();
+            self.block_cell_row_count = 0;
             self.total_doc_height_px = 0;
             self.block_layout_cell_height = 0;
             self.block_layout_gap_px = 0;
@@ -850,6 +888,230 @@ pub const RenderState = struct {
         // Clear our dirty flags
         t.flags.dirty = .{};
         s.dirty = .{};
+    }
+
+    /// Compute the total number of cell buffer rows needed for block-aware
+    /// rendering. For each visible block, we include all rows from the first
+    /// partially-visible row to the end of the block. Rows below the viewport
+    /// are kept in the buffer (clipped by the GPU scissor rect) to avoid
+    /// grey/empty row artifacts.
+    fn blockCellRowCount(self: *const RenderState, t: *Terminal) size.CellCountInt {
+        const layout = &(t.block_layout orelse return self.rows);
+        layout.ensureValid();
+
+        const cell_h = layout.config.cell_height;
+        if (cell_h == 0) return self.rows;
+
+        const doc_h = layout.total_height_px;
+        const viewport_h = t.height_px;
+        const scroll_px = t.scroll_offset_px;
+
+        const viewport_top_px: u32 = if (doc_h > viewport_h + scroll_px)
+            doc_h - viewport_h - scroll_px
+        else
+            0;
+
+        const range = layout.viewportBlockRange(viewport_top_px, viewport_h);
+        const items = layout.block_offsets.items;
+
+        var total: u32 = 0;
+        for (items[range.start_idx..@min(range.end_idx, items.len)]) |info| {
+            // Skip rows fully above the viewport. Floor division means
+            // the partially-visible row at the boundary is always included.
+            const px_above: u32 = if (info.virtual_y_px < viewport_top_px)
+                viewport_top_px - info.virtual_y_px
+            else
+                0;
+            const rows_skip: u32 = if (cell_h > 0) px_above / cell_h else 0;
+            const rows_in_buffer: u32 = info.visible_rows -| rows_skip;
+            total += rows_in_buffer;
+        }
+
+        // Ensure at least self.rows so the cell buffer is never smaller than
+        // the grid (needed for cursor rendering and scratch row indexing).
+        // Clamp to a reasonable size. The renderer can handle at most u16 rows.
+        return @intCast(@min(@max(total, self.rows), std.math.maxInt(size.CellCountInt)));
+    }
+
+    /// Populate row_data from block pins for all visible blocks.
+    /// Returns true if any rows were dirty.
+    ///
+    /// This decouples cell buffer population from the PageList viewport,
+    /// enabling true per-pixel smooth scrolling. Each visible block's rows
+    /// are placed contiguously in the cell buffer. The block_render_info_buf
+    /// records the cell buffer offset for each block so the renderer knows
+    /// where each block's data starts.
+    fn populateBlockRows(
+        self: *RenderState,
+        alloc: Allocator,
+        t: *Terminal,
+        redraw: bool,
+        needed_rows: size.CellCountInt,
+        row_arenas: []ArenaAllocator.State,
+        row_pins: []PageList.Pin,
+        row_rows: []page.Row,
+        row_cells: []std.MultiArrayList(Cell),
+        row_sels: []?[2]size.CellCountInt,
+        row_highlights: []std.ArrayList(Highlight),
+        row_dirties: []bool,
+        s: *Screen,
+    ) Allocator.Error!bool {
+        const layout = &(t.block_layout orelse return false);
+        layout.ensureValid();
+
+        const cell_h = layout.config.cell_height;
+        if (cell_h == 0) return false;
+
+        const doc_h = layout.total_height_px;
+        const viewport_h = t.height_px;
+        const scroll_px = t.scroll_offset_px;
+
+        const viewport_top_px: u32 = if (doc_h > viewport_h + scroll_px)
+            doc_h - viewport_h - scroll_px
+        else
+            0;
+
+        const range = layout.viewportBlockRange(viewport_top_px, viewport_h);
+        const items = layout.block_offsets.items;
+
+        self.block_render_info_buf.clearRetainingCapacity();
+        self.block_cell_row_count = 0;
+
+        var cell_buf_offset: u16 = 0;
+        var any_dirty: bool = false;
+
+        for (items[range.start_idx..@min(range.end_idx, items.len)], range.start_idx..) |info, layout_idx| {
+            // Skip rows fully above the viewport. Floor division means
+            // the partially-visible row at the boundary is always included.
+            const px_above: u32 = if (info.virtual_y_px < viewport_top_px)
+                viewport_top_px - info.virtual_y_px
+            else
+                0;
+            const rows_skip_top: u32 = if (cell_h > 0) px_above / cell_h else 0;
+
+            const rows_in_buffer: u16 = @intCast(@min(
+                info.visible_rows -| rows_skip_top,
+                @as(u32, needed_rows) -| @as(u32, cell_buf_offset),
+            ));
+
+            if (rows_in_buffer == 0) continue;
+
+            // Record this block's cell buffer mapping.
+            self.block_render_info_buf.append(alloc, .{
+                .layout_idx = layout_idx,
+                .cell_buf_row = cell_buf_offset,
+                .row_count = rows_in_buffer,
+                .rows_skipped_top = @intCast(@min(rows_skip_top, std.math.maxInt(u16))),
+            }) catch {};
+
+            // Iterate rows from the block's pin, starting at rows_skip_top.
+            const block_idx = info.block_list_index;
+            if (layout.pinAtBlockRow(block_idx, rows_skip_top)) |start_pin| {
+                var row_it = start_pin.rowIterator(.right_down, null);
+                var local: u16 = 0;
+                while (row_it.next()) |row_pin| {
+                    if (local >= rows_in_buffer) break;
+                    const y = cell_buf_offset + local;
+                    if (y >= needed_rows) break;
+
+                    // Check for cursor in this row.
+                    if (self.cursor.viewport == null and
+                        row_pin.node == s.cursor.page_pin.node and
+                        row_pin.y == s.cursor.page_pin.y)
+                    {
+                        self.cursor.viewport = .{
+                            .y = y,
+                            .x = s.cursor.x,
+                            .wide_tail = if (s.cursor.x > 0)
+                                s.cursorCellLeft(1).wide == .wide
+                            else
+                                false,
+                        };
+                    }
+
+                    row_pins[y] = row_pin;
+
+                    const p_page: *page.Page = &row_pin.node.data;
+                    const page_rac = row_pin.rowAndCell();
+
+                    // For block-aware path, always treat as dirty on redraw
+                    // (block rows may have shifted in the cell buffer).
+                    const is_dirty = redraw or p_page.dirty or page_rac.row.dirty;
+
+                    if (is_dirty) {
+                        any_dirty = true;
+                        page_rac.row.dirty = false;
+
+                        var arena = row_arenas[y].promote(alloc);
+                        defer row_arenas[y] = arena.state;
+
+                        if (row_cells[y].len > 0) {
+                            _ = arena.reset(.retain_capacity);
+                            row_cells[y].clearRetainingCapacity();
+                            row_sels[y] = null;
+                            row_highlights[y] = .empty;
+                        }
+                        row_dirties[y] = true;
+
+                        const page_cells: []const page.Cell = p_page.getCells(page_rac.row);
+                        if (page_cells.len == self.cols) {
+                            row_rows[y] = page_rac.row.*;
+
+                            const cells: *std.MultiArrayList(Cell) = &row_cells[y];
+                            try cells.resize(alloc, self.cols);
+
+                            const cells_slice = cells.slice();
+                            fastmem.copy(
+                                page.Cell,
+                                cells_slice.items(.raw),
+                                page_cells,
+                            );
+
+                            if (page_rac.row.managedMemory()) {
+                                const arena_alloc = arena.allocator();
+                                const cells_grapheme = cells_slice.items(.grapheme);
+                                const cells_style = cells_slice.items(.style);
+                                for (page_cells, 0..) |*page_cell, x| {
+                                    if (page_cell.style_id > 0) cells_style[x] = p_page.styles.get(
+                                        p_page.memory,
+                                        page_cell.style_id,
+                                    ).*;
+
+                                    switch (page_cell.content_tag) {
+                                        .codepoint => {},
+                                        .codepoint_grapheme => {
+                                            cells_grapheme[x] = try arena_alloc.dupe(
+                                                u21,
+                                                p_page.lookupGrapheme(page_cell) orelse &.{},
+                                            );
+                                        },
+                                        .bg_color_rgb => {
+                                            cells_style[x] = .{ .bg_color = .{ .rgb = .{
+                                                .r = page_cell.content.color_rgb.r,
+                                                .g = page_cell.content.color_rgb.g,
+                                                .b = page_cell.content.color_rgb.b,
+                                            } } };
+                                        },
+                                        .bg_color_palette => {
+                                            cells_style[x] = .{ .bg_color = .{
+                                                .palette = page_cell.content.color_palette,
+                                            } };
+                                        },
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    local += 1;
+                }
+            }
+
+            cell_buf_offset += rows_in_buffer;
+        }
+
+        self.block_cell_row_count = cell_buf_offset;
+        return any_dirty;
     }
 
     /// Update the highlights in the render state from the given flattened
