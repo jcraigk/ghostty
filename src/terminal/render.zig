@@ -906,20 +906,22 @@ pub const RenderState = struct {
         const viewport_h = t.height_px;
         const scroll_px = t.scroll_offset_px;
 
-        const viewport_top_px: u32 = if (doc_h > viewport_h + scroll_px)
-            doc_h - viewport_h - scroll_px
+        // Extend viewport by one cell_h on each side to cover window padding.
+        // The renderer's visible area includes padding_top above and padding_bottom
+        // below the grid area, so we need those rows in the cell buffer.
+        const extended_top: u32 = if (doc_h > viewport_h + scroll_px + cell_h)
+            doc_h - viewport_h - scroll_px - cell_h
         else
             0;
+        const extended_h: u32 = viewport_h + cell_h * 2;
 
-        const range = layout.viewportBlockRange(viewport_top_px, viewport_h);
+        const range = layout.viewportBlockRange(extended_top, extended_h);
         const items = layout.block_offsets.items;
 
         var total: u32 = 0;
         for (items[range.start_idx..@min(range.end_idx, items.len)]) |info| {
-            // Skip rows fully above the viewport. Floor division means
-            // the partially-visible row at the boundary is always included.
-            const px_above: u32 = if (info.virtual_y_px < viewport_top_px)
-                viewport_top_px - info.virtual_y_px
+            const px_above: u32 = if (info.virtual_y_px < extended_top)
+                extended_top - info.virtual_y_px
             else
                 0;
             const rows_skip: u32 = if (cell_h > 0) px_above / cell_h else 0;
@@ -966,12 +968,16 @@ pub const RenderState = struct {
         const viewport_h = t.height_px;
         const scroll_px = t.scroll_offset_px;
 
-        const viewport_top_px: u32 = if (doc_h > viewport_h + scroll_px)
-            doc_h - viewport_h - scroll_px
+        // Extend viewport by one cell_h on each side to cover window padding.
+        // The renderer's visible area includes padding_top above and padding_bottom
+        // below the grid area, so we need those rows in the cell buffer.
+        const extended_top: u32 = if (doc_h > viewport_h + scroll_px + cell_h)
+            doc_h - viewport_h - scroll_px - cell_h
         else
             0;
+        const extended_h: u32 = viewport_h + cell_h * 2;
 
-        const range = layout.viewportBlockRange(viewport_top_px, viewport_h);
+        const range = layout.viewportBlockRange(extended_top, extended_h);
         const items = layout.block_offsets.items;
 
         self.block_render_info_buf.clearRetainingCapacity();
@@ -981,10 +987,10 @@ pub const RenderState = struct {
         var any_dirty: bool = false;
 
         for (items[range.start_idx..@min(range.end_idx, items.len)], range.start_idx..) |info, layout_idx| {
-            // Skip rows fully above the viewport. Floor division means
+            // Skip rows fully above the extended viewport. Floor division means
             // the partially-visible row at the boundary is always included.
-            const px_above: u32 = if (info.virtual_y_px < viewport_top_px)
-                viewport_top_px - info.virtual_y_px
+            const px_above: u32 = if (info.virtual_y_px < extended_top)
+                extended_top - info.virtual_y_px
             else
                 0;
             const rows_skip_top: u32 = if (cell_h > 0) px_above / cell_h else 0;

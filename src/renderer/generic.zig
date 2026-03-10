@@ -234,6 +234,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Block regions for per-block scissored rendering.
         /// Populated in rebuildCells from block_render_list.
         block_regions: std.ArrayListUnmanaged(BlockRegion) = .empty,
+        /// Screen Y of the first block below the viewport (for trailing separator).
+        /// null when there's no off-screen block below.
+        next_off_screen_y: ?u32 = null,
+        /// Screen-space bottom (screen_y + height) of the last block above the viewport
+        /// (for leading separator). null when there's no off-screen block above.
+        prev_off_screen_bottom: ?i64 = null,
 
         /// Filter text glyph rendering state (populated in rebuildCells, drawn in drawFrame).
         filter_text_base_instance: usize = 0,
@@ -1943,10 +1949,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             if (region.screen_y_px <= prev_end) break :blk prev_end;
                             const gap_mid = prev_end + (region.screen_y_px - prev_end) / 2;
                             break :blk gap_mid + 2;
+                        } else if (self.prev_off_screen_bottom) |prev_bottom_i64| blk: {
+                            // There's a block above the viewport; extend tint to gap midpoint.
+                            const region_y_i64: i64 = @intCast(region.screen_y_px);
+                            if (region_y_i64 > prev_bottom_i64 + 2) {
+                                const gap_mid_i64 = prev_bottom_i64 + @divTrunc(region_y_i64 - prev_bottom_i64, 2) + 2;
+                                break :blk if (gap_mid_i64 >= 0) @as(u32, @intCast(gap_mid_i64)) else 0;
+                            }
+                            break :blk 0;
                         } else
-                        // First visible block: extend tint/stripe to screen top so the
-                        // window padding area is filled with the block's tint color
-                        // instead of showing a black strip.
+                        // First visible block with no block above: extend tint/stripe
+                        // to screen top so the window padding area is filled.
                             0;
 
                         const vis_bottom: u32 = if (ri + 1 < self.block_regions.items.len) blk: {
@@ -1958,7 +1971,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         } else if (region.exit_code < 0 and ts.scroll_offset_px == 0)
                             // Active block when following: extend tint/stripe to screen bottom.
                             self.size.screen.height
-                        else
+                        else if (self.next_off_screen_y) |next_y| blk: {
+                            // There's a block below the viewport; extend tint to gap midpoint.
+                            const this_end = region.screen_y_px + region.height_px;
+                            if (next_y <= this_end) break :blk this_end;
+                            break :blk @min(this_end + (next_y - this_end) / 2, self.size.screen.height);
+                        } else
                             // Completed block, or active block when scrolled up:
                             // extend only to content + footer padding.
                             @min(region.screen_y_px + region.height_px + self.config.command_blocks_padding_footer, self.size.screen.height);
@@ -2071,6 +2089,64 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         // Only the text overlay (added by addCollapseIndicatorText)
                         // is drawn on top.
 
+                        // Leading separator: gap between an off-screen block above
+                        // and the first visible block.
+                        if (ri == 0) {
+                            if (self.prev_off_screen_bottom) |prev_bottom_i64| {
+                                const region_y_i64: i64 = @intCast(region.screen_y_px);
+                                if (region_y_i64 > prev_bottom_i64 + 2) {
+                                    const gap_mid_i64 = prev_bottom_i64 + @divTrunc(region_y_i64 - prev_bottom_i64, 2);
+                                    if (gap_mid_i64 >= 0 and gap_mid_i64 + 2 <= @as(i64, @intCast(self.size.screen.height))) {
+                                        const gap_mid: u32 = @intCast(gap_mid_i64);
+                                        if (self.config.command_blocks_separator_color != null) {
+                                            pass.step(.{
+                                                .pipeline = self.shaders.pipelines.cell_bg,
+                                                .uniforms = frame.uniforms.buffer,
+                                                .buffers = &.{ null, frame.cells_bg.buffer },
+                                                .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                                .scissor = .{
+                                                    .x = 0,
+                                                    .y = gap_mid,
+                                                    .width = self.size.screen.width,
+                                                    .height = @min(2, self.size.screen.height -| gap_mid),
+                                                },
+                                                .block_params = .{
+                                                    .block_y_offset = 0,
+                                                    .block_first_row = sep_row,
+                                                    .block_x_offset = -pad_left,
+                                                    .block_y_flat = 1.0,
+                                                },
+                                            });
+                                        }
+                                        if (stripe_w > 0 and region.screen_y_px > gap_mid + 2) {
+                                            const cur_sc = self.stripeColor(region.exit_code);
+                                            if (cur_sc[3] > 0) {
+                                                const cur_stripe: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(region.block_idx));
+                                                pass.step(.{
+                                                    .pipeline = self.shaders.pipelines.cell_bg,
+                                                    .uniforms = frame.uniforms.buffer,
+                                                    .buffers = &.{ null, frame.cells_bg.buffer },
+                                                    .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                                    .scissor = .{
+                                                        .x = 0,
+                                                        .y = gap_mid + 2,
+                                                        .width = stripe_w,
+                                                        .height = region.screen_y_px - gap_mid - 2,
+                                                    },
+                                                    .block_params = .{
+                                                        .block_y_offset = 0,
+                                                        .block_first_row = cur_stripe,
+                                                        .block_x_offset = -pad_left,
+                                                        .block_y_flat = 1.0,
+                                                    },
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // Separator + stripe through gap to next block.
                         if (ri > 0) {
                             const prev = self.block_regions.items[ri - 1];
@@ -2149,6 +2225,66 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                                 .block_y_flat = 1.0,
                                             },
                                         });
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Trailing separator: draw the separator in the gap between the
+                    // last visible block and the first off-screen block below the viewport.
+                    // Without this, separators disappear before scrolling off screen.
+                    if (self.next_off_screen_y) |next_y| {
+                        if (self.block_regions.items.len > 0 and self.config.command_blocks_separator_color != null) {
+                            const last_reg = self.block_regions.items[self.block_regions.items.len - 1];
+                            const last_end = last_reg.screen_y_px + last_reg.height_px;
+                            if (next_y > last_end + 2) {
+                                const gap_mid = last_end + (next_y - last_end) / 2;
+                                if (gap_mid + 2 <= self.size.screen.height) {
+                                    pass.step(.{
+                                        .pipeline = self.shaders.pipelines.cell_bg,
+                                        .uniforms = frame.uniforms.buffer,
+                                        .buffers = &.{ null, frame.cells_bg.buffer },
+                                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                        .scissor = .{
+                                            .x = 0,
+                                            .y = gap_mid,
+                                            .width = self.size.screen.width,
+                                            .height = @min(2, self.size.screen.height -| gap_mid),
+                                        },
+                                        .block_params = .{
+                                            .block_y_offset = 0,
+                                            .block_first_row = sep_row,
+                                            .block_x_offset = -pad_left,
+                                            .block_y_flat = 1.0,
+                                        },
+                                    });
+
+                                    // Stripe through trailing gap.
+                                    if (stripe_w > 0) {
+                                        // Footer stripe (last_end to gap_mid).
+                                        const prev_sc = self.stripeColor(last_reg.exit_code);
+                                        if (prev_sc[3] > 0 and gap_mid > last_end) {
+                                            const prev_stripe: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(last_reg.block_idx));
+                                            pass.step(.{
+                                                .pipeline = self.shaders.pipelines.cell_bg,
+                                                .uniforms = frame.uniforms.buffer,
+                                                .buffers = &.{ null, frame.cells_bg.buffer },
+                                                .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                                .scissor = .{
+                                                    .x = 0,
+                                                    .y = last_end,
+                                                    .width = stripe_w,
+                                                    .height = gap_mid - last_end,
+                                                },
+                                                .block_params = .{
+                                                    .block_y_offset = 0,
+                                                    .block_first_row = prev_stripe,
+                                                    .block_x_offset = -pad_left,
+                                                    .block_y_flat = 1.0,
+                                                },
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -3635,6 +3771,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Compute block regions for per-block scissored rendering.
             {
                 self.block_regions.clearRetainingCapacity();
+                self.next_off_screen_y = null;
+                self.prev_off_screen_bottom = null;
 
                 const brl = state.block_render_list.items;
                 const use_layout = brl.len > 0 and self.config.command_blocks;
@@ -3673,21 +3811,29 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                         // Skip blocks entirely above or below the screen.
                         const block_bottom_i64 = block_screen_y_i64 + @as(i64, @intCast(info.visible_height_px));
-                        if (block_bottom_i64 <= 0) continue;
-                        if (block_screen_y_i64 >= @as(i64, @intCast(screen_h))) continue;
+                        if (block_bottom_i64 <= 0) {
+                            // Track the bottom edge of this off-screen block above
+                            // the viewport so we can draw a leading separator.
+                            self.prev_off_screen_bottom = block_bottom_i64;
+                            continue;
+                        }
+                        if (block_screen_y_i64 >= @as(i64, @intCast(screen_h))) {
+                            // Track the first off-screen block below the viewport
+                            // so we can draw the trailing separator in the gap.
+                            if (self.next_off_screen_y == null) {
+                                self.next_off_screen_y = @intCast(block_screen_y_i64);
+                            }
+                            continue;
+                        }
 
-                        // Clip to grid area (content starts at padding_top, not screen top).
-                        // This ensures rows sliding into view from above are smoothly
-                        // clipped at the padding boundary, not fully revealed in the
-                        // padding area.
-                        const min_y: i64 = @as(i64, @intCast(padding_top));
-                        const screen_y: u32 = if (block_screen_y_i64 >= min_y)
+                        // Clip to screen bounds.
+                        const screen_y: u32 = if (block_screen_y_i64 >= 0)
                             @intCast(block_screen_y_i64)
                         else
-                            @intCast(min_y);
+                            0;
 
-                        const clip_top: u32 = if (block_screen_y_i64 < min_y)
-                            @intCast(min_y - block_screen_y_i64)
+                        const clip_top: u32 = if (block_screen_y_i64 < 0)
+                            @intCast(-block_screen_y_i64)
                         else
                             0;
 
