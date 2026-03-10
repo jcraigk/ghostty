@@ -4519,138 +4519,157 @@ pub fn mouseButtonCallback(
                     const viewport_top_i64: i64 = @max(0, @as(i64, @intCast(doc_h)) -
                         @as(i64, @intCast(viewport_h)) -
                         @as(i64, @intCast(scroll_px)));
-                    const content_y_f: f64 = pos.y - @as(f64, @floatFromInt(padding_top));
-                    if (content_y_f < 0) break :blk;
+                    // Clamp content_y to 0 so clicks in the window padding area
+                    // still reach toolbars rendered at the top (clamped screen_y=0).
+                    const content_y_f: f64 = @max(0, pos.y - @as(f64, @floatFromInt(padding_top)));
                     const virtual_y_i64: i64 = @as(i64, @intFromFloat(content_y_f)) + viewport_top_i64;
                     if (virtual_y_i64 < 0) break :blk;
                     const virtual_y: u32 = @intCast(@min(virtual_y_i64, @as(i64, @intCast(doc_h))));
 
                     // Find which block contains this virtual Y.
-                    for (brl) |info| {
-                        const block_end = info.virtual_y_px + info.visible_height_px;
-                        if (virtual_y >= info.virtual_y_px and virtual_y < block_end) {
-                            // Check if click is on the filter bar close button.
-                            if (t.filter_input_block_idx) |fbi| filter_check: {
-                                if (info.block_list_index != fbi) break :filter_check;
-                                const block_screen_y_fc: i64 = @as(i64, @intCast(padding_top)) +
-                                    @as(i64, @intCast(info.virtual_y_px)) - viewport_top_i64;
-                                if (block_screen_y_fc < 0) break :filter_check;
-                                const f_screen_y: u32 = @intCast(block_screen_y_fc);
-                                const f_bar_h_c = cell_h;
-                                const grid_right_c = self.size.padding.left + t.cols * cell_w;
-                                const f_bar_w_c: u32 = @min(grid_right_c -| self.size.padding.left -| cell_w * 2, cell_w * 30);
-                                const f_bar_x_c: u32 = grid_right_c -| f_bar_w_c -| cell_w;
-                                const click_x_fc: u32 = @intFromFloat(@max(0, pos.x));
-                                const click_y_fc: u32 = @intFromFloat(@max(0, pos.y));
-
-                                if (click_y_fc >= f_screen_y and click_y_fc < f_screen_y + f_bar_h_c and
-                                    click_x_fc >= f_bar_x_c and click_x_fc < f_bar_x_c + f_bar_w_c)
-                                {
-                                    // Check if click is on the X close button (right portion of bar).
-                                    const close_region_x = (f_bar_x_c + f_bar_w_c) -| f_bar_h_c;
-                                    if (click_x_fc >= close_region_x) {
-                                        t.dismissFilterInput();
-                                        try self.queueRender();
-                                        break;
-                                    }
-                                    // Click is on the filter text area — consume but don't dismiss.
-                                    try self.queueRender();
-                                    break;
-                                }
-                            }
-
-                            // Check if click is on the toolbar pill.
-                            if (self.config.command_blocks_toolbar) toolbar_check: {
-                                const icons_cfg = self.config.command_blocks_toolbar_icons;
-                                const icon_count = icons_cfg.count();
-                                if (icon_count == 0) break :toolbar_check;
-
-                                // Skip active block (last in layout).
-                                if (info.block_list_index == brl[brl.len - 1].block_list_index) break :toolbar_check;
-
-                                // Compute toolbar screen bounds (same as renderer).
-                                const block_screen_y_i64: i64 = @as(i64, @intCast(padding_top)) +
-                                    @as(i64, @intCast(info.virtual_y_px)) - viewport_top_i64;
-                                if (block_screen_y_i64 < 0) break :toolbar_check;
-                                const block_screen_y: u32 = @intCast(block_screen_y_i64);
-
-                                const toolbar_h = cell_h;
-                                const icon_slot_w = toolbar_h; // square slots, same as renderer
-                                const icon_padding: u32 = @max(2, toolbar_h / 6);
-                                const toolbar_w = icon_count * icon_slot_w + icon_padding * 2;
-                                const grid_cols = t.cols;
-                                const grid_right = self.size.padding.left + grid_cols * cell_w;
-                                const is_right = self.config.command_blocks_toolbar_position == .@"upper-right" or
-                                    self.config.command_blocks_toolbar_position == .@"lower-right";
-                                const is_upper = self.config.command_blocks_toolbar_position == .@"upper-right" or
-                                    self.config.command_blocks_toolbar_position == .@"upper-left";
-                                const toolbar_x: u32 = if (is_right)
-                                    grid_right -| toolbar_w -| cell_w
-                                else
-                                    self.size.padding.left + cell_w;
-                                const toolbar_y: u32 = if (is_upper)
-                                    block_screen_y
-                                else
-                                    (block_screen_y + info.visible_height_px) -| toolbar_h;
-
-                                const click_x: u32 = @intFromFloat(@max(0, pos.x));
-                                const click_y: u32 = @intFromFloat(@max(0, pos.y));
-
-                                if (click_x >= toolbar_x and click_x < toolbar_x + toolbar_w and
-                                    click_y >= toolbar_y and click_y < toolbar_y + toolbar_h)
-                                {
-                                    // Determine which icon was clicked.
-                                    const rel_x = click_x - toolbar_x - icon_padding;
-                                    const icon_idx = @min(rel_x / icon_slot_w, icon_count - 1);
-                                    const enabled = icons_cfg.enabledIcons();
-                                    if (icon_idx < enabled.len) {
-                                        // Set pressed state for visual feedback.
-                                        t.pressed_toolbar_icon = @intCast(icon_idx);
-                                        switch (enabled.icons[icon_idx]) {
-                                            .copy => {
-                                                self.copyBlockToClipboard(t, info.block_list_index);
-                                            },
-                                            .collapse => {
-                                                t.highlighted_block_idx = info.block_list_index;
-                                                t.toggleHighlightedBlockCollapse();
-                                            },
-                                            .ellipsis => {
-                                                // Defer menu popup to after mutex is released,
-                                                // since NSMenu runs a modal event loop that
-                                                // needs to render (which requires the mutex).
-                                                // Position dropdown: right-aligned with toolbar,
-                                                // appearing below the toolbar.
-                                                deferred_menu = .{
-                                                    .block_idx = info.block_list_index,
-                                                    .menu_x_px = toolbar_x + toolbar_w,
-                                                    .menu_y_px = toolbar_y + toolbar_h,
-                                                    .margin_px = icon_padding,
-                                                };
-                                            },
-                                            .filter => {
-                                                // Toggle: if filter active, clear it; else start.
-                                                const bl_idx = info.block_list_index;
-                                                const has_filter = if (t.block_list) |*bl_l|
-                                                    bl_idx < bl_l.blocks.items.len and bl_l.blocks.items[bl_idx].filter_match_rows != null
-                                                else
-                                                    false;
-                                                if (has_filter) {
-                                                    t.dismissFilterInput();
-                                                } else {
-                                                    t.startFilterInput(bl_idx);
-                                                }
-                                            },
-                                        }
-                                    }
-                                    try self.queueRender();
-                                    break;
-                                }
-                            }
-
-                            t.toggleBlockHighlight(info.block_list_index);
-                            try self.queueRender();
-                            break;
+                    // Also check gaps: if virtual_y is in a gap, attribute
+                    // it to the next block (for toolbar clicks in padding area).
+                    const found_info: ?@TypeOf(brl[0]) = fi: {
+                        for (brl) |info| {
+                            const block_end = info.virtual_y_px + info.visible_height_px;
+                            if (virtual_y >= info.virtual_y_px and virtual_y < block_end)
+                                break :fi info;
                         }
+                        // Gap fallback: find the first block below virtual_y.
+                        for (brl) |info| {
+                            if (virtual_y < info.virtual_y_px)
+                                break :fi info;
+                        }
+                        break :fi null;
+                    };
+                    if (found_info) |info| handle_block: {
+                        // Check if click is on the filter bar close button.
+                        if (t.filter_input_block_idx) |fbi| filter_check: {
+                            if (info.block_list_index != fbi) break :filter_check;
+                            const block_screen_y_fc: i64 = @as(i64, @intCast(padding_top)) +
+                                @as(i64, @intCast(info.virtual_y_px)) - viewport_top_i64;
+                            const f_screen_y: u32 = if (block_screen_y_fc >= 0)
+                                @intCast(block_screen_y_fc)
+                            else
+                                0;
+                            const f_bar_h_c = cell_h;
+                            const grid_right_c = self.size.padding.left + t.cols * cell_w;
+                            const f_bar_w_c: u32 = @min(grid_right_c -| self.size.padding.left -| cell_w * 2, cell_w * 30);
+                            const f_bar_x_c: u32 = grid_right_c -| f_bar_w_c -| cell_w;
+                            const click_x_fc: u32 = @intFromFloat(@max(0, pos.x));
+                            const click_y_fc: u32 = @intFromFloat(@max(0, pos.y));
+
+                            if (click_y_fc >= f_screen_y and click_y_fc < f_screen_y + f_bar_h_c and
+                                click_x_fc >= f_bar_x_c and click_x_fc < f_bar_x_c + f_bar_w_c)
+                            {
+                                // Check if click is on the X close button (right portion of bar).
+                                const close_region_x = (f_bar_x_c + f_bar_w_c) -| f_bar_h_c;
+                                if (click_x_fc >= close_region_x) {
+                                    t.dismissFilterInput();
+                                    try self.queueRender();
+                                    break :handle_block;
+                                }
+                                // Click is on the filter text area — consume but don't dismiss.
+                                try self.queueRender();
+                                break :handle_block;
+                            }
+                        }
+
+                        // Check if click is on the toolbar pill.
+                        if (self.config.command_blocks_toolbar) toolbar_check: {
+                            const icons_cfg = self.config.command_blocks_toolbar_icons;
+                            const icon_count = icons_cfg.count();
+                            if (icon_count == 0) break :toolbar_check;
+
+                            // Skip active block (last in layout).
+                            if (info.block_list_index == brl[brl.len - 1].block_list_index) break :toolbar_check;
+
+                            // Compute toolbar screen bounds (same as renderer).
+                            // Clamp to 0 when block is partially above viewport,
+                            // matching how the renderer clips screen_y_px.
+                            const block_screen_y_i64: i64 = @as(i64, @intCast(padding_top)) +
+                                @as(i64, @intCast(info.virtual_y_px)) - viewport_top_i64;
+                            const block_screen_y: u32 = if (block_screen_y_i64 >= 0)
+                                @intCast(block_screen_y_i64)
+                            else
+                                0;
+
+                            const toolbar_h = cell_h;
+                            const icon_slot_w = toolbar_h; // square slots, same as renderer
+                            const icon_padding: u32 = @max(2, toolbar_h / 6);
+                            const toolbar_w = icon_count * icon_slot_w + icon_padding * 2;
+                            const grid_cols = t.cols;
+                            const grid_right = self.size.padding.left + grid_cols * cell_w;
+                            const is_right = self.config.command_blocks_toolbar_position == .@"upper-right" or
+                                self.config.command_blocks_toolbar_position == .@"lower-right";
+                            const is_upper = self.config.command_blocks_toolbar_position == .@"upper-right" or
+                                self.config.command_blocks_toolbar_position == .@"upper-left";
+                            const toolbar_x: u32 = if (is_right)
+                                grid_right -| toolbar_w -| cell_w
+                            else
+                                self.size.padding.left + cell_w;
+                            const toolbar_y: u32 = if (is_upper)
+                                block_screen_y
+                            else
+                                (block_screen_y + info.visible_height_px) -| toolbar_h;
+
+                            const click_x: u32 = @intFromFloat(@max(0, pos.x));
+                            const click_y: u32 = @intFromFloat(@max(0, pos.y));
+
+                            if (click_x >= toolbar_x and click_x < toolbar_x + toolbar_w and
+                                click_y >= toolbar_y and click_y < toolbar_y + toolbar_h)
+                            {
+                                // Determine which icon was clicked.
+                                const rel_x = click_x - toolbar_x - icon_padding;
+                                const icon_idx = @min(rel_x / icon_slot_w, icon_count - 1);
+                                const enabled = icons_cfg.enabledIcons();
+                                if (icon_idx < enabled.len) {
+                                    // Set pressed state for visual feedback.
+                                    t.pressed_toolbar_icon = @intCast(icon_idx);
+                                    switch (enabled.icons[icon_idx]) {
+                                        .copy => {
+                                            self.copyBlockToClipboard(t, info.block_list_index);
+                                        },
+                                        .collapse => {
+                                            t.highlighted_block_idx = info.block_list_index;
+                                            t.toggleHighlightedBlockCollapse();
+                                        },
+                                        .ellipsis => {
+                                            // Defer menu popup to after mutex is released,
+                                            // since NSMenu runs a modal event loop that
+                                            // needs to render (which requires the mutex).
+                                            // Position dropdown: right-aligned with toolbar,
+                                            // appearing below the toolbar.
+                                            deferred_menu = .{
+                                                .block_idx = info.block_list_index,
+                                                .menu_x_px = toolbar_x + toolbar_w,
+                                                .menu_y_px = toolbar_y + toolbar_h,
+                                                .margin_px = icon_padding,
+                                            };
+                                        },
+                                        .filter => {
+                                            // Toggle: if filter active, clear it; else start.
+                                            const bl_idx = info.block_list_index;
+                                            const has_filter = if (t.block_list) |*bl_l|
+                                                bl_idx < bl_l.blocks.items.len and bl_l.blocks.items[bl_idx].filter_match_rows != null
+                                            else
+                                                false;
+                                            if (has_filter) {
+                                                t.dismissFilterInput();
+                                            } else {
+                                                t.startFilterInput(bl_idx);
+                                            }
+                                        },
+                                    }
+                                }
+                                try self.queueRender();
+                                break :handle_block;
+                            }
+                        }
+
+                        // Click was not on toolbar or filter bar — toggle block highlight.
+                        t.toggleBlockHighlight(info.block_list_index);
+                        try self.queueRender();
                     }
                 }
             },
@@ -5309,18 +5328,11 @@ pub fn cursorPosCallback(
             const viewport_top_i64: i64 = @max(0, @as(i64, @intCast(doc_h)) -
                 @as(i64, @intCast(viewport_h)) -
                 @as(i64, @intCast(scroll_px)));
-            const content_y_f: f64 = pos.y - @as(f64, @floatFromInt(padding_top));
-            if (content_y_f < 0) {
-                // Above content area — treat as history (pointer cursor).
-                t.hovered_block_idx = null;
-                t.hovered_toolbar_icon = null;
-                _ = try self.rt_app.performAction(
-                    .{ .surface = self },
-                    .mouse_shape,
-                    .default,
-                );
-                break :cursor_shape;
-            }
+            // content_y_f can be negative when the mouse is in the window
+            // padding area above the content grid. We clamp to 0 so the
+            // hover/toolbar logic still works for blocks whose toolbar is
+            // rendered in the padding area (clamped to screen Y=0).
+            const content_y_f: f64 = @max(0, pos.y - @as(f64, @floatFromInt(padding_top)));
             const virtual_y_i64: i64 = @as(i64, @intFromFloat(content_y_f)) + viewport_top_i64;
 
             // The active block is the last one in the layout.
@@ -5333,11 +5345,26 @@ pub fn cursorPosCallback(
             else ih: {
                 const virtual_y: u32 = @intCast(@min(virtual_y_i64, @as(i64, @intCast(doc_h))));
                 // Find which completed block contains this virtual Y.
+                // Also check the gap above each block — if the toolbar is at
+                // "upper-*" position and the block is near the top of the viewport,
+                // the mouse over the toolbar area may map to the gap above the block.
                 for (brl[0 .. brl.len - 1]) |info| {
                     const block_end = info.virtual_y_px + info.visible_height_px;
                     if (virtual_y >= info.virtual_y_px and virtual_y < block_end) {
                         hovered_idx = info.block_list_index;
                         break;
+                    }
+                }
+                // If no block matched and the virtual Y is in a gap, attribute
+                // the hover to the next block below the gap. This ensures the
+                // toolbar remains visible when the mouse is in the gap area
+                // above a block that's near the top of the viewport.
+                if (hovered_idx == null) {
+                    for (brl[0 .. brl.len - 1]) |info| {
+                        if (virtual_y < info.virtual_y_px) {
+                            hovered_idx = info.block_list_index;
+                            break;
+                        }
                     }
                 }
                 break :ih virtual_y < active_info.virtual_y_px;
@@ -5375,8 +5402,10 @@ pub fn cursorPosCallback(
                     if (info.block_list_index == hovered_idx.?) {
                         const block_screen_y_i64: i64 = @as(i64, @intCast(padding_top)) +
                             @as(i64, @intCast(info.virtual_y_px)) - viewport_top_i64;
-                        if (block_screen_y_i64 < 0) break :icon_detect;
-                        const block_screen_y: u32 = @intCast(block_screen_y_i64);
+                        const block_screen_y: u32 = if (block_screen_y_i64 >= 0)
+                            @intCast(block_screen_y_i64)
+                        else
+                            0;
                         const toolbar_y: u32 = if (is_upper)
                             block_screen_y
                         else
