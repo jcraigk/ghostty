@@ -1937,16 +1937,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         };
 
                         // Compute visual block extent (header padding to footer padding).
-                        const header_h: u32 = self.config.command_blocks_padding_header;
                         const vis_top: u32 = if (ri > 0) blk: {
                             const prev = self.block_regions.items[ri - 1];
                             const prev_end = prev.screen_y_px + prev.height_px;
                             if (region.screen_y_px <= prev_end) break :blk prev_end;
                             const gap_mid = prev_end + (region.screen_y_px - prev_end) / 2;
                             break :blk gap_mid + 2;
-                        } else if (region.screen_y_px > header_h)
-                            region.screen_y_px - header_h
-                        else
+                        } else
+                        // First visible block: extend tint/stripe to screen top so the
+                        // window padding area is filled with the block's tint color
+                        // instead of showing a black strip.
                             0;
 
                         const vis_bottom: u32 = if (ri + 1 < self.block_regions.items.len) blk: {
