@@ -101,6 +101,9 @@ hovered_toolbar_icon: ?u32 = null,
 /// feedback. Cleared on mouse-up or mouse-move off the toolbar.
 pressed_toolbar_icon: ?u32 = null,
 
+/// Whether the filter bar copy button is currently pressed (mouse-down).
+pressed_filter_copy: bool = false,
+
 /// Block index with an active filter input, or null if no filter is active.
 /// When set, keyboard input is captured for the filter text field.
 filter_input_block_idx: ?usize = null,

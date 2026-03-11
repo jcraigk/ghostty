@@ -4375,11 +4375,12 @@ pub fn mouseButtonCallback(
     }
 
     if (button == .left and action == .release) {
-        // Clear pressed toolbar icon state on mouse-up.
+        // Clear pressed toolbar/filter icon state on mouse-up.
         {
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
             self.renderer_state.terminal.pressed_toolbar_icon = null;
+            self.renderer_state.terminal.pressed_filter_copy = false;
         }
 
         // Stop selection scrolling when releasing the left mouse button
@@ -4663,6 +4664,8 @@ pub fn mouseButtonCallback(
                                 // Check if click is on the copy button (to the left of close).
                                 const copy_region_x = close_region_x -| f_bar_h_c;
                                 if (click_x_fc >= copy_region_x and click_x_fc < close_region_x) {
+                                    // Set pressed state for visual feedback.
+                                    t.pressed_filter_copy = true;
                                     // Copy filtered lines to clipboard.
                                     if (t.block_list) |*bl| {
                                         if (fbi < bl.blocks.items.len) {

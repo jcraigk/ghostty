@@ -2468,7 +2468,45 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                 // Copy button to the left of the X close button.
                                 {
                                     const copy_region_w: u32 = f_bar_h;
-                                    const copy_cx: u32 = (f_bar_x + f_bar_w) -| f_bar_h -| copy_region_w / 2;
+                                    const copy_region_x: u32 = (f_bar_x + f_bar_w) -| f_bar_h -| copy_region_w;
+
+                                    // Draw pressed highlight background.
+                                    if (ts.pressed_filter_copy) {
+                                        const f_pressed_scratch: f32 = f_toolbar_scratch + 3.0;
+                                        const cp_margin: u32 = @max(1, f_bar_h / 8);
+                                        const cp_hx = copy_region_x + cp_margin;
+                                        const cp_hy = f_bar_y + cp_margin;
+                                        const cp_hw = copy_region_w -| cp_margin * 2;
+                                        const cp_hh = f_bar_h -| cp_margin * 2;
+                                        const cp_hx_f: f32 = @floatFromInt(cp_hx);
+                                        const cp_hy_f: f32 = @floatFromInt(cp_hy);
+                                        const cp_hw_f: f32 = @floatFromInt(cp_hw);
+                                        const cp_hh_f: f32 = @floatFromInt(cp_hh);
+                                        const cp_radius: f32 = if (self.config.command_blocks_toolbar_icon_radius > 0)
+                                            @floatFromInt(self.config.command_blocks_toolbar_icon_radius)
+                                        else
+                                            4.0;
+                                        pass.step(.{
+                                            .pipeline = self.shaders.pipelines.cell_bg,
+                                            .uniforms = frame.uniforms.buffer,
+                                            .buffers = &.{ null, frame.cells_bg.buffer },
+                                            .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                            .scissor = .{ .x = cp_hx, .y = cp_hy, .width = cp_hw, .height = cp_hh },
+                                            .block_params = .{
+                                                .block_y_offset = 0,
+                                                .block_first_row = f_pressed_scratch,
+                                                .block_x_offset = -pad_left,
+                                                .block_y_flat = 1.0,
+                                                .block_corner_radius = cp_radius,
+                                                .block_scissor_x = cp_hx_f,
+                                                .block_scissor_y = cp_hy_f,
+                                                .block_scissor_w = cp_hw_f,
+                                                .block_scissor_h = cp_hh_f,
+                                            },
+                                        });
+                                    }
+
+                                    const copy_cx: u32 = copy_region_x + copy_region_w / 2;
                                     const copy_cy: u32 = f_bar_y + f_bar_h / 2;
                                     const copy_icon_area: u32 = @max(6, f_bar_h * 2 / 5);
                                     const copy_rect_w: u32 = copy_icon_area * 2 / 3;

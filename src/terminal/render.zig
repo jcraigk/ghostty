@@ -128,6 +128,9 @@ pub const RenderState = struct {
     /// Index of the toolbar icon currently pressed (for click highlight).
     pressed_toolbar_icon: ?u32 = null,
 
+    /// Whether the filter bar copy button is pressed (for click highlight).
+    pressed_filter_copy: bool = false,
+
     /// Block index that currently has active filter input, or null.
     filter_input_block_idx: ?usize = null,
     /// The current filter input text (snapshot from Terminal).
@@ -672,6 +675,13 @@ pub const RenderState = struct {
             const prev_pressed = self.pressed_toolbar_icon;
             self.pressed_toolbar_icon = t.pressed_toolbar_icon;
             if (!std.meta.eql(prev_pressed, self.pressed_toolbar_icon)) {
+                self.dirty = .full;
+            }
+
+            // Pressed filter copy button state.
+            const prev_filter_copy = self.pressed_filter_copy;
+            self.pressed_filter_copy = t.pressed_filter_copy;
+            if (prev_filter_copy != self.pressed_filter_copy) {
                 self.dirty = .full;
             }
 
