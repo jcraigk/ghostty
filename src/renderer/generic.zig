@@ -2465,6 +2465,92 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                     });
                                 }
 
+                                // Copy button to the left of the X close button.
+                                {
+                                    const copy_region_w: u32 = f_bar_h;
+                                    const copy_cx: u32 = (f_bar_x + f_bar_w) -| f_bar_h -| copy_region_w / 2;
+                                    const copy_cy: u32 = f_bar_y + f_bar_h / 2;
+                                    const copy_icon_area: u32 = @max(6, f_bar_h * 2 / 5);
+                                    const copy_rect_w: u32 = copy_icon_area * 2 / 3;
+                                    const copy_rect_h: u32 = copy_icon_area * 3 / 4;
+                                    const copy_offset: u32 = copy_icon_area / 5;
+                                    // Back rectangle (upper-left).
+                                    const copy_back_x = copy_cx -| copy_icon_area / 2;
+                                    const copy_back_y = copy_cy -| copy_icon_area / 2;
+                                    const cbx_f: f32 = @floatFromInt(copy_back_x);
+                                    const cby_f: f32 = @floatFromInt(copy_back_y);
+                                    const cbw_f: f32 = @floatFromInt(copy_rect_w);
+                                    const cbh_f: f32 = @floatFromInt(copy_rect_h);
+                                    pass.step(.{
+                                        .pipeline = self.shaders.pipelines.cell_bg,
+                                        .uniforms = frame.uniforms.buffer,
+                                        .buffers = &.{ null, frame.cells_bg.buffer },
+                                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                        .scissor = .{ .x = copy_back_x, .y = copy_back_y, .width = copy_rect_w, .height = copy_rect_h },
+                                        .block_params = .{
+                                            .block_y_offset = 0,
+                                            .block_first_row = f_icon_scratch,
+                                            .block_x_offset = -pad_left,
+                                            .block_y_flat = 1.0,
+                                            .block_corner_radius = 1.0,
+                                            .block_scissor_x = cbx_f,
+                                            .block_scissor_y = cby_f,
+                                            .block_scissor_w = cbw_f,
+                                            .block_scissor_h = cbh_f,
+                                        },
+                                    });
+                                    // Separator gap (toolbar bg color).
+                                    const csep_x = copy_back_x + copy_offset -| 1;
+                                    const csep_y = copy_back_y + copy_offset -| 1;
+                                    const csep_w = copy_rect_w + 2;
+                                    const csep_h = copy_rect_h + 2;
+                                    const csx_f: f32 = @floatFromInt(csep_x);
+                                    const csy_f: f32 = @floatFromInt(csep_y);
+                                    const csw_f: f32 = @floatFromInt(csep_w);
+                                    const csh_f: f32 = @floatFromInt(csep_h);
+                                    pass.step(.{
+                                        .pipeline = self.shaders.pipelines.cell_bg,
+                                        .uniforms = frame.uniforms.buffer,
+                                        .buffers = &.{ null, frame.cells_bg.buffer },
+                                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                        .scissor = .{ .x = csep_x, .y = csep_y, .width = csep_w, .height = csep_h },
+                                        .block_params = .{
+                                            .block_y_offset = 0,
+                                            .block_first_row = f_toolbar_scratch,
+                                            .block_x_offset = -pad_left,
+                                            .block_y_flat = 1.0,
+                                            .block_corner_radius = 1.0,
+                                            .block_scissor_x = csx_f,
+                                            .block_scissor_y = csy_f,
+                                            .block_scissor_w = csw_f,
+                                            .block_scissor_h = csh_f,
+                                        },
+                                    });
+                                    // Front rectangle (lower-right, icon color).
+                                    const copy_front_x = copy_back_x + copy_offset;
+                                    const copy_front_y = copy_back_y + copy_offset;
+                                    const cfx_f: f32 = @floatFromInt(copy_front_x);
+                                    const cfy_f: f32 = @floatFromInt(copy_front_y);
+                                    pass.step(.{
+                                        .pipeline = self.shaders.pipelines.cell_bg,
+                                        .uniforms = frame.uniforms.buffer,
+                                        .buffers = &.{ null, frame.cells_bg.buffer },
+                                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                        .scissor = .{ .x = copy_front_x, .y = copy_front_y, .width = copy_rect_w, .height = copy_rect_h },
+                                        .block_params = .{
+                                            .block_y_offset = 0,
+                                            .block_first_row = f_icon_scratch,
+                                            .block_x_offset = -pad_left,
+                                            .block_y_flat = 1.0,
+                                            .block_corner_radius = 1.0,
+                                            .block_scissor_x = cfx_f,
+                                            .block_scissor_y = cfy_f,
+                                            .block_scissor_w = cbw_f,
+                                            .block_scissor_h = cbh_f,
+                                        },
+                                    });
+                                }
+
                                 // "X" close button on the right side.
                                 const close_size: u32 = @max(6, f_bar_h / 3);
                                 const close_x: u32 = (f_bar_x + f_bar_w) -| f_bar_h / 2 -| close_size / 2;

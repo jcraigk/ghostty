@@ -4653,10 +4653,31 @@ pub fn mouseButtonCallback(
                             if (click_y_fc >= f_bar_y_c and click_y_fc < f_bar_y_c + f_bar_h_c and
                                 click_x_fc >= f_bar_x_c and click_x_fc < f_bar_x_c + f_bar_w_c)
                             {
-                                // Check if click is on the X close button (right portion of bar).
+                                // Check if click is on the X close button (rightmost region).
                                 const close_region_x = (f_bar_x_c + f_bar_w_c) -| f_bar_h_c;
                                 if (click_x_fc >= close_region_x) {
                                     t.dismissFilterInput();
+                                    try self.queueRender();
+                                    break :handle_block;
+                                }
+                                // Check if click is on the copy button (to the left of close).
+                                const copy_region_x = close_region_x -| f_bar_h_c;
+                                if (click_x_fc >= copy_region_x and click_x_fc < close_region_x) {
+                                    // Copy filtered lines to clipboard.
+                                    if (t.block_list) |*bl| {
+                                        if (fbi < bl.blocks.items.len) {
+                                            const block = &bl.blocks.items[fbi];
+                                            if (block.filter_match_rows) |matches| {
+                                                if (matches.len > 0) {
+                                                    if (block.output_start) |os| {
+                                                        self.copyFilteredLinesToClipboard(os.*, matches) catch |err| {
+                                                            log.err("copy filtered lines failed: {}", .{err});
+                                                        };
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                     try self.queueRender();
                                     break :handle_block;
                                 }
