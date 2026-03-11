@@ -2542,12 +2542,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             self.config.command_blocks_toolbar_position == .@"lower-right";
                         const is_upper = self.config.command_blocks_toolbar_position == .@"upper-right" or
                             self.config.command_blocks_toolbar_position == .@"upper-left";
+                        const blk_pad_right: u32 = self.config.command_blocks_padding_right;
+                        const blk_pad_left: u32 = self.config.command_blocks_padding_left;
                         const toolbar_x: u32 = if (is_right)
-                            grid_right -| toolbar_w -| cell_w
+                            grid_right -| toolbar_w -| blk_pad_right
                         else
-                            self.size.padding.left + cell_w;
+                            self.size.padding.left + blk_pad_left;
+                        const toolbar_min_y: u32 = self.config.command_blocks_padding_header;
                         const toolbar_y: u32 = if (is_upper)
-                            region.screen_y_px
+                            @max(region.screen_y_px, toolbar_min_y)
                         else
                             (region.screen_y_px + region.height_px) -| toolbar_h;
 

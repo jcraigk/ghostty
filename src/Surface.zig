@@ -340,7 +340,9 @@ const DerivedConfig = struct {
     command_blocks_toolbar: bool,
     command_blocks_toolbar_icons: configpkg.Config.ToolbarIcons,
     command_blocks_toolbar_position: configpkg.Config.ToolbarPosition,
+    command_blocks_padding_left: u16,
     command_blocks_padding_right: u16,
+    command_blocks_padding_header: u16,
 
     const Link = struct {
         regex: oni.Regex,
@@ -422,7 +424,9 @@ const DerivedConfig = struct {
             .command_blocks_toolbar = config.@"command-blocks-toolbar",
             .command_blocks_toolbar_icons = config.@"command-blocks-toolbar-icons",
             .command_blocks_toolbar_position = config.@"command-blocks-toolbar-position",
+            .command_blocks_padding_left = config.@"command-blocks-padding-left",
             .command_blocks_padding_right = config.@"command-blocks-padding-right",
+            .command_blocks_padding_header = config.@"command-blocks-padding-header",
 
             // Assignments happen sequentially so we have to do this last
             // so that the memory is captured from allocs above.
@@ -4604,12 +4608,15 @@ pub fn mouseButtonCallback(
                                 self.config.command_blocks_toolbar_position == .@"lower-right";
                             const is_upper = self.config.command_blocks_toolbar_position == .@"upper-right" or
                                 self.config.command_blocks_toolbar_position == .@"upper-left";
+                            const blk_pad_right: u32 = self.config.command_blocks_padding_right;
+                            const blk_pad_left: u32 = self.config.command_blocks_padding_left;
                             const toolbar_x: u32 = if (is_right)
-                                grid_right -| toolbar_w -| cell_w
+                                grid_right -| toolbar_w -| blk_pad_right
                             else
-                                self.size.padding.left + cell_w;
+                                self.size.padding.left + blk_pad_left;
+                            const toolbar_min_y: u32 = self.config.command_blocks_padding_header;
                             const toolbar_y: u32 = if (is_upper)
-                                block_screen_y
+                                @max(block_screen_y, toolbar_min_y)
                             else
                                 (block_screen_y + info.visible_height_px) -| toolbar_h;
 
@@ -5392,10 +5399,12 @@ pub fn cursorPosCallback(
                     self.config.command_blocks_toolbar_position == .@"lower-right";
                 const is_upper = self.config.command_blocks_toolbar_position == .@"upper-right" or
                     self.config.command_blocks_toolbar_position == .@"upper-left";
+                const blk_pad_right: u32 = self.config.command_blocks_padding_right;
+                const blk_pad_left: u32 = self.config.command_blocks_padding_left;
                 const toolbar_x: u32 = if (is_right)
-                    grid_right -| toolbar_w -| cell_w
+                    grid_right -| toolbar_w -| blk_pad_right
                 else
-                    self.size.padding.left + cell_w;
+                    self.size.padding.left + blk_pad_left;
 
                 // Compute toolbar screen Y from the hovered block's virtual position.
                 for (brl) |info| {
@@ -5406,8 +5415,9 @@ pub fn cursorPosCallback(
                             @intCast(block_screen_y_i64)
                         else
                             0;
+                        const toolbar_min_y: u32 = self.config.command_blocks_padding_header;
                         const toolbar_y: u32 = if (is_upper)
-                            block_screen_y
+                            @max(block_screen_y, toolbar_min_y)
                         else
                             (block_screen_y + info.visible_height_px) -| toolbar_h;
 
