@@ -3993,60 +3993,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // not per-cell, so it covers gaps and supports hover/click.
             }
 
-            // Remap cell buffer rows for filtered blocks.
-            // Only on full rebuild — on partial rebuilds the display rows already
-            // have correct content from the previous full rebuild. Re-running the
-            // remap on partial frames would read from source rows that may have been
-            // overwritten by a previous remap (since source rows overlap with display
-            // positions from earlier matches).
-            if (rebuild) {
-                for (self.block_regions.items) |region| {
-                    if (!region.filtered) continue;
-                    const matches = region.filter_match_rows orelse continue;
-                    if (matches.len == 0) continue;
-                    const out_off: u16 = region.output_row_offset;
-                    const cols_u: usize = self.cells.size.columns;
-                    const lists = self.cells.fg_rows.lists;
-
-                    // For each match, copy the fg list and bg cells from the source row
-                    // to the display position. Since matches are sorted and source >= display,
-                    // processing in order is safe (we never overwrite a source we still need).
-                    // We use copy (not swap) to avoid corrupting source rows that may be
-                    // display targets for later matches, and to avoid frame-to-frame instability
-                    // from repeated swaps.
-                    for (matches, 0..) |match_row_idx, mi| {
-                        const display_row: u16 = region.first_row + out_off + @as(u16, @intCast(mi));
-                        const source_row: u16 = region.first_row + out_off + @as(u16, @intCast(match_row_idx));
-                        if (display_row == source_row) continue;
-                        if (display_row >= row_len or source_row >= row_len) continue;
-
-                        // Copy fg row list from source to display (lists[0] is cursor, so +1).
-                        const di: usize = @as(usize, display_row) + 1;
-                        const si: usize = @as(usize, source_row) + 1;
-                        if (di < lists.len and si < lists.len) {
-                            lists[di].clearRetainingCapacity();
-                            lists[di].appendSlice(self.alloc, lists[si].items) catch {};
-                            // Fix grid_pos.y: copied glyphs have source_row as their Y,
-                            // but they need display_row for correct shader positioning.
-                            for (lists[di].items) |*glyph| {
-                                glyph.grid_pos[1] = display_row;
-                            }
-                        }
-
-                        // Copy bg cell data for this row.
-                        const d_start = @as(usize, display_row) * cols_u;
-                        const s_start = @as(usize, source_row) * cols_u;
-                        if (d_start + cols_u <= self.cells.bg_cells.len and
-                            s_start + cols_u <= self.cells.bg_cells.len)
-                        {
-                            @memcpy(
-                                self.cells.bg_cells[d_start..][0..cols_u],
-                                self.cells.bg_cells[s_start..][0..cols_u],
-                            );
-                        }
-                    }
-                }
-            }
+            // Filtered block rows are now loaded directly into the correct
+            // cell buffer positions by populateBlockRows (which skips non-matching
+            // output rows during iteration). No remap needed.
 
             // Populate scratch rows for separator and per-row stripes.
             // sep_row is the index of the first scratch row, after all content rows.

@@ -408,6 +408,12 @@ pub const RenderState = struct {
                 break :redraw true;
             }
 
+            // If the block layout is dirty (e.g. filter changed, collapse toggled),
+            // force a full rebuild so populateBlockRows reloads the correct rows.
+            if (t.block_layout) |*layout| {
+                if (layout.dirty) break :redraw true;
+            }
+
             break :redraw false;
         };
 
@@ -1010,15 +1016,45 @@ pub const RenderState = struct {
                 .rows_skipped_top = @intCast(@min(rows_skip_top, std.math.maxInt(u16))),
             }) catch {};
 
-            // Iterate rows from the block's pin, starting at rows_skip_top.
+            // Iterate rows from the block's pin.
+            // For filtered blocks, we iterate from the start of the block and
+            // selectively load only prompt/input rows + matched output rows,
+            // skipping non-matching output rows entirely.
             const block_idx = info.block_list_index;
-            if (layout.pinAtBlockRow(block_idx, rows_skip_top)) |start_pin| {
+            const filter_matches = if (info.filtered) info.filter_match_rows else null;
+            const out_off: u32 = info.output_row_offset;
+            // For filtered blocks, always start from row 0 (prompt_start) so
+            // we can correctly count which rows are prompt vs output. For
+            // non-filtered blocks, skip rows_skip_top as before.
+            const effective_skip: u32 = if (filter_matches != null) 0 else rows_skip_top;
+            if (layout.pinAtBlockRow(block_idx, effective_skip)) |start_pin| {
                 var row_it = start_pin.rowIterator(.right_down, null);
-                var local: u16 = 0;
+                var local: u16 = 0; // rows placed in cell buffer
+                var block_row: u32 = effective_skip; // current row index in the block
+                var match_cursor: usize = 0; // index into filter_match_rows
                 while (row_it.next()) |row_pin| {
                     if (local >= rows_in_buffer) break;
                     const y = cell_buf_offset + local;
                     if (y >= needed_rows) break;
+
+                    // For filtered blocks, skip non-matching output rows.
+                    if (filter_matches) |matches| {
+                        if (block_row >= out_off) {
+                            // This is an output row. Check if it matches.
+                            const output_row_idx: u32 = block_row - out_off;
+                            // Advance match_cursor past any matches before this row.
+                            while (match_cursor < matches.len and matches[match_cursor] < output_row_idx) {
+                                match_cursor += 1;
+                            }
+                            if (match_cursor >= matches.len or matches[match_cursor] != output_row_idx) {
+                                // Not a match — skip this row.
+                                block_row += 1;
+                                continue;
+                            }
+                        }
+                        // Prompt/input row or matched output row — include it.
+                    }
+                    block_row += 1;
 
                     // Check for cursor in this row.
                     if (self.cursor.viewport == null and
