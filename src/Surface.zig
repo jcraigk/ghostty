@@ -1192,18 +1192,26 @@ fn selectionScrollTick(self: *Surface) !void {
     // Scroll the viewport as required
     t.scrollViewport(.{ .delta = delta });
 
-    // Compute viewport position with block-gap-adjusted Y (mutex is held).
-    const pos_vp = self.posToViewport(pos.x, self.blockAdjustedY(pos.y));
-
-    // Next, trigger our drag behavior
-    const pin = t.screens.active.pages.pin(.{
-        .viewport = .{
-            .x = pos_vp.x,
-            .y = pos_vp.y,
-        },
-    }) orelse {
-        if (comptime std.debug.runtime_safety) unreachable;
-        return;
+    // Compute pin for the drag position.
+    const pin = pin: {
+        if (t.block_list != null) {
+            if (self.blockPinFromPos(pos.y)) |bp| {
+                const pt = self.posToViewport(pos.x, pos.y);
+                var p = bp;
+                p.x = pt.x;
+                break :pin p;
+            }
+        }
+        const pos_vp = self.posToViewport(pos.x, self.blockAdjustedY(pos.y));
+        break :pin t.screens.active.pages.pin(.{
+            .viewport = .{
+                .x = pos_vp.x,
+                .y = pos_vp.y,
+            },
+        }) orelse {
+            if (comptime std.debug.runtime_safety) unreachable;
+            return;
+        };
     };
     try self.dragLeftClickSingle(pin, pos.x);
 
@@ -2223,6 +2231,55 @@ fn copyBlockToClipboard(self: *Surface, t: *terminal.Terminal, block_idx: usize)
         .plain,
     ) catch |err| {
         log.err("copy block to clipboard failed: {}", .{err});
+    };
+}
+
+/// Copy only the matched (filtered) output lines from a block to the clipboard.
+/// Each matched line is separated by a newline.
+fn copyFilteredLinesToClipboard(
+    self: *Surface,
+    output_start: terminal.Pin,
+    matches: []const u32,
+) !void {
+    var arena = ArenaAllocator.init(self.alloc);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const opts: terminal.formatter.Options = .{
+        .emit = .plain,
+        .unwrap = true,
+        .trim = self.config.clipboard_trim_trailing_spaces,
+        .codepoint_map = self.config.clipboard_codepoint_map.map.list,
+        .background = self.io.terminal.colors.background.get(),
+        .foreground = self.io.terminal.colors.foreground.get(),
+        .palette = &self.io.terminal.colors.palette.current,
+    };
+    const ScreenFormatter = terminal.formatter.ScreenFormatter;
+
+    // For each matched row, format it and collect lines.
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    for (matches) |match_row_idx| {
+        // Navigate to the matched output row.
+        const row_pin = output_start.down(match_row_idx) orelse continue;
+        var start = row_pin;
+        start.x = 0;
+        var end = row_pin;
+        end.x = self.io.terminal.screens.active.pages.cols - 1;
+        const sel = terminal.Selection.init(start, end, false);
+
+        if (aw.written().len > 0) try aw.writer.writeByte('\n');
+        var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, opts);
+        formatter.content = .{ .selection = sel };
+        try formatter.format(&aw.writer);
+    }
+
+    if (aw.written().len == 0) return;
+
+    const data = try aw.toOwnedSliceSentinel(0);
+    var contents: std.ArrayList(apprt.ClipboardContent) = .empty;
+    try contents.append(alloc, .{ .mime = "text/plain", .data = data });
+    self.rt_surface.setClipboard(.standard, contents.items, false) catch |err| {
+        log.err("error setting clipboard err={}", .{err});
     };
 }
 
@@ -4424,8 +4481,19 @@ pub fn mouseButtonCallback(
         const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
 
         const pos = try self.rt_surface.getCursorPos();
-        const adjusted_y = self.blockAdjustedY(pos.y);
         const pin = pin: {
+            // When command-blocks is active, use blockPinFromPos to get
+            // the pin directly (bypasses PageList viewport which is
+            // pinned at the active area and can't address scrollback).
+            if (t.block_list != null) {
+                if (self.blockPinFromPos(pos.y)) |bp| {
+                    const pt_viewport = self.posToViewport(pos.x, pos.y);
+                    var p = bp;
+                    p.x = pt_viewport.x;
+                    break :pin try screen.pages.trackPin(p);
+                }
+            }
+            const adjusted_y = self.blockAdjustedY(pos.y);
             const pt_viewport = self.posToViewport(pos.x, adjusted_y);
             const pin = screen.pages.pin(.{
                 .viewport = .{
@@ -4907,7 +4975,14 @@ fn maybePromptClick(self: *Surface) !bool {
     const pos = try self.rt_surface.getCursorPos();
     const pos_vp = self.posToViewport(pos.x, self.blockAdjustedY(pos.y));
     const click_pin: terminal.Pin = pin: {
-        const pin = screen.pages.pin(.{
+        if (t.block_list != null) {
+            if (self.blockPinFromPos(pos.y)) |bp| {
+                var p = bp;
+                p.x = pos_vp.x;
+                break :pin p;
+            }
+        }
+        const vp_pin = screen.pages.pin(.{
             .viewport = .{
                 .x = pos_vp.x,
                 .y = pos_vp.y,
@@ -4918,7 +4993,7 @@ fn maybePromptClick(self: *Surface) !bool {
             return false;
         };
 
-        break :pin pin;
+        break :pin vp_pin;
     };
 
     // Get our cursor's most current prompt.
@@ -5011,6 +5086,14 @@ fn linkAtPos(
     // Convert our cursor position to a screen point, adjusting for block gaps.
     const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
     const mouse_pin: terminal.Pin = mouse_pin: {
+        if (self.renderer_state.terminal.block_list != null) {
+            if (self.blockPinFromPos(pos.y)) |bp| {
+                const pt = self.posToViewport(pos.x, pos.y);
+                var p = bp;
+                p.x = pt.x;
+                break :mouse_pin p;
+            }
+        }
         const point = self.posToViewport(pos.x, self.blockAdjustedY(pos.y));
         const pin = screen.pages.pin(.{ .viewport = point }) orelse {
             log.warn("failed to get pin for clicked point", .{});
@@ -5556,17 +5639,27 @@ pub fn cursorPosCallback(
             );
         }
 
-        // Convert to points, using block-gap-adjusted Y for correct row mapping.
-        const adjusted_vp = self.posToViewport(pos.x, self.blockAdjustedY(pos.y));
+        // Convert to pin, using block layout when available.
         const screen: *terminal.Screen = t.screens.active;
-        const pin = screen.pages.pin(.{
-            .viewport = .{
-                .x = adjusted_vp.x,
-                .y = adjusted_vp.y,
-            },
-        }) orelse {
-            if (comptime std.debug.runtime_safety) unreachable;
-            return;
+        const pin = pin: {
+            if (t.block_list != null) {
+                if (self.blockPinFromPos(pos.y)) |bp| {
+                    const pt = self.posToViewport(pos.x, pos.y);
+                    var p = bp;
+                    p.x = pt.x;
+                    break :pin p;
+                }
+            }
+            const adjusted_vp = self.posToViewport(pos.x, self.blockAdjustedY(pos.y));
+            break :pin screen.pages.pin(.{
+                .viewport = .{
+                    .x = adjusted_vp.x,
+                    .y = adjusted_vp.y,
+                },
+            }) orelse {
+                if (comptime std.debug.runtime_safety) unreachable;
+                return;
+            };
         };
 
         // Handle dragging depending on click count
@@ -5851,37 +5944,53 @@ pub fn posToViewport(self: Surface, xpos: f64, ypos: f64) terminal.point.Coordin
 ///
 /// Precondition: the renderer_state mutex must be held.
 fn blockAdjustedY(self: *const Surface, raw_y: f64) f64 {
+    // When block layout is active, use blockPinFromPos to get the actual pin,
+    // then convert to a Y that posToViewport will map correctly.
     const t: *terminal.Terminal = self.renderer_state.terminal;
     if (t.block_list == null) return raw_y;
-
-    const layout = t.block_layout orelse return raw_y;
-    const brl = layout.block_offsets.items;
-    if (brl.len == 0) return raw_y;
+    const layout = &(t.block_layout orelse return raw_y);
+    if (layout.block_offsets.items.len == 0) return raw_y;
 
     const cell_h: u32 = self.size.cell.height;
     if (cell_h == 0) return raw_y;
 
+    const pin = self.blockPinFromPos(raw_y) orelse return raw_y;
+    const screen_active: *terminal.Screen = t.screens.active;
+    const vp_pt = screen_active.pages.pointFromPin(.viewport, pin) orelse return raw_y;
     const padding_top: u32 = self.size.padding.top;
-    // Use rows * cell_height for viewport_h to match Terminal.height_px.
+    return @as(f64, @floatFromInt(padding_top)) +
+        @as(f64, @floatFromInt(vp_pt.viewport.y)) * @as(f64, @floatFromInt(cell_h)) +
+        @as(f64, @floatFromInt(cell_h)) / 2.0;
+}
+
+/// Map a screen pixel Y position to a PageList Pin using BlockLayout.
+/// This correctly handles filtered blocks (skipped output rows) and
+/// collapsed blocks. Returns null if no block contains the position.
+///
+/// Precondition: the renderer_state mutex must be held.
+fn blockPinFromPos(self: *const Surface, raw_y: f64) ?terminal.Pin {
+    const t: *terminal.Terminal = self.renderer_state.terminal;
+    const layout = &(t.block_layout orelse return null);
+    const brl = layout.block_offsets.items;
+    if (brl.len == 0) return null;
+
+    const cell_h: u32 = self.size.cell.height;
+    if (cell_h == 0) return null;
+
+    const padding_top: u32 = self.size.padding.top;
     const viewport_h: u32 = @as(u32, t.rows) * cell_h;
     const doc_h: u32 = layout.total_height_px;
     const scroll_px: u32 = t.scroll_offset_px;
 
-    // viewport_top_px: the virtual Y at the top of the viewport.
-    // Clamped to 0: when doc_h < viewport_h, content renders from the top.
     const viewport_top_i64: i64 = @max(0, @as(i64, @intCast(doc_h)) -
         @as(i64, @intCast(viewport_h)) -
         @as(i64, @intCast(scroll_px)));
 
-    // Convert screen pixel Y to virtual document Y.
     const content_y_f: f64 = raw_y - @as(f64, @floatFromInt(padding_top));
-    if (content_y_f < 0) return raw_y;
+    if (content_y_f < 0) return null;
     const virtual_y_i64: i64 = @as(i64, @intFromFloat(content_y_f)) + viewport_top_i64;
-    if (virtual_y_i64 < 0) return raw_y;
+    if (virtual_y_i64 < 0) return null;
     const virtual_y: u32 = @intCast(@min(virtual_y_i64, @as(i64, @intCast(doc_h))));
-
-    // Find which block contains this virtual Y and map to a viewport row.
-    const screen_active: *terminal.Screen = t.screens.active;
 
     for (brl, 0..) |info, layout_i| {
         const block_end = info.virtual_y_px + info.visible_height_px;
@@ -5891,35 +6000,41 @@ fn blockAdjustedY(self: *const Surface, raw_y: f64) f64 {
             const offset_in_block: u32 = virtual_y - info.virtual_y_px;
             const row_in_block: u32 = @min(offset_in_block / cell_h, info.visible_rows -| 1);
 
-            // Use the block's prompt_start_pin to find the viewport row.
-            if (screen_active.pages.pointFromPin(.viewport, info.prompt_start_pin)) |vp_pt| {
-                const first_row: u32 = @intCast(vp_pt.viewport.y);
-                const target_row: u32 = first_row + row_in_block;
-                return @as(f64, @floatFromInt(padding_top)) +
-                    @as(f64, @floatFromInt(target_row)) * @as(f64, @floatFromInt(cell_h)) +
-                    @as(f64, @floatFromInt(cell_h)) / 2.0;
-            }
-            return raw_y;
+            // For filtered blocks, map visual row to actual PageList row.
+            const actual_row_offset: u32 = if (info.filtered) blk: {
+                const out_off: u32 = info.output_row_offset;
+                if (row_in_block < out_off) break :blk row_in_block;
+                const match_idx = row_in_block - out_off;
+                if (info.filter_match_rows) |matches| {
+                    if (match_idx < matches.len) break :blk out_off + matches[match_idx];
+                }
+                break :blk row_in_block;
+            } else row_in_block;
+
+            return layout.pinAtBlockRow(info.block_list_index, actual_row_offset);
         }
 
         // Check if virtual_y is in a gap between this block and the next.
         if (layout_i + 1 < brl.len) {
             const next = brl[layout_i + 1];
             if (virtual_y >= block_end and virtual_y < next.virtual_y_px) {
-                // In a gap — clamp to the last visible row of the current block.
-                if (screen_active.pages.pointFromPin(.viewport, info.prompt_start_pin)) |vp_pt| {
-                    const first_row: u32 = @intCast(vp_pt.viewport.y);
-                    const target_row: u32 = first_row + info.visible_rows -| 1;
-                    return @as(f64, @floatFromInt(padding_top)) +
-                        @as(f64, @floatFromInt(target_row)) * @as(f64, @floatFromInt(cell_h)) +
-                        @as(f64, @floatFromInt(cell_h)) / 2.0;
-                }
-                return raw_y;
+                // In a gap — clamp to last visible row of current block.
+                const last_visual: u32 = info.visible_rows -| 1;
+                const last_actual: u32 = if (info.filtered) blk: {
+                    const out_off: u32 = info.output_row_offset;
+                    if (last_visual < out_off) break :blk last_visual;
+                    const match_idx = last_visual - out_off;
+                    if (info.filter_match_rows) |matches| {
+                        if (match_idx < matches.len) break :blk out_off + matches[match_idx];
+                    }
+                    break :blk last_visual;
+                } else last_visual;
+                return layout.pinAtBlockRow(info.block_list_index, last_actual);
             }
         }
     }
 
-    return raw_y;
+    return null;
 }
 
 /// Scroll to the bottom of the viewport.
@@ -6207,12 +6322,25 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             }
 
             // No active selection — if a block is highlighted, copy
-            // the entire block (prompt + input + output) as if the
-            // user had manually selected all the text in it.
+            // the block text. When a filter is active, copy only the
+            // matched output lines; otherwise copy the full block.
             if (self.io.terminal.highlighted_block_idx) |hl_idx| {
                 if (self.io.terminal.block_list) |bl| {
                     if (hl_idx < bl.blocks.items.len) {
                         const block = bl.blocks.items[hl_idx];
+
+                        // If block has an active filter, copy matched lines only.
+                        if (block.filter_match_rows) |matches| {
+                            if (matches.len > 0) {
+                                if (block.output_start) |os| {
+                                    self.copyFilteredLinesToClipboard(os.*, matches) catch |err| {
+                                        log.err("copy filtered lines failed: {}", .{err});
+                                    };
+                                    return true;
+                                }
+                            }
+                        }
+
                         const start_pin: terminal.PageList.Pin = pin: {
                             var p = block.prompt_start.*;
                             p.x = 0;
