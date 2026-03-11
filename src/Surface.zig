@@ -343,6 +343,7 @@ const DerivedConfig = struct {
     command_blocks_padding_left: u16,
     command_blocks_padding_right: u16,
     command_blocks_padding_header: u16,
+    command_blocks_padding_footer: u16,
 
     const Link = struct {
         regex: oni.Regex,
@@ -427,6 +428,7 @@ const DerivedConfig = struct {
             .command_blocks_padding_left = config.@"command-blocks-padding-left",
             .command_blocks_padding_right = config.@"command-blocks-padding-right",
             .command_blocks_padding_header = config.@"command-blocks-padding-header",
+            .command_blocks_padding_footer = config.@"command-blocks-padding-footer",
 
             // Assignments happen sequentially so we have to do this last
             // so that the memory is captured from allocs above.
@@ -2226,7 +2228,7 @@ fn copyBlockToClipboard(self: *Surface, t: *terminal.Terminal, block_idx: usize)
 
 /// Show a dropdown menu for the block toolbar at the given screen position.
 /// On macOS, uses NSMenu via the objc bridge; on other platforms, this is a no-op.
-fn showBlockToolbarMenu(self: *Surface, block_idx: usize, menu_x_px: u32, menu_y_px: u32, margin_px: u32) void {
+fn showBlockToolbarMenu(self: *Surface, block_idx: usize, menu_x_px: u32, menu_y_px: u32, margin_px: u32, align_right: bool) void {
     if (comptime !builtin.os.tag.isDarwin()) return;
 
     // Get the NSView from our surface (only available for embedded apprt on macOS).
@@ -2344,14 +2346,17 @@ fn showBlockToolbarMenu(self: *Surface, block_idx: usize, menu_x_px: u32, menu_y
     const content_scale = self.rt_surface.getContentScale() catch .{ .x = 1, .y = 1 };
     const view_h_points: f64 = @as(f64, @floatFromInt(self.size.screen.height)) / content_scale.y;
     const point_x: f64 = @as(f64, @floatFromInt(menu_x_px)) / content_scale.x;
-    const point_y: f64 = view_h_points - @as(f64, @floatFromInt(menu_y_px + margin_px * 2)) / content_scale.y;
 
-    // Force layout to get actual menu size for right-alignment.
+    // Force layout to get actual menu size for alignment.
     menu_obj.msgSend(void, objc.sel("update"), .{});
     const NSSize = extern struct { width: f64, height: f64 };
     const menu_size: NSSize = menu_obj.msgSend(NSSize, objc.sel("size"), .{});
     const menu_width: f64 = if (menu_size.width > 0) menu_size.width else 170;
-    const adjusted_x: f64 = point_x - menu_width;
+    const adjusted_x: f64 = if (align_right) point_x - menu_width else point_x;
+
+    // Position below the toolbar. macOS handles flipping the menu
+    // upward automatically when near the bottom of the screen.
+    const point_y: f64 = view_h_points - @as(f64, @floatFromInt(menu_y_px + margin_px * 2)) / content_scale.y;
 
     const NSPoint = extern struct { x: f64, y: f64 };
     _ = menu_obj.msgSend(
@@ -4409,7 +4414,7 @@ pub fn mouseButtonCallback(
     // For left button clicks we always record some information for
     // selection/highlighting purposes.
     // Deferred menu popup info (must be shown after mutex is released).
-    const DeferredMenu = struct { block_idx: usize, menu_x_px: u32, menu_y_px: u32, margin_px: u32 };
+    const DeferredMenu = struct { block_idx: usize, menu_x_px: u32, menu_y_px: u32, margin_px: u32, align_right: bool };
     var deferred_menu: ?DeferredMenu = null;
 
     if (button == .left and action == .press) click: {
@@ -4559,11 +4564,25 @@ pub fn mouseButtonCallback(
                             const f_bar_h_c = cell_h;
                             const grid_right_c = self.size.padding.left + t.cols * cell_w;
                             const f_bar_w_c: u32 = @min(grid_right_c -| self.size.padding.left -| cell_w * 2, cell_w * 30);
-                            const f_bar_x_c: u32 = grid_right_c -| f_bar_w_c -| cell_w;
+                            const f_is_right = self.config.command_blocks_toolbar_position == .@"upper-right" or
+                                self.config.command_blocks_toolbar_position == .@"lower-right";
+                            const f_is_upper = self.config.command_blocks_toolbar_position == .@"upper-right" or
+                                self.config.command_blocks_toolbar_position == .@"upper-left";
+                            const f_blk_pad_right: u32 = self.config.command_blocks_padding_right;
+                            const f_blk_pad_left: u32 = self.config.command_blocks_padding_left;
+                            const f_bar_x_c: u32 = if (f_is_right)
+                                grid_right_c -| f_bar_w_c -| f_blk_pad_right
+                            else
+                                self.size.padding.left + f_blk_pad_left;
                             const click_x_fc: u32 = @intFromFloat(@max(0, pos.x));
                             const click_y_fc: u32 = @intFromFloat(@max(0, pos.y));
 
-                            if (click_y_fc >= f_screen_y and click_y_fc < f_screen_y + f_bar_h_c and
+                            const f_bar_y_c: u32 = if (f_is_upper)
+                                f_screen_y
+                            else
+                                (f_screen_y + info.visible_height_px) -| f_bar_h_c;
+
+                            if (click_y_fc >= f_bar_y_c and click_y_fc < f_bar_y_c + f_bar_h_c and
                                 click_x_fc >= f_bar_x_c and click_x_fc < f_bar_x_c + f_bar_w_c)
                             {
                                 // Check if click is on the X close button (right portion of bar).
@@ -4614,11 +4633,18 @@ pub fn mouseButtonCallback(
                                 grid_right -| toolbar_w -| blk_pad_right
                             else
                                 self.size.padding.left + blk_pad_left;
+                            // Clip block height to viewport, same as the renderer.
+                            const clip_top: u32 = if (block_screen_y_i64 < 0)
+                                @intCast(-block_screen_y_i64)
+                            else
+                                0;
+                            const clipped_h: u32 = @min(info.visible_height_px -| clip_top, self.size.screen.height -| block_screen_y);
                             const toolbar_min_y: u32 = self.config.command_blocks_padding_header;
+                            const toolbar_max_y: u32 = self.size.screen.height -| self.config.command_blocks_padding_footer -| toolbar_h;
                             const toolbar_y: u32 = if (is_upper)
                                 @max(block_screen_y, toolbar_min_y)
                             else
-                                (block_screen_y + info.visible_height_px) -| toolbar_h;
+                                @min((block_screen_y + clipped_h) -| toolbar_h, toolbar_max_y);
 
                             const click_x: u32 = @intFromFloat(@max(0, pos.x));
                             const click_y: u32 = @intFromFloat(@max(0, pos.y));
@@ -4649,9 +4675,10 @@ pub fn mouseButtonCallback(
                                             // appearing below the toolbar.
                                             deferred_menu = .{
                                                 .block_idx = info.block_list_index,
-                                                .menu_x_px = toolbar_x + toolbar_w,
+                                                .menu_x_px = if (is_right) toolbar_x + toolbar_w else toolbar_x,
                                                 .menu_y_px = toolbar_y + toolbar_h,
                                                 .margin_px = icon_padding,
+                                                .align_right = is_right,
                                             };
                                         },
                                         .filter => {
@@ -4737,7 +4764,7 @@ pub fn mouseButtonCallback(
 
     // Show deferred menu popup (after mutex is released).
     if (deferred_menu) |dm| {
-        self.showBlockToolbarMenu(dm.block_idx, dm.menu_x_px, dm.menu_y_px, dm.margin_px);
+        self.showBlockToolbarMenu(dm.block_idx, dm.menu_x_px, dm.menu_y_px, dm.margin_px, dm.align_right);
     }
 
     // Middle-click pastes from our selection clipboard
@@ -5415,11 +5442,18 @@ pub fn cursorPosCallback(
                             @intCast(block_screen_y_i64)
                         else
                             0;
+                        // Clip block height to viewport, same as the renderer.
+                        const clip_top: u32 = if (block_screen_y_i64 < 0)
+                            @intCast(-block_screen_y_i64)
+                        else
+                            0;
+                        const clipped_h: u32 = @min(info.visible_height_px -| clip_top, self.size.screen.height -| block_screen_y);
                         const toolbar_min_y: u32 = self.config.command_blocks_padding_header;
+                        const toolbar_max_y: u32 = self.size.screen.height -| self.config.command_blocks_padding_footer -| toolbar_h;
                         const toolbar_y: u32 = if (is_upper)
                             @max(block_screen_y, toolbar_min_y)
                         else
-                            (block_screen_y + info.visible_height_px) -| toolbar_h;
+                            @min((block_screen_y + clipped_h) -| toolbar_h, toolbar_max_y);
 
                         const mx: u32 = @intFromFloat(@max(0, pos.x));
                         const my: u32 = @intFromFloat(@max(0, pos.y));

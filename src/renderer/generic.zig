@@ -2316,8 +2316,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             const grid_right_f: u32 = self.size.padding.left + grid_cols_f * f_cell_w;
                             // Filter bar spans most of the block width.
                             const f_bar_w: u32 = @min(grid_right_f -| self.size.padding.left -| f_cell_w * 2, f_cell_w * 30);
-                            const f_bar_x: u32 = grid_right_f -| f_bar_w -| f_cell_w;
-                            const f_bar_y: u32 = f_region.screen_y_px;
+                            // Position filter bar using same toolbar position config.
+                            const f_is_right = self.config.command_blocks_toolbar_position == .@"upper-right" or
+                                self.config.command_blocks_toolbar_position == .@"lower-right";
+                            const f_is_upper = self.config.command_blocks_toolbar_position == .@"upper-right" or
+                                self.config.command_blocks_toolbar_position == .@"upper-left";
+                            const f_blk_pad_right: u32 = self.config.command_blocks_padding_right;
+                            const f_blk_pad_left: u32 = self.config.command_blocks_padding_left;
+                            const f_bar_x: u32 = if (f_is_right)
+                                grid_right_f -| f_bar_w -| f_blk_pad_right
+                            else
+                                self.size.padding.left + f_blk_pad_left;
+                            const f_toolbar_min_y: u32 = self.config.command_blocks_padding_header;
+                            const f_toolbar_max_y: u32 = self.size.screen.height -| self.config.command_blocks_padding_footer -| f_bar_h;
+                            const f_bar_y: u32 = if (f_is_upper)
+                                @max(f_region.screen_y_px, f_toolbar_min_y)
+                            else
+                                @min((f_region.screen_y_px + f_region.height_px) -| f_bar_h, f_toolbar_max_y);
 
                             const f_corner_radius: f32 = if (self.config.command_blocks_toolbar_radius > 0)
                                 @floatFromInt(self.config.command_blocks_toolbar_radius)
@@ -2549,10 +2564,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         else
                             self.size.padding.left + blk_pad_left;
                         const toolbar_min_y: u32 = self.config.command_blocks_padding_header;
+                        const toolbar_max_y: u32 = self.size.screen.height -| self.config.command_blocks_padding_footer -| toolbar_h;
                         const toolbar_y: u32 = if (is_upper)
                             @max(region.screen_y_px, toolbar_min_y)
                         else
-                            (region.screen_y_px + region.height_px) -| toolbar_h;
+                            @min((region.screen_y_px + region.height_px) -| toolbar_h, toolbar_max_y);
 
                         const corner_radius: f32 = if (self.config.command_blocks_toolbar_radius > 0)
                             @floatFromInt(self.config.command_blocks_toolbar_radius)
