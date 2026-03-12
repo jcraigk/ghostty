@@ -111,6 +111,9 @@ filter_input_block_idx: ?usize = null,
 /// Text being typed into the filter input. Owned by gpa.
 filter_input_buf: std.ArrayListUnmanaged(u8) = .empty,
 
+/// Whether filter uses regex matching instead of literal substring.
+filter_regex_mode: bool = false,
+
 /// Auto-collapse threshold: when a new block is created, automatically
 /// collapse the block N positions back from the newest. Set by the
 /// renderer from config. null = disabled.
@@ -1590,7 +1593,16 @@ pub fn dismissFilterInput(self: *Terminal) void {
     }
     self.filter_input_block_idx = null;
     self.filter_input_buf.clearRetainingCapacity();
+    self.filter_regex_mode = false;
     if (self.block_layout) |*layout| layout.invalidate();
+}
+
+/// Toggle regex mode for the filter and reapply.
+pub fn toggleFilterRegexMode(self: *Terminal) void {
+    self.filter_regex_mode = !self.filter_regex_mode;
+    if (self.filter_input_block_idx) |bi| {
+        self.applyFilterToBlock(bi);
+    }
 }
 
 /// Apply the current filter text to the given block.
@@ -1598,7 +1610,7 @@ fn applyFilterToBlock(self: *Terminal, block_idx: usize) void {
     const bl = &(self.block_list orelse return);
     if (block_idx >= bl.blocks.items.len) return;
     var block = &bl.blocks.items[block_idx];
-    block.applyFilter(bl.alloc, self.filter_input_buf.items);
+    block.applyFilter(bl.alloc, self.filter_input_buf.items, self.filter_regex_mode);
     if (self.block_layout) |*layout| layout.invalidate();
 }
 

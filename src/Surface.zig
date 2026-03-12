@@ -3035,6 +3035,12 @@ pub fn keyCallback(
                 self.renderer_state.mutex.unlock();
                 try self.queueRender();
                 return .consumed;
+            } else if (event.key == .key_r and event.mods.super) {
+                // Cmd+R toggles regex mode.
+                t.toggleFilterRegexMode();
+                self.renderer_state.mutex.unlock();
+                try self.queueRender();
+                return .consumed;
             } else if (event.utf8.len > 0) {
                 t.appendFilterText(event.utf8);
                 self.renderer_state.mutex.unlock();
@@ -4681,6 +4687,15 @@ pub fn mouseButtonCallback(
                                             }
                                         }
                                     }
+                                    try self.queueRender();
+                                    break :handle_block;
+                                }
+                                // Check if click is on the ".*" regex toggle (left region).
+                                // The ".*" glyphs start at f_bar_x + f_bar_h/4 + 4 and span
+                                // 3 cell widths (2 chars + space). Use that as the hit region.
+                                const regex_region_end = f_bar_x_c + f_bar_h_c / 4 + 4 + cell_w * 3;
+                                if (click_x_fc < regex_region_end) {
+                                    t.toggleFilterRegexMode();
                                     try self.queueRender();
                                     break :handle_block;
                                 }

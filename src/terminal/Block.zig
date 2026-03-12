@@ -6,6 +6,7 @@ const Block = @This();
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const oni = @import("oniguruma");
 const PageList = @import("PageList.zig");
 const pagepkg = @import("page.zig");
 const size = @import("size.zig");
@@ -138,8 +139,10 @@ pub fn outputText(self: Block, pages: *PageList, buf: []u8) []const u8 {
 
 /// Apply a case-insensitive literal filter to this block's output rows.
 /// Stores matching row indices (0-based from output_start) and the filter text.
-/// Passing an empty needle clears the filter.
-pub fn applyFilter(self: *Block, alloc: Allocator, needle: []const u8) void {
+/// Passing an empty needle clears the filter. When `use_regex` is true, the
+/// needle is compiled as an Oniguruma regex (case-insensitive); invalid patterns
+/// match nothing.
+pub fn applyFilter(self: *Block, alloc: Allocator, needle: []const u8, use_regex: bool) void {
     // Free previous filter data.
     if (self.filter_match_rows) |m| alloc.free(m);
     if (self.filter_text) |t| alloc.free(t);
@@ -154,6 +157,21 @@ pub fn applyFilter(self: *Block, alloc: Allocator, needle: []const u8) void {
     // Store needle.
     self.filter_text = alloc.dupe(u8, needle) catch return;
 
+    // Compile regex if in regex mode. If the pattern is invalid, we
+    // treat it as matching nothing (empty result set).
+    var regex: ?oni.Regex = if (use_regex)
+        oni.Regex.init(needle, .{ .ignorecase = true }, oni.Encoding.utf8, oni.Syntax.default, null) catch null
+    else
+        null;
+    defer if (regex) |*re| re.deinit();
+
+    // Lowercase needle for literal mode (computed once, not per-row).
+    var needle_lower: [256]u8 = undefined;
+    const nl = @min(needle.len, needle_lower.len);
+    for (needle[0..nl], 0..) |c, ci| {
+        needle_lower[ci] = if (c >= 'A' and c <= 'Z') c + 32 else c;
+    }
+
     // Scan output rows and collect indices of matching ones.
     var matches: std.ArrayListUnmanaged(u32) = .empty;
     var row_idx: u32 = 0;
@@ -164,32 +182,47 @@ pub fn applyFilter(self: *Block, alloc: Allocator, needle: []const u8) void {
         var row_buf: [4096]u8 = undefined;
         var written: usize = 0;
         const cells = row_pin.cells(.all);
-        for (cells) |cell| {
-            if (!cell.hasText()) continue;
-            if (cell.wide == .spacer_tail) continue;
-            const cp = cell.content.codepoint;
-            // Convert codepoint to lowercase for case-insensitive match.
-            const lower_cp = if (cp >= 'A' and cp <= 'Z') cp + 32 else cp;
-            const len = std.unicode.utf8CodepointSequenceLength(lower_cp) catch continue;
-            if (written + len > row_buf.len) break;
-            _ = std.unicode.utf8Encode(lower_cp, row_buf[written..]) catch continue;
-            written += len;
+        if (use_regex) {
+            // Regex mode: preserve original case.
+            for (cells) |cell| {
+                if (!cell.hasText()) continue;
+                if (cell.wide == .spacer_tail) continue;
+                const cp = cell.content.codepoint;
+                const len = std.unicode.utf8CodepointSequenceLength(cp) catch continue;
+                if (written + len > row_buf.len) break;
+                _ = std.unicode.utf8Encode(cp, row_buf[written..]) catch continue;
+                written += len;
+            }
+        } else {
+            // Literal mode: lowercase for case-insensitive match.
+            for (cells) |cell| {
+                if (!cell.hasText()) continue;
+                if (cell.wide == .spacer_tail) continue;
+                const cp = cell.content.codepoint;
+                const lower_cp = if (cp >= 'A' and cp <= 'Z') cp + 32 else cp;
+                const len = std.unicode.utf8CodepointSequenceLength(lower_cp) catch continue;
+                if (written + len > row_buf.len) break;
+                _ = std.unicode.utf8Encode(lower_cp, row_buf[written..]) catch continue;
+                written += len;
+            }
         }
         // Trim trailing spaces.
         while (written > 0 and row_buf[written - 1] == ' ') written -= 1;
 
-        // Lowercase needle for comparison.
-        var needle_lower: [256]u8 = undefined;
-        const nl = @min(needle.len, needle_lower.len);
-        for (needle[0..nl], 0..) |c, ci| {
-            needle_lower[ci] = if (c >= 'A' and c <= 'Z') c + 32 else c;
-        }
-
-        if (written >= nl and nl > 0) {
-            // Search for needle in row text.
-            if (std.mem.indexOf(u8, row_buf[0..written], needle_lower[0..nl]) != null) {
-                matches.append(alloc, row_idx) catch {};
+        const row_text = row_buf[0..written];
+        const matched = if (regex) |*re| blk: {
+            var region = re.search(row_text, .{}) catch break :blk false;
+            defer region.deinit();
+            break :blk region.count() > 0;
+        } else blk: {
+            if (written >= nl and nl > 0) {
+                break :blk std.mem.indexOf(u8, row_text, needle_lower[0..nl]) != null;
             }
+            break :blk false;
+        };
+
+        if (matched) {
+            matches.append(alloc, row_idx) catch {};
         }
         row_idx += 1;
     }

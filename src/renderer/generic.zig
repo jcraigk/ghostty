@@ -244,6 +244,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Filter text glyph rendering state (populated in rebuildCells, drawn in drawFrame).
         filter_text_base_instance: usize = 0,
         filter_text_glyph_count: usize = 0,
+        /// Column offset for filter text due to regex indicator prefix (".*" + space).
+        filter_text_col_offset: u16 = 0,
 
 
         const BlockRegion = struct {
@@ -2374,6 +2376,44 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                 // Draw filter text using the icon scratch row color.
                                 const f_icon_scratch: f32 = f_toolbar_scratch + 1.0;
 
+                                // Regex toggle button highlight background when active.
+                                if (ts.filter_regex_mode) {
+                                    const rx_margin: u32 = @max(1, f_bar_h / 6);
+                                    const rx_x = f_bar_x + rx_margin;
+                                    const rx_y = f_bar_y + rx_margin;
+                                    // Width covers ".*" text (2 cells + padding).
+                                    const rx_w = f_cell_w * 2 + f_bar_h / 4 + 4 -| rx_margin;
+                                    const rx_h = f_bar_h -| rx_margin * 2;
+                                    const rx_x_f: f32 = @floatFromInt(rx_x);
+                                    const rx_y_f: f32 = @floatFromInt(rx_y);
+                                    const rx_w_f: f32 = @floatFromInt(rx_w);
+                                    const rx_h_f: f32 = @floatFromInt(rx_h);
+                                    const rx_radius: f32 = if (self.config.command_blocks_toolbar_icon_radius > 0)
+                                        @floatFromInt(self.config.command_blocks_toolbar_icon_radius)
+                                    else
+                                        4.0;
+                                    // Use the pressed highlight scratch row (brighter bg).
+                                    const f_pressed_scratch: f32 = f_toolbar_scratch + 3.0;
+                                    pass.step(.{
+                                        .pipeline = self.shaders.pipelines.cell_bg,
+                                        .uniforms = frame.uniforms.buffer,
+                                        .buffers = &.{ null, frame.cells_bg.buffer },
+                                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                        .scissor = .{ .x = rx_x, .y = rx_y, .width = rx_w, .height = rx_h },
+                                        .block_params = .{
+                                            .block_y_offset = 0,
+                                            .block_first_row = f_pressed_scratch,
+                                            .block_x_offset = -pad_left,
+                                            .block_y_flat = 1.0,
+                                            .block_corner_radius = rx_radius,
+                                            .block_scissor_x = rx_x_f,
+                                            .block_scissor_y = rx_y_f,
+                                            .block_scissor_w = rx_w_f,
+                                            .block_scissor_h = rx_h_f,
+                                        },
+                                    });
+                                }
+
                                 // Render filter text as actual glyphs and a cursor bar.
                                 // We add glyph cells to fg_rows[0] and issue a separate
                                 // cell_text draw call with block_params that map grid positions
@@ -2400,7 +2440,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                 // Use actual input text length for cursor, not glyph count
                                 // (glyph count may include placeholder "Filter" text).
                                 const filter_input_len: u32 = @intCast(@min(filter_text.len, std.math.maxInt(u32)));
-                                const cursor_px_x = filter_text_x_start + filter_input_len * f_cell_w;
+                                const cursor_px_x = filter_text_x_start + (@as(u32, self.filter_text_col_offset) + filter_input_len) * f_cell_w;
                                 const cursor_bar_w: u32 = @max(2, f_cell_w / 5);
                                 const close_region_w: u32 = f_bar_h;
                                 const max_text_x: u32 = (f_bar_x + f_bar_w) -| close_region_w;
@@ -4411,6 +4451,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // This MUST be after cursor setup (setCursor clears fg_rows[0]).
             self.filter_text_glyph_count = 0;
             self.filter_text_base_instance = 0;
+            self.filter_text_col_offset = 0;
             if (state.filter_input_block_idx != null) {
                 const lists_ft = self.cells.fg_rows.lists;
                 if (lists_ft.len > 0) {
@@ -4422,11 +4463,44 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         .{ fg_ft.r, fg_ft.g, fg_ft.b, 255 }
                     else
                         .{ fg_ft.r / 2, fg_ft.g / 2, fg_ft.b / 2, 255 };
+
+                    var ft_col: u16 = 0;
+
+                    // Render ".*" regex mode indicator at the start of the filter bar.
+                    // Bright when active, dim when inactive.
+                    {
+                        const regex_active = state.filter_regex_mode;
+                        const regex_fg: [4]u8 = if (regex_active)
+                            .{ fg_ft.r, fg_ft.g, fg_ft.b, 255 }
+                        else
+                            .{ fg_ft.r / 3, fg_ft.g / 3, fg_ft.b / 3, 255 };
+                        for (".*") |ch| {
+                            const render_rx = self.font_grid.renderCodepoint(
+                                self.alloc,
+                                @intCast(ch),
+                                .regular,
+                                .text,
+                                .{ .grid_metrics = self.grid_metrics },
+                            ) catch continue;
+                            const glyph_rx = render_rx orelse continue;
+                            lists_ft[0].append(self.alloc, .{
+                                .atlas = .grayscale,
+                                .grid_pos = .{ ft_col, 0 },
+                                .color = regex_fg,
+                                .glyph_pos = .{ glyph_rx.glyph.atlas_x, glyph_rx.glyph.atlas_y },
+                                .glyph_size = .{ glyph_rx.glyph.width, glyph_rx.glyph.height },
+                                .bearings = .{ @intCast(glyph_rx.glyph.offset_x), @intCast(glyph_rx.glyph.offset_y) },
+                            }) catch continue;
+                            ft_col += 1;
+                        }
+                        ft_col += 1; // space after ".*"
+                        self.filter_text_col_offset = ft_col;
+                    }
+
                     const text_to_render: []const u8 = if (has_text)
                         state.filter_input_text.items
                     else
                         "Filter";
-                    var ft_col: u16 = 0;
                     for (text_to_render) |ch| {
                         if (ch < 0x20 or ch > 0x7e) continue;
                         const render_ft = self.font_grid.renderCodepoint(

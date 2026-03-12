@@ -136,6 +136,8 @@ pub const RenderState = struct {
     filter_input_block_idx: ?usize = null,
     /// The current filter input text (snapshot from Terminal).
     filter_input_text: std.ArrayListUnmanaged(u8) = .empty,
+    /// Whether the filter is in regex mode.
+    filter_regex_mode: bool = false,
     /// Number of output rows matching the current filter (0 if no filter).
     filter_match_count: u32 = 0,
     /// Total output rows in the filtered block (0 if no filter).
@@ -693,6 +695,10 @@ pub const RenderState = struct {
             // Filter input state.
             const prev_filter_idx = self.filter_input_block_idx;
             self.filter_input_block_idx = t.filter_input_block_idx;
+            if (self.filter_regex_mode != t.filter_regex_mode) {
+                self.filter_regex_mode = t.filter_regex_mode;
+                self.dirty = .full;
+            }
             {
                 const text = t.filter_input_buf.items;
                 if (!std.mem.eql(u8, self.filter_input_text.items, text)) {
