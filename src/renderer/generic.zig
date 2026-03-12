@@ -246,6 +246,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         filter_text_glyph_count: usize = 0,
         /// Column offset for filter text due to regex indicator prefix (".*" + space).
         filter_text_col_offset: u16 = 0,
+        /// Cursor blink state for the filter bar cursor.
+        filter_cursor_blink_visible: bool = true,
 
 
         const BlockRegion = struct {
@@ -1562,14 +1564,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.draw_mutex.lock();
                 defer self.draw_mutex.unlock();
 
+                // Store blink state for the filter bar cursor.
+                self.filter_cursor_blink_visible = cursor_blink_visible;
+
                 // Build our GPU cells
-                self.rebuildCells(
-                    critical.preedit,
+                // Hide the terminal cursor when filter input is active.
+                const cursor_style_val: ?renderer.CursorStyle = if (self.terminal_state.filter_input_block_idx != null)
+                    null
+                else
                     renderer.cursorStyle(&self.terminal_state, .{
                         .preedit = critical.preedit != null,
                         .focused = self.focused,
                         .blink_visible = cursor_blink_visible,
-                    }),
+                    });
+                self.rebuildCells(
+                    critical.preedit,
+                    cursor_style_val,
                     &critical.links,
                 ) catch |err| {
                     // This means we weren't able to allocate our buffer
@@ -2439,12 +2449,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                 // Cursor bar using cell_bg (thin vertical rectangle).
                                 // Use actual input text length for cursor, not glyph count
                                 // (glyph count may include placeholder "Filter" text).
+                                // Only show when blink state is visible.
                                 const filter_input_len: u32 = @intCast(@min(filter_text.len, std.math.maxInt(u32)));
                                 const cursor_px_x = filter_text_x_start + (@as(u32, self.filter_text_col_offset) + filter_input_len) * f_cell_w;
                                 const cursor_bar_w: u32 = @max(2, f_cell_w / 5);
                                 const close_region_w: u32 = f_bar_h;
                                 const max_text_x: u32 = (f_bar_x + f_bar_w) -| close_region_w;
-                                if (cursor_px_x + cursor_bar_w < max_text_x) {
+                                if (self.filter_cursor_blink_visible and cursor_px_x + cursor_bar_w < max_text_x) {
                                     const cb_y_top = f_bar_y + f_bar_h / 6;
                                     const cb_h_px = f_bar_h -| f_bar_h / 3;
                                     const cb_x_f: f32 = @floatFromInt(cursor_px_x);
