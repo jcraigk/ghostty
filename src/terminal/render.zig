@@ -9,6 +9,7 @@ const highlight = @import("highlight.zig");
 const point = @import("point.zig");
 const size = @import("size.zig");
 const page = @import("page.zig");
+const Block = @import("Block.zig");
 const BlockLayout = @import("BlockLayout.zig");
 const PageList = @import("PageList.zig");
 const Selection = @import("Selection.zig");
@@ -135,6 +136,10 @@ pub const RenderState = struct {
     filter_input_block_idx: ?usize = null,
     /// The current filter input text (snapshot from Terminal).
     filter_input_text: std.ArrayListUnmanaged(u8) = .empty,
+    /// Number of output rows matching the current filter (0 if no filter).
+    filter_match_count: u32 = 0,
+    /// Total output rows in the filtered block (0 if no filter).
+    filter_total_rows: u32 = 0,
 
     /// The cached selection so we can avoid expensive selection calculations
     /// if possible.
@@ -696,6 +701,26 @@ pub const RenderState = struct {
                     self.dirty = .full;
                 } else if (!std.meta.eql(prev_filter_idx, self.filter_input_block_idx)) {
                     self.dirty = .full;
+                }
+            }
+
+            // Snapshot filter match counts from the block.
+            self.filter_match_count = 0;
+            self.filter_total_rows = 0;
+            if (self.filter_input_block_idx) |fbi| {
+                if (t.block_list) |*bl| {
+                    if (fbi < bl.blocks.items.len) {
+                        const blk = &bl.blocks.items[fbi];
+                        if (blk.filter_match_rows) |m| {
+                            self.filter_match_count = @intCast(m.len);
+                        }
+                        // Total output rows: block total minus prompt+input rows.
+                        if (blk.output_start) |os| {
+                            const total = blk.cached_row_count orelse 0;
+                            const prompt_rows = Block.countRowsBetweenPins(blk.prompt_start.*, os.*);
+                            self.filter_total_rows = total -| prompt_rows;
+                        }
+                    }
                 }
             }
 

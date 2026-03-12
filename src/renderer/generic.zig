@@ -4447,6 +4447,56 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         }) catch continue;
                         ft_col += 1;
                     }
+
+                    // Append right-aligned match count label (e.g., "3 of 47")
+                    // in dimmed color, only when there's actual filter input.
+                    if (has_text and state.filter_total_rows > 0) {
+                        var count_buf: [32]u8 = undefined;
+                        const count_str = std.fmt.bufPrint(&count_buf, "{d} of {d}", .{
+                            state.filter_match_count,
+                            state.filter_total_rows,
+                        }) catch "";
+                        // Compute max text columns in the filter bar.
+                        // Bar layout: [pad] [text area] [copy btn] [close btn]
+                        // Each button is cell_height wide; text starts at ~cell_h/4+4 from bar left.
+                        const cell_w_ft = self.grid_metrics.cell_width;
+                        const cell_h_ft = self.grid_metrics.cell_height;
+                        const grid_cols_ft: u32 = self.cells.size.columns;
+                        const grid_right_ft: u32 = self.size.padding.left + grid_cols_ft * cell_w_ft;
+                        const bar_w_ft: u32 = @min(grid_right_ft -| self.size.padding.left -| cell_w_ft * 2, cell_w_ft * 30);
+                        const text_start_offset: u32 = cell_h_ft / 4 + 4;
+                        const buttons_w: u32 = cell_h_ft * 2; // copy + close
+                        const text_area_px: u32 = bar_w_ft -| text_start_offset -| buttons_w;
+                        const max_text_cols: u16 = @intCast(@min(text_area_px / cell_w_ft, std.math.maxInt(u16)));
+                        const count_len: u16 = @intCast(@min(count_str.len, std.math.maxInt(u16)));
+                        // Right-align: place count at (max_text_cols - count_len - 1) for a gap.
+                        if (count_len + 1 < max_text_cols) {
+                            const count_start_col: u16 = max_text_cols - count_len;
+                            const count_fg: [4]u8 = .{ fg_ft.r / 2, fg_ft.g / 2, fg_ft.b / 2, 255 };
+                            var ct_col: u16 = count_start_col;
+                            for (count_str) |ch| {
+                                if (ch < 0x20 or ch > 0x7e) continue;
+                                const render_ct = self.font_grid.renderCodepoint(
+                                    self.alloc,
+                                    @intCast(ch),
+                                    .regular,
+                                    .text,
+                                    .{ .grid_metrics = self.grid_metrics },
+                                ) catch continue;
+                                const glyph_ct = render_ct orelse continue;
+                                lists_ft[0].append(self.alloc, .{
+                                    .atlas = .grayscale,
+                                    .grid_pos = .{ ct_col, 0 },
+                                    .color = count_fg,
+                                    .glyph_pos = .{ glyph_ct.glyph.atlas_x, glyph_ct.glyph.atlas_y },
+                                    .glyph_size = .{ glyph_ct.glyph.width, glyph_ct.glyph.height },
+                                    .bearings = .{ @intCast(glyph_ct.glyph.offset_x), @intCast(glyph_ct.glyph.offset_y) },
+                                }) catch continue;
+                                ct_col += 1;
+                            }
+                        }
+                    }
+
                     self.filter_text_glyph_count = lists_ft[0].items.len - self.filter_text_base_instance;
                 }
             }
