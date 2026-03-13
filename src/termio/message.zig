@@ -62,6 +62,12 @@ pub const Message = union(enum) {
     /// Jump forward/backward n prompts.
     jump_to_prompt: isize,
 
+    /// Toggle collapse on the currently highlighted block.
+    toggle_block_collapse: void,
+
+    /// Navigate to the previous or next command block.
+    goto_block: enum { previous, next },
+
     /// Send this when a synchronized output mode is started. This will
     /// start the timer so that the output mode is disabled after a
     /// period of time so that a bad actor can't hang the terminal.

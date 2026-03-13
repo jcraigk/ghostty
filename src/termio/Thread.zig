@@ -330,6 +330,8 @@ fn drainMailbox(
                 }
             },
             .jump_to_prompt => |v| try io.jumpToPrompt(v),
+            .toggle_block_collapse => try io.toggleBlockCollapse(),
+            .goto_block => |dir| try io.gotoBlock(dir),
             .start_synchronized_output => self.startSynchronizedOutput(cb),
             .linefeed_mode => |v| self.flags.linefeed_mode = v,
             .focused => |v| try io.focusGained(data, v),

@@ -80,6 +80,7 @@ pub fn scroll_viewport(
         .top => .top,
         .bottom => .bottom,
         .delta => .{ .delta = behavior.value.delta },
+        .delta_px => .{ .delta_px = behavior.value.delta_px },
     });
 }
 

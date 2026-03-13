@@ -30,6 +30,8 @@ const ReadonlyStream = @import("stream_readonly.zig").Stream;
 const size = @import("size.zig");
 const pagepkg = @import("page.zig");
 const style = @import("style.zig");
+const Block = @import("Block.zig");
+const BlockLayout = @import("BlockLayout.zig");
 const Screen = @import("Screen.zig");
 const ScreenSet = @import("ScreenSet.zig");
 const Page = pagepkg.Page;
@@ -67,6 +69,62 @@ scrolling_region: ScrollingRegion,
 
 /// The last reported pwd, if any.
 pwd: std.ArrayList(u8),
+
+/// Ordered list of command blocks, built incrementally from OSC 133
+/// sequences. Only populated when command-blocks is enabled.
+block_list: ?Block.BlockList = null,
+
+/// Pixel-based virtual document layout computed from block_list.
+/// The single source of truth for block positioning, scroll bounds,
+/// and viewport mapping. Only populated when command-blocks is enabled.
+block_layout: ?BlockLayout = null,
+
+/// Pixel scroll offset from the bottom of the virtual document.
+/// 0 = following (viewport at bottom, auto-scrolls on new output).
+/// Values > 0 = scrolled up by that many pixels.
+/// Replaces the old block_scroll_px + PageList viewport scroll model.
+scroll_offset_px: u32 = 0,
+
+/// Index into block_list.blocks of the currently highlighted block, or
+/// null if no block is highlighted. Only one block can be highlighted
+/// at a time. The active (last) block cannot be highlighted.
+highlighted_block_idx: ?usize = null,
+
+/// Index into BlockList.blocks of the block currently under the mouse
+/// cursor, or null if the mouse is not over any completed block.
+/// Set by Surface.zig during mouse move; read by the renderer for toolbar.
+hovered_block_idx: ?usize = null,
+
+/// Index of the toolbar icon currently under the mouse cursor (0-based,
+/// in display order), or null if not hovering over any icon.
+/// Set by Surface.zig during mouse move; read by the renderer for hover highlight.
+hovered_toolbar_icon: ?u32 = null,
+
+/// Index of the toolbar icon currently pressed (mouse-down), for visual
+/// feedback. Cleared on mouse-up or mouse-move off the toolbar.
+pressed_toolbar_icon: ?u32 = null,
+
+/// Whether the filter bar copy button is currently pressed (mouse-down).
+pressed_filter_copy: bool = false,
+
+/// Block index with an active filter input, or null if no filter is active.
+/// When set, keyboard input is captured for the filter text field.
+filter_input_block_idx: ?usize = null,
+
+/// Text being typed into the filter input. Owned by gpa.
+filter_input_buf: std.ArrayListUnmanaged(u8) = .empty,
+
+/// Whether filter uses regex matching instead of literal substring.
+filter_regex_mode: bool = false,
+
+/// Auto-collapse threshold: when a new block is created, automatically
+/// collapse the block N positions back from the newest. Set by the
+/// renderer from config. null = disabled.
+auto_collapse_threshold: ?u16 = null,
+
+/// Number of output preview lines to show when a block is collapsed.
+/// Set by the renderer from config.
+collapse_preview_lines: u16 = 0,
 
 /// The color state for this terminal.
 colors: Colors,
@@ -229,6 +287,9 @@ pub fn init(
 }
 
 pub fn deinit(self: *Terminal, alloc: Allocator) void {
+    if (self.block_layout) |*layout| layout.deinit();
+    if (self.block_list) |*bl| bl.deinit();
+    self.filter_input_buf.deinit(self.gpa());
     self.tabstops.deinit(alloc);
     self.screens.deinit(alloc);
     self.pwd.deinit(alloc);
@@ -1189,8 +1250,13 @@ pub fn semanticPrompt(
                 }
             }
 
-            // The "aid" and "cl" options are also valid for this
-            // command but we don't yet handle these in any meaningful way.
+            // Track this as a new command block, but only for initial prompts.
+            // Continuation (k=c) and secondary (k=s) prompts are part of
+            // the current block's input (e.g. multi-line strings, heredocs).
+            const kind = cmd.readOption(.prompt_kind) orelse .initial;
+            if (self.screens.active_key == .primary and kind == .initial) {
+                self.blockListAddBlock() catch {};
+            }
         },
 
         .new_command => {
@@ -1228,6 +1294,7 @@ pub fn semanticPrompt(
             self.screens.active.cursorSetSemanticContent(.{
                 .input = .clear_explicit,
             });
+            self.blockListSetInputStart() catch {};
         },
 
         .end_prompt_start_input_terminate_eol => {
@@ -1235,6 +1302,7 @@ pub fn semanticPrompt(
             self.screens.active.cursorSetSemanticContent(.{
                 .input = .clear_eol,
             });
+            self.blockListSetInputStart() catch {};
         },
 
         .end_input_start_output => {
@@ -1255,6 +1323,7 @@ pub fn semanticPrompt(
             {
                 self.screens.active.cursor.page_row.semantic_prompt = .none;
             }
+            self.blockListSetOutputStart() catch {};
         },
 
         .end_command => {
@@ -1263,6 +1332,12 @@ pub fn semanticPrompt(
             // its reasonable at this point to reset our semantic content
             // state but the spec doesn't really say what to do.
             self.screens.active.cursorSetSemanticContent(.output);
+
+            if (self.block_list) |*bl| {
+                if (bl.activeBlock()) |active| {
+                    active.exit_code = cmd.readOption(.exit_code);
+                }
+            }
         },
     }
 }
@@ -1285,6 +1360,260 @@ fn semanticPromptFreshLine(self: *Terminal) !void {
 
     self.carriageReturn();
     try self.index();
+}
+
+/// Lazily initialize the block list and add a new block at the current
+/// cursor position. Called on OSC 133 A (new prompt).
+fn blockListAddBlock(self: *Terminal) !void {
+    const screen = self.screens.get(.primary) orelse return;
+    const bl = &(self.block_list orelse init: {
+        self.block_list = Block.BlockList.init(self.gpa(), &screen.pages);
+        break :init self.block_list.?;
+    });
+    bl.pruneGarbage();
+
+    // If the active block has no output yet (no command has been executed)
+    // AND the new prompt is on the same row as the existing prompt, this is
+    // a prompt redraw (e.g. after resize/font change). Replace the active
+    // block's prompt_start instead of creating a new empty block.
+    // If the cursor has moved to a different row, it's a genuine new prompt
+    // (e.g. user pressed Enter on an empty prompt).
+    if (bl.activeBlock()) |active| {
+        if (active.output_start == null and active.exit_code == null) {
+            const same_row = active.prompt_start.node == screen.cursor.page_pin.node and
+                active.prompt_start.y == screen.cursor.page_pin.y;
+            if (same_row) {
+                active.prompt_start.* = screen.cursor.page_pin.*;
+                // Reset input_start since the shell will re-send OSC 133 B.
+                if (active.input_start) |pin| {
+                    screen.pages.untrackPin(pin);
+                    active.input_start = null;
+                }
+                active.end = null;
+                if (self.block_layout) |*layout| layout.invalidate();
+                return;
+            }
+        }
+    }
+
+    _ = try bl.addBlock(screen.cursor.page_pin.*);
+
+    // Set CWD on the newly created block from the current Terminal.pwd.
+    if (bl.activeBlock()) |new_block| {
+        if (self.pwd.items.len > 0) {
+            new_block.cwd = self.gpa().dupe(u8, self.pwd.items) catch null;
+        }
+    }
+
+    // Auto-collapse: when a new block is created and auto_collapse_threshold
+    // is set, collapse the block N+1 positions back from the end.
+    // threshold=0 → collapse the just-completed block (len-2)
+    // threshold=1 → keep 1 completed block expanded, collapse len-3
+    if (self.auto_collapse_threshold) |threshold| {
+        const items = bl.blocks.items;
+        if (items.len >= 2) {
+            const offset = @as(usize, threshold) + 2;
+            if (items.len >= offset) {
+                const target = items.len - offset;
+                // Only collapse blocks that have output (same guard as manual toggle).
+                if (!items[target].collapsed and items[target].output_start != null) {
+                    items[target].collapsed = true;
+                }
+            }
+        }
+    }
+
+    // Initialize the layout if it doesn't exist yet, otherwise invalidate.
+    if (self.block_layout == null) {
+        self.block_layout = BlockLayout.init(self.gpa(), bl);
+    } else {
+        self.block_layout.?.invalidate();
+    }
+}
+
+/// Set input_start on the active block at the current cursor position.
+/// Called on OSC 133 B/I.
+fn blockListSetInputStart(self: *Terminal) !void {
+    const bl = &(self.block_list orelse return);
+    const active = bl.activeBlock() orelse return;
+    if (active.input_start != null) return;
+    const screen = self.screens.get(.primary) orelse return;
+    active.input_start = try bl.pages.trackPin(screen.cursor.page_pin.*);
+}
+
+/// Set output_start on the active block at the current cursor position.
+/// Called on OSC 133 C.
+fn blockListSetOutputStart(self: *Terminal) !void {
+    const bl = &(self.block_list orelse return);
+    const active = bl.activeBlock() orelse return;
+    if (active.output_start != null) return;
+    const screen = self.screens.get(.primary) orelse return;
+    active.output_start = try bl.pages.trackPin(screen.cursor.page_pin.*);
+}
+
+/// Toggle the highlighted state of a block by its index in block_list.blocks.
+/// If the block is already highlighted, un-highlight it. If a different block
+/// is highlighted, switch to the new one. The active (last) block cannot be
+/// highlighted.
+pub fn toggleBlockHighlight(self: *Terminal, block_idx: usize) void {
+    const bl = self.block_list orelse return;
+    // Don't allow highlighting the active (last) block.
+    if (block_idx >= bl.blocks.items.len) return;
+    if (block_idx == bl.blocks.items.len - 1) return;
+
+    if (self.highlighted_block_idx) |current| {
+        if (current == block_idx) {
+            // Already highlighted — un-highlight.
+            self.highlighted_block_idx = null;
+            return;
+        }
+    }
+    self.highlighted_block_idx = block_idx;
+}
+
+/// Navigate to the previous or next completed command block.
+/// Sets highlighted_block_idx and scrolls viewport to make the block visible.
+/// `is_previous`: true = go to earlier block, false = go to later block.
+pub fn gotoBlock(self: *Terminal, is_previous: bool) void {
+    const bl = self.block_list orelse return;
+    const items = bl.blocks.items;
+    if (items.len < 2) return; // Need at least active + 1 completed block.
+
+    // Clear mouse hover so keyboard-selected block gets the toolbar.
+    self.hovered_block_idx = null;
+    self.hovered_toolbar_icon = null;
+
+    // Last completed block index (active block is items.len - 1).
+    const last_completed = items.len - 2;
+
+    if (is_previous) {
+        if (self.highlighted_block_idx) |current| {
+            // Already highlighting — go to previous.
+            if (current > 0) {
+                self.highlighted_block_idx = current - 1;
+            }
+            // At block 0 — stay there.
+        } else {
+            // Nothing highlighted — highlight the last completed block.
+            self.highlighted_block_idx = last_completed;
+        }
+    } else {
+        if (self.highlighted_block_idx) |current| {
+            if (current < last_completed) {
+                self.highlighted_block_idx = current + 1;
+            } else {
+                // At or past the last completed — deselect (return to active).
+                self.highlighted_block_idx = null;
+            }
+        }
+        // Nothing highlighted + next = no-op.
+    }
+
+    // Scroll the highlighted block into view using BlockLayout.
+    if (self.highlighted_block_idx) |hl_idx| {
+        if (self.block_layout) |*layout| {
+            if (layout.virtualYForBlock(hl_idx)) |block_y| {
+                layout.ensureValid();
+                const doc_h = layout.total_height_px;
+                const viewport_h = self.height_px;
+                if (doc_h > viewport_h) {
+                    // scroll_offset_px = doc_h - viewport_h - block_y, clamped.
+                    const max_scroll = doc_h - viewport_h;
+                    const target: u32 = if (block_y < doc_h - viewport_h)
+                        doc_h - viewport_h - block_y
+                    else
+                        0;
+                    self.scroll_offset_px = @min(target, max_scroll);
+                    self.syncPageListViewport();
+                }
+            }
+        } else if (hl_idx < items.len) {
+            // Fallback for non-layout mode.
+            const block = &items[hl_idx];
+            if (!block.prompt_start.garbage) {
+                self.screens.active.scroll(.{
+                    .pin = block.prompt_start.*,
+                });
+            }
+        }
+    }
+}
+
+/// Toggle the collapsed state of the currently highlighted block.
+/// No-op if no block is highlighted, block_list is not active, or the
+/// block has no output (nothing to collapse).
+pub fn toggleHighlightedBlockCollapse(self: *Terminal) void {
+    const hl_idx = self.highlighted_block_idx orelse return;
+    const bl = &(self.block_list orelse return);
+    if (hl_idx >= bl.blocks.items.len) return;
+    const block = &bl.blocks.items[hl_idx];
+    // Blocks with no output cannot be collapsed.
+    if (block.output_start == null) return;
+    block.collapsed = !block.collapsed;
+    // Invalidate the layout so it recomputes with the new collapse state.
+    if (self.block_layout) |*layout| layout.invalidate();
+}
+
+/// Start or update filter input for a block. Opens the filter bar.
+pub fn startFilterInput(self: *Terminal, block_idx: usize) void {
+    if (self.filter_input_block_idx != null and self.filter_input_block_idx.? != block_idx) {
+        // Switching blocks: clear previous filter.
+        self.dismissFilterInput();
+    }
+    self.filter_input_block_idx = block_idx;
+}
+
+/// Append UTF-8 text to the filter input buffer and reapply the filter.
+pub fn appendFilterText(self: *Terminal, text: []const u8) void {
+    const bi = self.filter_input_block_idx orelse return;
+    self.filter_input_buf.appendSlice(self.gpa(), text) catch return;
+    self.applyFilterToBlock(bi);
+}
+
+/// Remove the last UTF-8 codepoint from the filter input buffer.
+pub fn backspaceFilterText(self: *Terminal) void {
+    const bi = self.filter_input_block_idx orelse return;
+    if (self.filter_input_buf.items.len == 0) return;
+    // Walk backwards to find the start of the last UTF-8 codepoint.
+    var i = self.filter_input_buf.items.len;
+    while (i > 0) {
+        i -= 1;
+        // UTF-8 continuation bytes start with 10xxxxxx.
+        if (self.filter_input_buf.items[i] & 0xC0 != 0x80) break;
+    }
+    self.filter_input_buf.shrinkRetainingCapacity(i);
+    self.applyFilterToBlock(bi);
+}
+
+/// Dismiss (close) the filter input and clear the filter on the block.
+pub fn dismissFilterInput(self: *Terminal) void {
+    if (self.filter_input_block_idx) |bi| {
+        const bl = &(self.block_list orelse return);
+        if (bi < bl.blocks.items.len) {
+            bl.blocks.items[bi].clearFilter(bl.alloc);
+        }
+    }
+    self.filter_input_block_idx = null;
+    self.filter_input_buf.clearRetainingCapacity();
+    self.filter_regex_mode = false;
+    if (self.block_layout) |*layout| layout.invalidate();
+}
+
+/// Toggle regex mode for the filter and reapply.
+pub fn toggleFilterRegexMode(self: *Terminal) void {
+    self.filter_regex_mode = !self.filter_regex_mode;
+    if (self.filter_input_block_idx) |bi| {
+        self.applyFilterToBlock(bi);
+    }
+}
+
+/// Apply the current filter text to the given block.
+fn applyFilterToBlock(self: *Terminal, block_idx: usize) void {
+    const bl = &(self.block_list orelse return);
+    if (block_idx >= bl.blocks.items.len) return;
+    var block = &bl.blocks.items[block_idx];
+    block.applyFilter(bl.alloc, self.filter_input_buf.items, self.filter_regex_mode);
+    if (self.block_layout) |*layout| layout.invalidate();
 }
 
 /// The semantic prompt type. This is used when tracking a line type and
@@ -1689,13 +2018,17 @@ pub const ScrollViewport = union(Tag) {
     /// Scroll to the bottom, i.e. the top of the active area
     bottom,
 
-    /// Scroll by some delta amount, up is negative.
+    /// Scroll by some delta amount in rows, up is negative.
     delta: isize,
+
+    /// Scroll by some delta amount in pixels, up is negative.
+    delta_px: isize,
 
     pub const Tag = lib.Enum(lib_target, &.{
         "top",
         "bottom",
         "delta",
+        "delta_px",
     });
 
     const c_union = lib.TaggedUnion(
@@ -1711,12 +2044,81 @@ pub const ScrollViewport = union(Tag) {
 };
 
 /// Scroll the viewport of the terminal grid.
+///
+/// When block_layout is active, scrolling adjusts scroll_offset_px which
+/// is a single pixel offset into BlockLayout's virtual document.
+/// The PageList viewport is NOT manipulated for block scrolling — the
+/// renderer fetches row data directly from block pins.
+///
+/// When block_layout is not active, scrolling falls through to the
+/// traditional PageList viewport scroll.
 pub fn scrollViewport(self: *Terminal, behavior: ScrollViewport) void {
-    self.screens.active.scroll(switch (behavior) {
-        .top => .{ .top = {} },
-        .bottom => .{ .active = {} },
-        .delta => |delta| .{ .delta_row = delta },
-    });
+    if (self.block_layout) |*layout| {
+        switch (behavior) {
+            .top => {
+                layout.ensureValid();
+                const doc_h = layout.total_height_px;
+                const viewport_h = self.height_px;
+                self.scroll_offset_px = if (doc_h > viewport_h) doc_h - viewport_h else 0;
+                self.syncPageListViewport();
+            },
+            .bottom => {
+                self.scroll_offset_px = 0;
+                self.syncPageListViewport();
+            },
+            .delta => |delta| {
+                const cell_h: i64 = if (self.rows > 0 and self.height_px > 0)
+                    @intCast(self.height_px / @as(u32, self.rows))
+                else
+                    16;
+                const px_delta: i64 = @as(i64, delta) * cell_h;
+                self.applyBlockScrollDelta(-px_delta);
+            },
+            .delta_px => |px| {
+                // Negate: terminal convention is negative = up, but
+                // scroll_offset_px increases when scrolling up.
+                self.applyBlockScrollDelta(-@as(i64, px));
+            },
+        }
+    } else {
+        switch (behavior) {
+            .top => self.screens.active.scroll(.{ .top = {} }),
+            .bottom => self.screens.active.scroll(.{ .active = {} }),
+            .delta => |delta| self.screens.active.scroll(.{ .delta_row = delta }),
+            .delta_px => |px| self.screens.active.scroll(.{ .delta_row = if (px > 0) 1 else -1 }),
+        }
+    }
+}
+
+/// Apply a pixel delta to scroll_offset_px, clamped to [0, max_scroll].
+/// Positive delta = scroll up (increase offset), negative = scroll down.
+fn applyBlockScrollDelta(self: *Terminal, delta: i64) void {
+    const layout = &(self.block_layout orelse return);
+    layout.ensureValid();
+
+    const doc_h = layout.total_height_px;
+    const viewport_h = self.height_px;
+    const max_scroll: u32 = if (doc_h > viewport_h) doc_h - viewport_h else 0;
+
+    const current: i64 = @intCast(self.scroll_offset_px);
+    const new_val: i64 = current + delta;
+    self.scroll_offset_px = @intCast(std.math.clamp(new_val, 0, @as(i64, max_scroll)));
+    self.syncPageListViewport();
+}
+
+/// Synchronize the PageList viewport with scroll_offset_px.
+///
+/// With block-aware rendering, the cell buffer is populated directly from
+/// block pins in RenderState.populateBlockRows(), decoupled from the
+/// PageList viewport. The PageList viewport is kept pinned at the active
+/// area so the cursor is always accessible. No row-offset computation is
+/// needed here — that's handled entirely by the renderer.
+pub fn syncPageListViewport(self: *Terminal) void {
+    if (self.block_layout == null) return;
+    // Always keep the PageList viewport at the active area (bottom).
+    // The block-aware renderer fetches rows directly from block pins,
+    // independent of the PageList viewport position.
+    self.screens.active.scroll(.{ .active = {} });
 }
 
 /// To be called before shifting a row (as in insertLines and deleteLines)
@@ -2857,6 +3259,20 @@ pub fn resize(
         .left = 0,
         .right = cols - 1,
     };
+
+    // Invalidate block layout, cached row counts, and reset scroll offset.
+    // After a resize, cell metrics change, row counts change due to reflow,
+    // and the old pixel-based scroll offset no longer maps correctly. Reset
+    // to following (offset 0) which is the safe default.
+    if (self.block_list) |*bl| {
+        for (bl.blocks.items) |*block| {
+            block.cached_row_count = null;
+        }
+    }
+    if (self.block_layout) |*layout| {
+        layout.invalidate();
+        self.scroll_offset_px = 0;
+    }
 }
 
 /// Set the pwd for the terminal.
@@ -13054,4 +13470,381 @@ test "Terminal: deleteLines wide char at right margin with full clear" {
     // and the orphaned spacer_tail at col 39 triggers a page integrity
     // violation in clearCells.
     try t.scrollUp(t.rows);
+}
+
+// ─── Command Block Tests ─────────────────────────────────────────────────────
+
+/// Helper: simulate a full command with OSC 133 A/B/C/D and print text.
+/// Returns the terminal positioned after the command completes.
+fn testSimulateCommand(
+    t: *Terminal,
+    prompt: []const u8,
+    command: []const u8,
+    output: []const u8,
+    exit_code: i32,
+) !void {
+    // OSC 133 A — new prompt
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    for (prompt) |c| try t.print(c);
+    // OSC 133 B — start input
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    for (command) |c| try t.print(c);
+    // OSC 133 C — start output
+    try t.semanticPrompt(.init(.end_input_start_output));
+    t.carriageReturn();
+    try t.linefeed();
+    // Print output lines (split on \n)
+    for (output) |c| {
+        if (c == '\n') {
+            t.carriageReturn();
+            try t.linefeed();
+        } else {
+            try t.print(c);
+        }
+    }
+    t.carriageReturn();
+    try t.linefeed();
+    // OSC 133 D — command done with exit code
+    var buf: [16]u8 = undefined;
+    const exit_str = std.fmt.bufPrint(&buf, "{d}", .{exit_code}) catch "";
+    try t.semanticPrompt(.{ .action = .end_command, .options_unvalidated = exit_str });
+}
+
+test "Terminal: block list created on OSC 133 A" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    // No block list initially.
+    try testing.expect(t.block_list == null);
+
+    // OSC 133 A creates the block list.
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try testing.expect(t.block_list != null);
+    try testing.expectEqual(@as(usize, 1), t.block_list.?.blockCount());
+}
+
+test "Terminal: block list tracks multiple commands" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    try testSimulateCommand(&t, "$ ", "echo hello", "hello", 0);
+    try testSimulateCommand(&t, "$ ", "echo world", "world", 0);
+    // After the second command completes, a third prompt starts.
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    const bl = t.block_list.?;
+    try testing.expectEqual(@as(usize, 3), bl.blockCount());
+
+    // First block should have exit code 0.
+    try testing.expectEqual(@as(?i32, 0), bl.blocks.items[0].exit_code);
+    // Second block should have exit code 0.
+    try testing.expectEqual(@as(?i32, 0), bl.blocks.items[1].exit_code);
+    // Third (active) block has no exit code.
+    try testing.expect(bl.blocks.items[2].exit_code == null);
+}
+
+test "Terminal: block exit codes tracked correctly" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    try testSimulateCommand(&t, "$ ", "true", "", 0);
+    try testSimulateCommand(&t, "$ ", "false", "", 1);
+    try testSimulateCommand(&t, "$ ", "kill-me", "", 137);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    const bl = t.block_list.?;
+    try testing.expectEqual(@as(?i32, 0), bl.blocks.items[0].exit_code);
+    try testing.expectEqual(@as(?i32, 1), bl.blocks.items[1].exit_code);
+    try testing.expectEqual(@as(?i32, 137), bl.blocks.items[2].exit_code);
+}
+
+test "Terminal: block input and output pins set" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    try testSimulateCommand(&t, "$ ", "echo hi", "hi", 0);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    const bl = t.block_list.?;
+    const block = &bl.blocks.items[0];
+
+    // All pins should be set for a completed block.
+    try testing.expect(block.input_start != null);
+    try testing.expect(block.output_start != null);
+    try testing.expect(block.end != null);
+    try testing.expect(!block.prompt_start.garbage);
+}
+
+test "Terminal: gotoBlock navigates between blocks" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    try testSimulateCommand(&t, "$ ", "cmd1", "out1", 0);
+    try testSimulateCommand(&t, "$ ", "cmd2", "out2", 0);
+    try testSimulateCommand(&t, "$ ", "cmd3", "out3", 0);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    // 4 blocks: 3 completed + 1 active.
+    try testing.expectEqual(@as(usize, 4), t.block_list.?.blockCount());
+
+    // Nothing highlighted initially.
+    try testing.expect(t.highlighted_block_idx == null);
+
+    // "Previous" with nothing highlighted → selects last completed (index 2).
+    t.gotoBlock(true);
+    try testing.expectEqual(@as(?usize, 2), t.highlighted_block_idx);
+
+    // "Previous" again → selects block 1.
+    t.gotoBlock(true);
+    try testing.expectEqual(@as(?usize, 1), t.highlighted_block_idx);
+
+    // "Previous" again → selects block 0.
+    t.gotoBlock(true);
+    try testing.expectEqual(@as(?usize, 0), t.highlighted_block_idx);
+
+    // "Previous" at block 0 → stays at block 0.
+    t.gotoBlock(true);
+    try testing.expectEqual(@as(?usize, 0), t.highlighted_block_idx);
+
+    // "Next" → selects block 1.
+    t.gotoBlock(false);
+    try testing.expectEqual(@as(?usize, 1), t.highlighted_block_idx);
+
+    // "Next" → selects block 2.
+    t.gotoBlock(false);
+    try testing.expectEqual(@as(?usize, 2), t.highlighted_block_idx);
+
+    // "Next" from last completed → deselects.
+    t.gotoBlock(false);
+    try testing.expect(t.highlighted_block_idx == null);
+
+    // "Next" with nothing highlighted → no-op.
+    t.gotoBlock(false);
+    try testing.expect(t.highlighted_block_idx == null);
+}
+
+test "Terminal: gotoBlock with single block is no-op" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    // Only active block — need at least 2 for navigation.
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try testing.expectEqual(@as(usize, 1), t.block_list.?.blockCount());
+
+    t.gotoBlock(true);
+    try testing.expect(t.highlighted_block_idx == null);
+    t.gotoBlock(false);
+    try testing.expect(t.highlighted_block_idx == null);
+}
+
+test "Terminal: toggleHighlightedBlockCollapse" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    try testSimulateCommand(&t, "$ ", "echo hi", "hello\nworld", 0);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    const bl = &t.block_list.?;
+    const block = &bl.blocks.items[0];
+
+    // Initially expanded.
+    try testing.expect(!block.collapsed);
+
+    // No-op when nothing highlighted.
+    t.toggleHighlightedBlockCollapse();
+    try testing.expect(!block.collapsed);
+
+    // Highlight block 0 and toggle collapse.
+    t.highlighted_block_idx = 0;
+    t.toggleHighlightedBlockCollapse();
+    try testing.expect(block.collapsed);
+
+    // Toggle again — expand.
+    t.toggleHighlightedBlockCollapse();
+    try testing.expect(!block.collapsed);
+}
+
+test "Terminal: toggleHighlightedBlockCollapse no-op without output" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    // Block with prompt but no output (no OSC 133 C sent).
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    for ("$ ") |c| try t.print(c);
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    // Add a second block to close the first.
+    t.carriageReturn();
+    try t.linefeed();
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    t.highlighted_block_idx = 0;
+    t.toggleHighlightedBlockCollapse();
+    // Should remain expanded — no output to collapse.
+    try testing.expect(!t.block_list.?.blocks.items[0].collapsed);
+}
+
+test "Terminal: auto-collapse threshold" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    t.auto_collapse_threshold = 0; // Collapse most recently completed block immediately.
+
+    try testSimulateCommand(&t, "$ ", "echo 1", "one", 0);
+    try testSimulateCommand(&t, "$ ", "echo 2", "two", 0);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    const items = t.block_list.?.blocks.items;
+    // Block 0 should be collapsed (it was 2 positions back when block 2 was created,
+    // and threshold=0 means collapse at offset 2 from end).
+    try testing.expect(items[0].collapsed);
+    // Block 1 should also be collapsed when the 4th prompt appeared.
+    try testing.expect(items[1].collapsed);
+}
+
+test "Terminal: filter lifecycle" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    try testSimulateCommand(&t, "$ ", "ls", "foo\nbar\nbaz", 0);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    // No filter initially.
+    try testing.expect(t.filter_input_block_idx == null);
+
+    // Start filter on block 0.
+    t.startFilterInput(0);
+    try testing.expectEqual(@as(?usize, 0), t.filter_input_block_idx);
+
+    // Type "ba" into filter.
+    t.appendFilterText("ba");
+    const block = &t.block_list.?.blocks.items[0];
+    // "bar" and "baz" match "ba".
+    try testing.expect(block.filter_match_rows != null);
+    try testing.expectEqual(@as(usize, 2), block.filter_match_rows.?.len);
+    try testing.expect(block.filter_text != null);
+    try testing.expectEqualStrings("ba", block.filter_text.?);
+
+    // Backspace removes last character.
+    t.backspaceFilterText();
+    try testing.expectEqualStrings("b", t.filter_input_buf.items);
+    // Now "b" matches all 3: "bar", "baz" (and "foo" doesn't match).
+    // Actually: "foo" has no 'b', "bar" has 'b', "baz" has 'b'.
+    try testing.expect(block.filter_match_rows != null);
+    try testing.expectEqual(@as(usize, 2), block.filter_match_rows.?.len);
+
+    // Dismiss filter.
+    t.dismissFilterInput();
+    try testing.expect(t.filter_input_block_idx == null);
+    try testing.expectEqual(@as(usize, 0), t.filter_input_buf.items.len);
+    try testing.expect(block.filter_match_rows == null);
+    try testing.expect(block.filter_text == null);
+}
+
+test "Terminal: filter empty needle clears filter" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    try testSimulateCommand(&t, "$ ", "ls", "foo\nbar", 0);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    t.startFilterInput(0);
+    t.appendFilterText("foo");
+    try testing.expect(t.block_list.?.blocks.items[0].filter_match_rows != null);
+
+    // Backspace all characters — clears filter.
+    t.backspaceFilterText();
+    t.backspaceFilterText();
+    t.backspaceFilterText();
+    try testing.expectEqual(@as(usize, 0), t.filter_input_buf.items.len);
+    // applyFilter with empty needle clears filter_match_rows.
+    try testing.expect(t.block_list.?.blocks.items[0].filter_match_rows == null);
+}
+
+test "Terminal: filter regex mode" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    try testSimulateCommand(&t, "$ ", "ls", "foo123\nbar456\nbaz789", 0);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    t.startFilterInput(0);
+
+    // Literal mode: type a regex pattern as literal text.
+    t.appendFilterText("\\d+");
+    const block = &t.block_list.?.blocks.items[0];
+    // Literal "\\d+" won't match any output line.
+    try testing.expect(block.filter_match_rows != null);
+    try testing.expectEqual(@as(usize, 0), block.filter_match_rows.?.len);
+
+    // Toggle to regex mode.
+    try testing.expect(!t.filter_regex_mode);
+    t.toggleFilterRegexMode();
+    try testing.expect(t.filter_regex_mode);
+    // Now \\d+ is a regex matching digits — all 3 lines have digits.
+    try testing.expect(block.filter_match_rows != null);
+    try testing.expectEqual(@as(usize, 3), block.filter_match_rows.?.len);
+
+    // Toggle back to literal mode.
+    t.toggleFilterRegexMode();
+    try testing.expect(!t.filter_regex_mode);
+    try testing.expectEqual(@as(usize, 0), block.filter_match_rows.?.len);
+
+    // Dismiss resets regex mode.
+    t.filter_regex_mode = true;
+    t.dismissFilterInput();
+    try testing.expect(!t.filter_regex_mode);
+}
+
+test "Terminal: block commandText and outputText" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    try testSimulateCommand(&t, "$ ", "echo hello", "hello", 0);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    const bl = &t.block_list.?;
+    const block = &bl.blocks.items[0];
+
+    var cmd_buf: [256]u8 = undefined;
+    const cmd = block.commandText(&t.screens.active.pages, &cmd_buf);
+    try testing.expectEqualStrings("echo hello", cmd);
+
+    var out_buf: [256]u8 = undefined;
+    const out = block.outputText(&t.screens.active.pages, &out_buf);
+    // Output includes the CR/LF before and after the text.
+    // Just verify "hello" is contained in the output.
+    try testing.expect(std.mem.indexOf(u8, out, "hello") != null);
+}
+
+test "Terminal: block cached_row_count set on close" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    try testSimulateCommand(&t, "$ ", "echo hi", "hello\nworld", 0);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    const block = &t.block_list.?.blocks.items[0];
+    // Completed block should have cached row count.
+    try testing.expect(block.cached_row_count != null);
+    // prompt row + output "hello" + output "world" + blank line from CR/LF = varies,
+    // but should be > 0.
+    try testing.expect(block.cached_row_count.? > 0);
+
+    // Active block should NOT have cached row count.
+    const active = t.block_list.?.activeBlock().?;
+    try testing.expect(active.cached_row_count == null);
 }
