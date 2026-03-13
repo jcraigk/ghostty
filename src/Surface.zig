@@ -4655,10 +4655,15 @@ pub fn mouseButtonCallback(
                             const click_x_fc: u32 = @intFromFloat(@max(0, pos.x));
                             const click_y_fc: u32 = @intFromFloat(@max(0, pos.y));
 
+                            // Clamp filter bar position the same way the renderer does:
+                            // upper: @max(screen_y, header_padding)
+                            // lower: @min(screen_y + height - bar_h, screen_h - footer - bar_h)
+                            const f_header_pad: u32 = self.config.command_blocks_padding_header;
+                            const f_footer_pad: u32 = self.config.command_blocks_padding_footer;
                             const f_bar_y_c: u32 = if (f_is_upper)
-                                f_screen_y
+                                @max(f_screen_y, f_header_pad)
                             else
-                                (f_screen_y + info.visible_height_px) -| f_bar_h_c;
+                                @min((f_screen_y + info.visible_height_px) -| f_bar_h_c, self.size.screen.height -| f_footer_pad -| f_bar_h_c);
 
                             if (click_y_fc >= f_bar_y_c and click_y_fc < f_bar_y_c + f_bar_h_c and
                                 click_x_fc >= f_bar_x_c and click_x_fc < f_bar_x_c + f_bar_w_c)

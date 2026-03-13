@@ -2977,7 +2977,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                         });
                                     },
                                     .collapse => {
-                                        // Chevron icon: ">" when expanded, "v" when collapsed.
+                                        // Chevron icon: ">" when collapsed (click to expand),
+                                        // "v" when expanded (click to collapse).
                                         // Drawn as two arms of densely overlapping circles
                                         // to form a smooth diagonal line.
                                         const is_collapsed = region.collapsed;
@@ -3001,8 +3002,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                             const frac_y: u32 = si * half_spread / num_steps;
 
                                             // Arm 1 and Arm 2 positions.
-                                            const a1x: u32, const a1y: u32, const a2x: u32, const a2y: u32 = if (is_collapsed) blk: {
-                                                // Down chevron "v": arms go from top-left and top-right to center-bottom.
+                                            const a1x: u32, const a1y: u32, const a2x: u32, const a2y: u32 = if (!is_collapsed) blk: {
+                                                // Down chevron "v" (expanded): arms go from top-left and top-right to center-bottom.
                                                 const tip_x = icon_cx;
                                                 const tip_y = icon_cy + half_spread / 2;
                                                 const left_x = tip_x -| half_spread;
@@ -3013,7 +3014,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                                     right_x -| frac_x, top_y + frac_y, // arm2: top-right → tip
                                                 };
                                             } else blk: {
-                                                // Right chevron ">": arms go from top-left and bottom-left to center-right.
+                                                // Right chevron ">" (collapsed): arms go from top-left and bottom-left to center-right.
                                                 const tip_x = icon_cx + half_spread / 2;
                                                 const tip_y = icon_cy;
                                                 const left_x = tip_x -| half_spread;
