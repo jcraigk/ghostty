@@ -42,12 +42,37 @@ pub const Step = struct {
     /// of a fragment texture, set via setFragmentSamplerState(_:index:).
     samplers: []const ?Sampler = &.{},
     draw: Draw,
+    /// Optional scissor rect to clip rendering to a subregion.
+    scissor: ?ScissorRect = null,
+    /// Optional per-draw block parameters for command block rendering.
+    block_params: ?BlockParams = null,
+
+    pub const BlockParams = extern struct {
+        block_y_offset: f32,
+        block_first_row: f32,
+        block_x_offset: f32 = 0,
+        block_y_flat: f32 = 0,
+        block_corner_radius: f32 = 0,
+        /// Scissor rect origin/size for corner radius calculations in the shader.
+        block_scissor_x: f32 = 0,
+        block_scissor_y: f32 = 0,
+        block_scissor_w: f32 = 0,
+        block_scissor_h: f32 = 0,
+    };
+
+    pub const ScissorRect = struct {
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    };
 
     /// Describes the draw call for this step.
     pub const Draw = struct {
         type: mtl.MTLPrimitiveType,
         vertex_count: usize,
         instance_count: usize = 1,
+        base_instance: usize = 0,
     };
 };
 
@@ -209,17 +234,65 @@ pub fn step(self: *const Self, s: Step) void {
         );
     };
 
+    // Set scissor rect if specified.
+    if (s.scissor) |sc| {
+        const MTLScissorRect = extern struct {
+            x: c_ulong,
+            y: c_ulong,
+            width: c_ulong,
+            height: c_ulong,
+        };
+        self.encoder.msgSend(
+            void,
+            objc.sel("setScissorRect:"),
+            .{MTLScissorRect{
+                .x = sc.x,
+                .y = sc.y,
+                .width = sc.width,
+                .height = sc.height,
+            }},
+        );
+    }
+
+    // Set per-block parameters via inline bytes at buffer index 3.
+    if (s.block_params) |bp| {
+        self.encoder.msgSend(
+            void,
+            objc.sel("setVertexBytes:length:atIndex:"),
+            .{ @as(*const anyopaque, @ptrCast(&bp)), @as(c_ulong, @sizeOf(Step.BlockParams)), @as(c_ulong, 3) },
+        );
+        self.encoder.msgSend(
+            void,
+            objc.sel("setFragmentBytes:length:atIndex:"),
+            .{ @as(*const anyopaque, @ptrCast(&bp)), @as(c_ulong, @sizeOf(Step.BlockParams)), @as(c_ulong, 3) },
+        );
+    }
+
     // Draw!
-    self.encoder.msgSend(
-        void,
-        objc.sel("drawPrimitives:vertexStart:vertexCount:instanceCount:"),
-        .{
-            @intFromEnum(s.draw.type),
-            @as(c_ulong, 0),
-            @as(c_ulong, s.draw.vertex_count),
-            @as(c_ulong, s.draw.instance_count),
-        },
-    );
+    if (s.draw.base_instance > 0) {
+        self.encoder.msgSend(
+            void,
+            objc.sel("drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:"),
+            .{
+                @intFromEnum(s.draw.type),
+                @as(c_ulong, 0),
+                @as(c_ulong, s.draw.vertex_count),
+                @as(c_ulong, s.draw.instance_count),
+                @as(c_ulong, s.draw.base_instance),
+            },
+        );
+    } else {
+        self.encoder.msgSend(
+            void,
+            objc.sel("drawPrimitives:vertexStart:vertexCount:instanceCount:"),
+            .{
+                @intFromEnum(s.draw.type),
+                @as(c_ulong, 0),
+                @as(c_ulong, s.draw.vertex_count),
+                @as(c_ulong, s.draw.instance_count),
+            },
+        );
+    }
 }
 
 /// Complete this render pass.

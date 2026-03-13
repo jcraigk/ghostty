@@ -443,6 +443,18 @@ fragment float4 bg_image_fragment(
   return rgba;
 }
 
+struct BlockParams {
+  float block_y_offset;
+  float block_first_row;
+  float block_x_offset;
+  float block_y_flat;
+  float block_corner_radius;
+  float block_scissor_x;
+  float block_scissor_y;
+  float block_scissor_w;
+  float block_scissor_h;
+};
+
 //-------------------------------------------------------------------
 // Cell Background Shader
 //-------------------------------------------------------------------
@@ -451,9 +463,19 @@ fragment float4 bg_image_fragment(
 fragment float4 cell_bg_fragment(
   FullScreenVertexOut in [[stage_in]],
   constant Uniforms& uniforms [[buffer(1)]],
-  constant uchar4 *cells [[buffer(2)]]
+  constant uchar4 *cells [[buffer(2)]],
+  constant BlockParams& block_params [[buffer(3)]]
 ) {
-  int2 grid_pos = int2(floor((in.position.xy - uniforms.grid_padding.wx) / uniforms.cell_size));
+  // Compute grid position. block_y_offset/block_x_offset are grid-relative
+  // (excludes padding), added to the padding to get the screen-space origin.
+  float2 origin = float2(uniforms.grid_padding.w + block_params.block_x_offset, uniforms.grid_padding.x + block_params.block_y_offset);
+  int2 grid_pos = int2(floor((in.position.xy - origin) / uniforms.cell_size));
+  // When block_y_flat is set, all pixels read from the same row (for solid fills).
+  if (block_params.block_y_flat != 0.0) {
+    grid_pos.y = int(block_params.block_first_row);
+  } else {
+    grid_pos.y += int(block_params.block_first_row);
+  }
 
   float4 bg = float4(0.0);
 
@@ -489,6 +511,21 @@ fragment float4 cell_bg_fragment(
 
   // Load the color for the cell.
   uchar4 cell_color = cells[grid_pos.y * uniforms.grid_size.x + grid_pos.x];
+
+  // Rounded corners: discard fragments outside the rounded rect.
+  if (block_params.block_corner_radius > 0.0) {
+    float r = block_params.block_corner_radius;
+    float2 rect_origin = float2(block_params.block_scissor_x, block_params.block_scissor_y);
+    float2 rect_size = float2(block_params.block_scissor_w, block_params.block_scissor_h);
+    // SDF for rounded rectangle: position relative to rect center.
+    float2 center = rect_origin + rect_size * 0.5;
+    float2 half_size = rect_size * 0.5;
+    float2 q = abs(in.position.xy - center) - half_size + float2(r);
+    float d = length(max(q, float2(0.0))) - r;
+    if (d > 0.0) {
+      return float4(0.0);
+    }
+  }
 
   // Convert the color and return it.
   //
@@ -557,10 +594,14 @@ vertex CellTextVertexOut cell_text_vertex(
   uint vid [[vertex_id]],
   CellTextVertexIn in [[stage_in]],
   constant Uniforms& uniforms [[buffer(1)]],
-  constant uchar4 *bg_colors [[buffer(2)]]
+  constant uchar4 *bg_colors [[buffer(2)]],
+  constant BlockParams& block_params [[buffer(3)]]
 ) {
-  // Convert the grid x, y into world space x, y by accounting for cell size
-  float2 cell_pos = uniforms.cell_size * float2(in.grid_pos);
+  // Convert the grid x, y into world space x, y by accounting for cell size.
+  // When block rendering is active, position relative to block origin.
+  float2 cell_pos;
+  cell_pos.x = uniforms.cell_size.x * float(in.grid_pos.x) + block_params.block_x_offset;
+  cell_pos.y = float(int(in.grid_pos.y) - int(block_params.block_first_row)) * uniforms.cell_size.y + block_params.block_y_offset;
 
   // We use a triangle strip with 4 vertices to render quads,
   // so we determine which corner of the cell this vertex is in

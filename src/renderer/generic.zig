@@ -231,6 +231,109 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Our overlay state, if any.
         overlay: ?Overlay = null,
 
+        /// Block regions for per-block scissored rendering.
+        /// Populated in rebuildCells from block_render_list.
+        block_regions: std.ArrayListUnmanaged(BlockRegion) = .empty,
+        /// Screen Y of the first block below the viewport (for trailing separator).
+        /// null when there's no off-screen block below.
+        next_off_screen_y: ?u32 = null,
+        /// Screen-space bottom (screen_y + height) of the last block above the viewport
+        /// (for leading separator). null when there's no off-screen block above.
+        prev_off_screen_bottom: ?i64 = null,
+
+        /// Filter text glyph rendering state (populated in rebuildCells, drawn in drawFrame).
+        filter_text_base_instance: usize = 0,
+        filter_text_glyph_count: usize = 0,
+        /// Column offset for filter text due to regex indicator prefix (".*" + space).
+        filter_text_col_offset: u16 = 0,
+        /// Cursor blink state for the filter bar cursor.
+        filter_cursor_blink_visible: bool = true,
+
+
+        const BlockRegion = struct {
+            first_row: u16,
+            row_count: u16,
+            /// Screen Y position (includes window padding) for scissor rects.
+            screen_y_px: u32,
+            height_px: u32,
+            /// Grid-relative Y offset (excludes padding) for shader block_y_offset.
+            grid_y_offset: f32 = 0,
+            /// Offset into the fg cell buffer for this block's instances.
+            instance_offset: usize = 0,
+            /// Number of fg cell instances in this block.
+            instance_count: usize = 0,
+            /// Exit code: 0 = success, >0 = error, -1 = running/unknown.
+            exit_code: i32 = -1,
+            /// Whether this block is collapsed.
+            collapsed: bool = false,
+            /// Number of hidden lines (total - visible). For the indicator text.
+            hidden_lines: u16 = 0,
+            /// Block index for scratch row lookup (0-based across all regions).
+            /// When using BlockLayout, this is the index within block_render_list.
+            block_idx: u16 = 0,
+            /// Whether this block has an active filter.
+            filtered: bool = false,
+            /// Matched output row indices (0-based from output_start) when filtered.
+            filter_match_rows: ?[]const u32 = null,
+            /// Number of prompt/input rows before output.
+            output_row_offset: u16 = 0,
+        };
+
+        /// Map a block exit code to an RGBA stripe color using config values.
+        fn stripeColor(self: *const Self, exit_code: i32) [4]u8 {
+            return switch (exit_code) {
+                0 => if (self.config.command_blocks_stripe_success) |c|
+                    .{ c.r, c.g, c.b, 228 }
+                else
+                    .{ 0, 0, 0, 0 },
+                -1 => if (self.config.command_blocks_stripe_running) |c|
+                    .{ c.r, c.g, c.b, 228 }
+                else
+                    .{ 0, 0, 0, 0 },
+                128...255 => if (self.config.command_blocks_stripe_signal) |c|
+                    .{ c.r, c.g, c.b, 228 }
+                else
+                    .{ 0, 0, 0, 0 },
+                else => if (self.config.command_blocks_stripe_error) |c|
+                    .{ c.r, c.g, c.b, 228 }
+                else
+                    .{ 0, 0, 0, 0 },
+            };
+        }
+
+        /// Blend a background color towards a tint color at a given factor (out of 256).
+        /// Returns transparent if tint_color is null.
+        fn blendTint(bg: [4]u8, tint_color: ?configpkg.Config.Color, factor: u16) [4]u8 {
+            const c = tint_color orelse return .{ 0, 0, 0, 0 };
+            const inv: u16 = 256 - factor;
+            return .{
+                @intCast((@as(u16, bg[0]) * inv + @as(u16, c.r) * factor) >> 8),
+                @intCast((@as(u16, bg[1]) * inv + @as(u16, c.g) * factor) >> 8),
+                @intCast((@as(u16, bg[2]) * inv + @as(u16, c.b) * factor) >> 8),
+                if (bg[3] == 0) 255 else bg[3],
+            };
+        }
+
+        /// Blend a cell bg color with a subtle red tint for error blocks.
+        fn blendErrorTint(self: *const Self, bg: [4]u8) [4]u8 {
+            return blendTint(bg, self.config.command_blocks_tint_error, 80);
+        }
+
+        /// Blend a cell bg color with a subtle green tint for success blocks.
+        fn blendSuccessTint(self: *const Self, bg: [4]u8) [4]u8 {
+            return blendTint(bg, self.config.command_blocks_tint_success, 50);
+        }
+
+        /// Blend a cell bg color with a subtle tint for signal-killed blocks (128-255).
+        fn blendSignalTint(self: *const Self, bg: [4]u8) [4]u8 {
+            return blendTint(bg, self.config.command_blocks_tint_signal, 60);
+        }
+
+        /// Blend a cell bg color with a blue tint for highlighted blocks.
+        fn blendHighlightTint(self: *const Self, bg: [4]u8) [4]u8 {
+            return blendTint(bg, self.config.command_blocks_tint_highlight, 100);
+        }
+
         const HighlightTag = enum(u8) {
             search_match,
             search_match_selected,
@@ -569,6 +672,29 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             colorspace: configpkg.Config.WindowColorspace,
             blending: configpkg.Config.AlphaBlending,
             background_blur: configpkg.Config.BackgroundBlur,
+            command_blocks: bool,
+            command_blocks_padding_footer: u16,
+            command_blocks_padding_header: u16,
+            command_blocks_padding_left: u16,
+            command_blocks_padding_right: u16,
+            command_blocks_stripe_width: u16,
+            command_blocks_separator_color: ?configpkg.Config.Color,
+            command_blocks_stripe_success: ?configpkg.Config.Color,
+            command_blocks_stripe_error: ?configpkg.Config.Color,
+            command_blocks_stripe_running: ?configpkg.Config.Color,
+            command_blocks_stripe_signal: ?configpkg.Config.Color,
+            command_blocks_tint_error: ?configpkg.Config.Color,
+            command_blocks_tint_success: ?configpkg.Config.Color,
+            command_blocks_tint_signal: ?configpkg.Config.Color,
+            command_blocks_tint_highlight: ?configpkg.Config.Color,
+            command_blocks_collapse_preview_lines: u16,
+            command_blocks_auto_collapse_threshold: ?u16,
+            command_blocks_toolbar: bool,
+            command_blocks_toolbar_icons: configpkg.Config.ToolbarIcons,
+            command_blocks_toolbar_position: configpkg.Config.ToolbarPosition,
+            command_blocks_toolbar_color: ?configpkg.Config.Color,
+            command_blocks_toolbar_radius: u16,
+            command_blocks_toolbar_icon_radius: u16,
             scroll_to_bottom_on_output: bool,
 
             pub fn init(
@@ -643,6 +769,29 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .colorspace = config.@"window-colorspace",
                     .blending = config.@"alpha-blending",
                     .background_blur = config.@"background-blur",
+                    .command_blocks = config.@"command-blocks",
+                    .command_blocks_padding_footer = config.@"command-blocks-padding-footer",
+                    .command_blocks_padding_header = config.@"command-blocks-padding-header",
+                    .command_blocks_padding_left = config.@"command-blocks-padding-left",
+                    .command_blocks_padding_right = config.@"command-blocks-padding-right",
+                    .command_blocks_stripe_width = config.@"command-blocks-stripe-width",
+                    .command_blocks_separator_color = config.@"command-blocks-separator-color",
+                    .command_blocks_stripe_success = config.@"command-blocks-stripe-success",
+                    .command_blocks_stripe_error = config.@"command-blocks-stripe-error",
+                    .command_blocks_stripe_running = config.@"command-blocks-stripe-running",
+                    .command_blocks_stripe_signal = config.@"command-blocks-stripe-signal",
+                    .command_blocks_tint_error = config.@"command-blocks-tint-error",
+                    .command_blocks_tint_success = config.@"command-blocks-tint-success",
+                    .command_blocks_tint_signal = config.@"command-blocks-tint-signal",
+                    .command_blocks_tint_highlight = config.@"command-blocks-tint-highlight",
+                    .command_blocks_collapse_preview_lines = config.@"command-blocks-collapse-preview-lines",
+                    .command_blocks_auto_collapse_threshold = config.@"command-blocks-auto-collapse-threshold",
+                    .command_blocks_toolbar = config.@"command-blocks-toolbar",
+                    .command_blocks_toolbar_icons = config.@"command-blocks-toolbar-icons",
+                    .command_blocks_toolbar_position = config.@"command-blocks-toolbar-position",
+                    .command_blocks_toolbar_color = config.@"command-blocks-toolbar-color",
+                    .command_blocks_toolbar_radius = config.@"command-blocks-toolbar-radius",
+                    .command_blocks_toolbar_icon_radius = config.@"command-blocks-toolbar-icon-radius",
                     .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
                     .arena = arena,
                 };
@@ -1199,6 +1348,53 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     state.terminal.scrollViewport(.bottom);
                 }
 
+                state.terminal.auto_collapse_threshold = self.config.command_blocks_auto_collapse_threshold;
+                state.terminal.collapse_preview_lines = self.config.command_blocks_collapse_preview_lines;
+
+                // Update BlockLayout configuration. This must happen before
+                // the render state snapshot so the layout is up to date.
+                if (state.terminal.block_layout) |*layout| {
+                    const active_cursor_row: ?u32 = acr: {
+                        if (state.terminal.block_list) |*bl| {
+                            if (bl.activeBlock()) |active| {
+                                if (!active.prompt_start.garbage) {
+                                    const cursor_pin = state.terminal.screens.active.cursor.page_pin.*;
+                                    // Safety: only compute if cursor is at or after prompt_start.
+                                    // If cursor is before prompt_start (e.g. during init), skip.
+                                    if (!cursor_pin.before(active.prompt_start.*)) {
+                                        // Count rows from prompt_start to cursor INCLUSIVE.
+                                        // This gives a 0-based row index: same row = 0, next row = 1, etc.
+                                        var row_count: u32 = 0;
+                                        var it = active.prompt_start.rowIterator(.right_down, cursor_pin);
+                                        while (it.next()) |row_pin| {
+                                            if (row_pin.node == cursor_pin.node and row_pin.y == cursor_pin.y) break;
+                                            row_count += 1;
+                                        }
+                                        break :acr row_count;
+                                    }
+                                }
+                            }
+                        }
+                        break :acr null;
+                    };
+                    layout.setConfig(.{
+                        .cell_height = self.grid_metrics.cell_height,
+                        .footer_padding_px = self.config.command_blocks_padding_footer,
+                        .header_padding_px = self.config.command_blocks_padding_header,
+                        .separator_height_px = 2,
+                        .preview_lines = self.config.command_blocks_collapse_preview_lines,
+                        .active_block_cursor_row = active_cursor_row,
+                    });
+                }
+
+                // Sync the PageList viewport to match the BlockLayout virtual
+                // document before snapshotting. This ensures the cell buffer
+                // contains the rows the renderer will actually draw (especially
+                // when inter-block gaps push earlier blocks into the visible area).
+                if (state.terminal.block_layout != null) {
+                    state.terminal.syncPageListViewport();
+                }
+
                 // Update our terminal state
                 try self.terminal_state.update(self.alloc, state.terminal);
 
@@ -1263,11 +1459,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
 
                 const overlay_features: []const Overlay.Feature = overlay: {
-                    const insp = state.inspector orelse break :overlay &.{};
-                    const renderer_info = insp.rendererInfo();
-                    break :overlay renderer_info.overlayFeatures(
-                        arena_alloc,
-                    ) catch &.{};
+                    // Collect features from various sources.
+                    var features: std.ArrayList(Overlay.Feature) = .empty;
+
+                    // Inspector-driven overlays.
+                    if (state.inspector) |insp| {
+                        const renderer_info = insp.rendererInfo();
+                        const insp_features = renderer_info.overlayFeatures(
+                            arena_alloc,
+                        ) catch &.{};
+                        for (insp_features) |f| features.append(arena_alloc, f) catch {};
+                    }
+
+                    break :overlay features.items;
                 };
 
                 break :critical .{
@@ -1360,14 +1564,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.draw_mutex.lock();
                 defer self.draw_mutex.unlock();
 
+                // Store blink state for the filter bar cursor.
+                self.filter_cursor_blink_visible = cursor_blink_visible;
+
                 // Build our GPU cells
-                self.rebuildCells(
-                    critical.preedit,
+                // Hide the terminal cursor when filter input is active.
+                const cursor_style_val: ?renderer.CursorStyle = if (self.terminal_state.filter_input_block_idx != null)
+                    null
+                else
                     renderer.cursorStyle(&self.terminal_state, .{
                         .preedit = critical.preedit != null,
                         .focused = self.focused,
                         .blink_visible = cursor_blink_visible,
-                    }),
+                    });
+                self.rebuildCells(
+                    critical.preedit,
+                    cursor_style_val,
                     &critical.links,
                 ) catch |err| {
                     // This means we weren't able to allocate our buffer
@@ -1380,8 +1592,38 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // The scrollbar is only emitted during draws so we also
                 // check the scrollbar cache here and update if needed.
                 // This is pretty fast.
-                if (!self.scrollbar.eql(critical.scrollbar)) {
-                    self.scrollbar = critical.scrollbar;
+                //
+                // When BlockLayout is active, we derive the scrollbar entirely
+                // from the virtual document dimensions. Otherwise, we use the
+                // PageList scrollbar directly.
+                var adjusted_scrollbar = critical.scrollbar;
+                if (self.config.command_blocks and self.terminal_state.total_doc_height_px > 0) {
+                    const cell_h = self.grid_metrics.cell_height;
+                    if (cell_h > 0) {
+                        const doc_h = self.terminal_state.total_doc_height_px;
+                        // Use rows * cell_height for consistency with Terminal.height_px.
+                        const viewport_h: u32 = @as(u32, @intCast(self.terminal_state.rows)) * cell_h;
+                        const scroll_px = self.terminal_state.scroll_offset_px;
+
+                        // Only override the scrollbar when the document is taller
+                        // than the viewport. When doc_h <= viewport_h, everything
+                        // fits on screen and the PageList scrollbar (no scrollback)
+                        // is already correct.
+                        if (doc_h > viewport_h) {
+                            // Convert pixel values to row units for the scrollbar.
+                            // scroll_offset_px is pixels from the bottom (0 = following).
+                            // Scrollbar.offset is the first visible row from the top
+                            // (0 = top of history). Convert by inverting.
+                            const max_scroll = doc_h - viewport_h;
+                            const offset_from_top_px = max_scroll -| scroll_px;
+                            adjusted_scrollbar.total = (doc_h + cell_h - 1) / cell_h;
+                            adjusted_scrollbar.len = (viewport_h + cell_h - 1) / cell_h;
+                            adjusted_scrollbar.offset = offset_from_top_px / cell_h;
+                        }
+                    }
+                }
+                if (!self.scrollbar.eql(adjusted_scrollbar)) {
+                    self.scrollbar = adjusted_scrollbar;
                     self.scrollbar_dirty = true;
                 }
 
@@ -1560,6 +1802,44 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             try frame.cells_bg.sync(self.cells.bg_cells);
             const fg_count = try frame.cells.syncFromArrayLists(self.cells.fg_rows.lists);
 
+            // Compute per-block instance offsets/counts for the fg cell buffer.
+            // The fg buffer is ordered: lists[0]=cursor, lists[1]=row0, lists[2]=row1, ...
+            // We accumulate cell counts per row and map them to block regions.
+            if (self.block_regions.items.len >= 1) {
+                const lists = self.cells.fg_rows.lists;
+                // Offset starts after the cursor list (lists[0]).
+                var cursor_cells: usize = if (lists.len > 0) lists[0].items.len else 0;
+                for (self.block_regions.items, 0..) |*region, ri| {
+                    // For the first region, skip any rows before region.first_row
+                    // (shouldn't happen normally). For subsequent regions, skip
+                    // any rows between the previous region's end and this region's
+                    // start — these are hidden rows from collapsed blocks.
+                    const skip_start: usize = if (ri > 0) blk: {
+                        const prev = self.block_regions.items[ri - 1];
+                        break :blk prev.first_row + prev.row_count;
+                    } else 0;
+                    var skip_row: usize = skip_start;
+                    while (skip_row < region.first_row) : (skip_row += 1) {
+                        const skip_idx = skip_row + 1;
+                        if (skip_idx < lists.len) {
+                            cursor_cells += lists[skip_idx].items.len;
+                        }
+                    }
+
+                    var count: usize = 0;
+                    var row: usize = region.first_row;
+                    while (row < region.first_row + region.row_count) : (row += 1) {
+                        const list_idx = row + 1; // lists[0] is cursor
+                        if (list_idx < lists.len) {
+                            count += lists[list_idx].items.len;
+                        }
+                    }
+                    region.instance_offset = cursor_cells;
+                    region.instance_count = count;
+                    cursor_cells += count;
+                }
+            }
+
             // If our background image buffer has changed, sync it.
             if (frame.bg_image_buffer_modified != self.bg_image_buffer_modified) {
                 try frame.bg_image_buffer.sync(&.{self.bg_image_buffer});
@@ -1636,13 +1916,1300 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .kitty_below_bg,
                 );
 
-                // Then we draw any opaque cell backgrounds.
-                pass.step(.{
-                    .pipeline = self.shaders.pipelines.cell_bg,
-                    .uniforms = frame.uniforms.buffer,
-                    .buffers = &.{ null, frame.cells_bg.buffer },
-                    .draw = .{ .type = .triangle, .vertex_count = 3 },
-                });
+                // Draw cell backgrounds and text per block region.
+                const default_bp: @TypeOf(pass).Step.BlockParams = .{
+                    .block_y_offset = 0.0,
+                    .block_first_row = 0,
+                };
+
+                if (self.block_regions.items.len >= 1) {
+                    const ts = &self.terminal_state;
+                    // sep_row is the first scratch row index, matching rebuildCells.
+                    const sep_row: f32 = if (ts.block_cell_row_count > 0)
+                        @floatFromInt(ts.block_cell_row_count)
+                    else
+                        @floatFromInt(ts.rows);
+                    const pad_left: f32 = @floatFromInt(self.size.padding.left);
+                    const stripe_w: u32 = self.config.command_blocks_stripe_width;
+                    const num_blocks: u16 = @intCast(@min(ts.block_render_list.items.len, std.math.maxInt(u16)));
+
+                    // Track the last block's params/scissor for the cursor draw.
+                    var last_bp: @TypeOf(pass).Step.BlockParams = default_bp;
+                    var last_scissor: @TypeOf(pass).Step.ScissorRect = .{
+                        .x = 0,
+                        .y = 0,
+                        .width = self.size.screen.width,
+                        .height = self.size.screen.height,
+                    };
+
+                    for (self.block_regions.items, 0..) |region, ri| {
+                        const bp: @TypeOf(pass).Step.BlockParams = .{
+                            .block_y_offset = region.grid_y_offset,
+                            .block_first_row = @floatFromInt(region.first_row),
+                        };
+                        const scissor: @TypeOf(pass).Step.ScissorRect = .{
+                            .x = 0,
+                            .y = region.screen_y_px,
+                            .width = self.size.screen.width,
+                            .height = region.height_px,
+                        };
+
+                        // Compute visual block extent (header padding to footer padding).
+                        const vis_top: u32 = if (ri > 0) blk: {
+                            const prev = self.block_regions.items[ri - 1];
+                            const prev_end = prev.screen_y_px + prev.height_px;
+                            if (region.screen_y_px <= prev_end) break :blk prev_end;
+                            const gap_mid = prev_end + (region.screen_y_px - prev_end) / 2;
+                            break :blk gap_mid + 2;
+                        } else if (self.prev_off_screen_bottom) |prev_bottom_i64| blk: {
+                            // There's a block above the viewport; extend tint to gap midpoint.
+                            const region_y_i64: i64 = @intCast(region.screen_y_px);
+                            if (region_y_i64 > prev_bottom_i64 + 2) {
+                                const gap_mid_i64 = prev_bottom_i64 + @divTrunc(region_y_i64 - prev_bottom_i64, 2) + 2;
+                                break :blk if (gap_mid_i64 >= 0) @as(u32, @intCast(gap_mid_i64)) else 0;
+                            }
+                            break :blk 0;
+                        } else
+                        // First visible block with no block above: extend tint/stripe
+                        // to screen top so the window padding area is filled.
+                            0;
+
+                        const vis_bottom: u32 = if (ri + 1 < self.block_regions.items.len) blk: {
+                            const next = self.block_regions.items[ri + 1];
+                            const this_end = region.screen_y_px + region.height_px;
+                            if (next.screen_y_px <= this_end) break :blk this_end;
+                            const gap_mid = this_end + (next.screen_y_px - this_end) / 2;
+                            break :blk gap_mid;
+                        } else if (region.exit_code < 0 and ts.scroll_offset_px == 0)
+                            // Active block when following: extend tint/stripe to screen bottom.
+                            self.size.screen.height
+                        else if (self.next_off_screen_y) |next_y| blk: {
+                            // There's a block below the viewport; extend tint to gap midpoint.
+                            const this_end = region.screen_y_px + region.height_px;
+                            if (next_y <= this_end) break :blk this_end;
+                            break :blk @min(this_end + (next_y - this_end) / 2, self.size.screen.height);
+                        } else
+                            // Completed block, or active block when scrolled up:
+                            // extend only to content + footer padding.
+                            @min(region.screen_y_px + region.height_px + self.config.command_blocks_padding_footer, self.size.screen.height);
+
+                        // Block tint: background layer spanning the full visual block
+                        // extent (vis_top to vis_bottom), matching the stripe coverage.
+                        // This fills the area between separator lines with the tint,
+                        // including footer/header padding within the block's visual
+                        // boundary. Also drawn when the block is highlighted (clicked).
+                        const block_idx = region.block_idx;
+                        const is_hl = if (ts.highlighted_block_idx) |hl_block_list_idx| blk: {
+                            // Compare against this region's block_list_index.
+                            if (block_idx < ts.block_render_list.items.len) {
+                                break :blk ts.block_render_list.items[block_idx].block_list_index == hl_block_list_idx;
+                            }
+                            break :blk false;
+                        } else false;
+                        if ((region.exit_code >= 0 or is_hl) and num_blocks > 0 and vis_bottom > vis_top) {
+                            const tint_base: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(num_blocks));
+                            const tint_row: f32 = tint_base + @as(f32, @floatFromInt(block_idx));
+
+                            pass.step(.{
+                                .pipeline = self.shaders.pipelines.cell_bg,
+                                .uniforms = frame.uniforms.buffer,
+                                .buffers = &.{ null, frame.cells_bg.buffer },
+                                .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                .scissor = .{
+                                    .x = 0,
+                                    .y = vis_top,
+                                    .width = self.size.screen.width,
+                                    .height = vis_bottom - vis_top,
+                                },
+                                .block_params = .{
+                                    .block_y_offset = 0,
+                                    .block_first_row = tint_row,
+                                    .block_x_offset = -pad_left,
+                                    .block_y_flat = 1.0,
+                                },
+                            });
+                        }
+
+                        // Content background
+                        pass.step(.{
+                            .pipeline = self.shaders.pipelines.cell_bg,
+                            .uniforms = frame.uniforms.buffer,
+                            .buffers = &.{ null, frame.cells_bg.buffer },
+                            .draw = .{ .type = .triangle, .vertex_count = 3 },
+                            .scissor = scissor,
+                            .block_params = bp,
+                        });
+
+                        // Content text
+                        if (region.instance_count > 0) {
+                            pass.step(.{
+                                .pipeline = self.shaders.pipelines.cell_text,
+                                .uniforms = frame.uniforms.buffer,
+                                .buffers = &.{
+                                    frame.cells.buffer,
+                                    frame.cells_bg.buffer,
+                                },
+                                .textures = &.{
+                                    frame.grayscale,
+                                    frame.color,
+                                },
+                                .draw = .{
+                                    .type = .triangle_strip,
+                                    .vertex_count = 4,
+                                    .instance_count = region.instance_count,
+                                    .base_instance = region.instance_offset,
+                                },
+                                .scissor = scissor,
+                                .block_params = bp,
+                            });
+                        }
+
+                        // Remember this block's params for the cursor draw.
+                        last_bp = bp;
+                        last_scissor = scissor;
+
+                        // Stripe: spans the full visual block extent (header to footer).
+                        if (stripe_w > 0 and vis_bottom > vis_top) {
+                            const stripe_scratch: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(block_idx));
+                            const sc = self.stripeColor(region.exit_code);
+                            if (sc[3] > 0) {
+                                pass.step(.{
+                                    .pipeline = self.shaders.pipelines.cell_bg,
+                                    .uniforms = frame.uniforms.buffer,
+                                    .buffers = &.{ null, frame.cells_bg.buffer },
+                                    .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                    .scissor = .{
+                                        .x = 0,
+                                        .y = vis_top,
+                                        .width = stripe_w,
+                                        .height = vis_bottom - vis_top,
+                                    },
+                                    .block_params = .{
+                                        .block_y_offset = 0,
+                                        .block_first_row = stripe_scratch,
+                                        .block_x_offset = -pad_left,
+                                        .block_y_flat = 1.0,
+                                    },
+                                });
+                            }
+                        }
+
+                        // Collapse indicator: semi-transparent overlay on the
+                        // last visible row of collapsed blocks. Signals that
+                        // Collapse indicator: no separate background draw needed.
+                        // The block tint already covers the last visible row.
+                        // Only the text overlay (added by addCollapseIndicatorText)
+                        // is drawn on top.
+
+                        // Leading separator: gap between an off-screen block above
+                        // and the first visible block.
+                        if (ri == 0) {
+                            if (self.prev_off_screen_bottom) |prev_bottom_i64| {
+                                const region_y_i64: i64 = @intCast(region.screen_y_px);
+                                if (region_y_i64 > prev_bottom_i64 + 2) {
+                                    const gap_mid_i64 = prev_bottom_i64 + @divTrunc(region_y_i64 - prev_bottom_i64, 2);
+                                    if (gap_mid_i64 >= 0 and gap_mid_i64 + 2 <= @as(i64, @intCast(self.size.screen.height))) {
+                                        const gap_mid: u32 = @intCast(gap_mid_i64);
+                                        if (self.config.command_blocks_separator_color != null) {
+                                            pass.step(.{
+                                                .pipeline = self.shaders.pipelines.cell_bg,
+                                                .uniforms = frame.uniforms.buffer,
+                                                .buffers = &.{ null, frame.cells_bg.buffer },
+                                                .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                                .scissor = .{
+                                                    .x = 0,
+                                                    .y = gap_mid,
+                                                    .width = self.size.screen.width,
+                                                    .height = @min(2, self.size.screen.height -| gap_mid),
+                                                },
+                                                .block_params = .{
+                                                    .block_y_offset = 0,
+                                                    .block_first_row = sep_row,
+                                                    .block_x_offset = -pad_left,
+                                                    .block_y_flat = 1.0,
+                                                },
+                                            });
+                                        }
+                                        if (stripe_w > 0 and region.screen_y_px > gap_mid + 2) {
+                                            const cur_sc = self.stripeColor(region.exit_code);
+                                            if (cur_sc[3] > 0) {
+                                                const cur_stripe: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(region.block_idx));
+                                                pass.step(.{
+                                                    .pipeline = self.shaders.pipelines.cell_bg,
+                                                    .uniforms = frame.uniforms.buffer,
+                                                    .buffers = &.{ null, frame.cells_bg.buffer },
+                                                    .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                                    .scissor = .{
+                                                        .x = 0,
+                                                        .y = gap_mid + 2,
+                                                        .width = stripe_w,
+                                                        .height = region.screen_y_px - gap_mid - 2,
+                                                    },
+                                                    .block_params = .{
+                                                        .block_y_offset = 0,
+                                                        .block_first_row = cur_stripe,
+                                                        .block_x_offset = -pad_left,
+                                                        .block_y_flat = 1.0,
+                                                    },
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Separator + stripe through gap to next block.
+                        if (ri > 0) {
+                            const prev = self.block_regions.items[ri - 1];
+                            const prev_end = prev.screen_y_px + prev.height_px;
+                            if (region.screen_y_px > prev_end + 2) {
+                                const gap_mid = prev_end + (region.screen_y_px - prev_end) / 2;
+
+                                // Separator line (scratch row filled with color, flat).
+                                // Skipped when separator color is null (hidden).
+                                if (self.config.command_blocks_separator_color != null) {
+                                    pass.step(.{
+                                        .pipeline = self.shaders.pipelines.cell_bg,
+                                        .uniforms = frame.uniforms.buffer,
+                                        .buffers = &.{ null, frame.cells_bg.buffer },
+                                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                        .scissor = .{
+                                            .x = 0,
+                                            .y = gap_mid,
+                                            .width = self.size.screen.width,
+                                            .height = 2,
+                                        },
+                                        .block_params = .{
+                                            .block_y_offset = 0,
+                                            .block_first_row = sep_row,
+                                            .block_x_offset = -pad_left,
+                                            .block_y_flat = 1.0,
+                                        },
+                                    });
+                                }
+
+                                // Stripe through gap: footer half uses previous
+                                // block's color, header half uses current block's.
+                                if (stripe_w > 0) {
+                                    // Footer stripe (prev_end to gap_mid).
+                                    const prev_sc = self.stripeColor(prev.exit_code);
+                                    if (prev_sc[3] > 0 and gap_mid > prev_end) {
+                                        const prev_stripe: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(prev.block_idx));
+                                        pass.step(.{
+                                            .pipeline = self.shaders.pipelines.cell_bg,
+                                            .uniforms = frame.uniforms.buffer,
+                                            .buffers = &.{ null, frame.cells_bg.buffer },
+                                            .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                            .scissor = .{
+                                                .x = 0,
+                                                .y = prev_end,
+                                                .width = stripe_w,
+                                                .height = gap_mid - prev_end,
+                                            },
+                                            .block_params = .{
+                                                .block_y_offset = 0,
+                                                .block_first_row = prev_stripe,
+                                                .block_x_offset = -pad_left,
+                                                .block_y_flat = 1.0,
+                                            },
+                                        });
+                                    }
+                                    // Header stripe (gap_mid+2 to region start).
+                                    const cur_sc = self.stripeColor(region.exit_code);
+                                    if (cur_sc[3] > 0 and region.screen_y_px > gap_mid + 2) {
+                                        const cur_stripe: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(region.block_idx));
+                                        pass.step(.{
+                                            .pipeline = self.shaders.pipelines.cell_bg,
+                                            .uniforms = frame.uniforms.buffer,
+                                            .buffers = &.{ null, frame.cells_bg.buffer },
+                                            .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                            .scissor = .{
+                                                .x = 0,
+                                                .y = gap_mid + 2,
+                                                .width = stripe_w,
+                                                .height = region.screen_y_px - gap_mid - 2,
+                                            },
+                                            .block_params = .{
+                                                .block_y_offset = 0,
+                                                .block_first_row = cur_stripe,
+                                                .block_x_offset = -pad_left,
+                                                .block_y_flat = 1.0,
+                                            },
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Trailing separator: draw the separator in the gap between the
+                    // last visible block and the first off-screen block below the viewport.
+                    // Without this, separators disappear before scrolling off screen.
+                    if (self.next_off_screen_y) |next_y| {
+                        if (self.block_regions.items.len > 0 and self.config.command_blocks_separator_color != null) {
+                            const last_reg = self.block_regions.items[self.block_regions.items.len - 1];
+                            const last_end = last_reg.screen_y_px + last_reg.height_px;
+                            if (next_y > last_end + 2) {
+                                const gap_mid = last_end + (next_y - last_end) / 2;
+                                if (gap_mid + 2 <= self.size.screen.height) {
+                                    pass.step(.{
+                                        .pipeline = self.shaders.pipelines.cell_bg,
+                                        .uniforms = frame.uniforms.buffer,
+                                        .buffers = &.{ null, frame.cells_bg.buffer },
+                                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                        .scissor = .{
+                                            .x = 0,
+                                            .y = gap_mid,
+                                            .width = self.size.screen.width,
+                                            .height = @min(2, self.size.screen.height -| gap_mid),
+                                        },
+                                        .block_params = .{
+                                            .block_y_offset = 0,
+                                            .block_first_row = sep_row,
+                                            .block_x_offset = -pad_left,
+                                            .block_y_flat = 1.0,
+                                        },
+                                    });
+
+                                    // Stripe through trailing gap.
+                                    if (stripe_w > 0) {
+                                        // Footer stripe (last_end to gap_mid).
+                                        const prev_sc = self.stripeColor(last_reg.exit_code);
+                                        if (prev_sc[3] > 0 and gap_mid > last_end) {
+                                            const prev_stripe: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(last_reg.block_idx));
+                                            pass.step(.{
+                                                .pipeline = self.shaders.pipelines.cell_bg,
+                                                .uniforms = frame.uniforms.buffer,
+                                                .buffers = &.{ null, frame.cells_bg.buffer },
+                                                .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                                .scissor = .{
+                                                    .x = 0,
+                                                    .y = last_end,
+                                                    .width = stripe_w,
+                                                    .height = gap_mid - last_end,
+                                                },
+                                                .block_params = .{
+                                                    .block_y_offset = 0,
+                                                    .block_first_row = prev_stripe,
+                                                    .block_x_offset = -pad_left,
+                                                    .block_y_flat = 1.0,
+                                                },
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Filter bar or Toolbar: rendered on the hovered/highlighted block.
+                    if (self.config.command_blocks_toolbar and num_blocks > 0) toolbar: {
+                        // Check if filter input is active on any visible block.
+                        const filter_block_idx = ts.filter_input_block_idx;
+                        const filter_text = ts.filter_input_text.items;
+
+                        // Find the filter block's region (if active).
+                        const filter_region: ?BlockRegion = if (filter_block_idx) |fbi| blk: {
+                            for (self.block_regions.items) |reg| {
+                                if (reg.block_idx < ts.block_render_list.items.len and
+                                    ts.block_render_list.items[reg.block_idx].block_list_index == fbi)
+                                    break :blk reg;
+                            }
+                            break :blk null;
+                        } else null;
+
+                        // If filter is active, render filter bar instead of toolbar.
+                        if (filter_region) |f_region| {
+                            const f_cell_h = self.grid_metrics.cell_height;
+                            const f_cell_w = self.grid_metrics.cell_width;
+                            const f_bar_h: u32 = @min(f_cell_h, f_region.height_px);
+                            const grid_cols_f: u32 = self.cells.size.columns;
+                            const grid_right_f: u32 = self.size.padding.left + grid_cols_f * f_cell_w;
+                            // Filter bar spans most of the block width.
+                            const f_bar_w: u32 = @min(grid_right_f -| self.size.padding.left -| f_cell_w * 2, f_cell_w * 30);
+                            // Position filter bar using same toolbar position config.
+                            const f_is_right = self.config.command_blocks_toolbar_position == .@"upper-right" or
+                                self.config.command_blocks_toolbar_position == .@"lower-right";
+                            const f_is_upper = self.config.command_blocks_toolbar_position == .@"upper-right" or
+                                self.config.command_blocks_toolbar_position == .@"upper-left";
+                            const f_blk_pad_right: u32 = self.config.command_blocks_padding_right;
+                            const f_blk_pad_left: u32 = self.config.command_blocks_padding_left;
+                            const f_bar_x: u32 = if (f_is_right)
+                                grid_right_f -| f_bar_w -| f_blk_pad_right
+                            else
+                                self.size.padding.left + f_blk_pad_left;
+                            const f_toolbar_min_y: u32 = self.config.command_blocks_padding_header;
+                            const f_toolbar_max_y: u32 = self.size.screen.height -| self.config.command_blocks_padding_footer -| f_bar_h;
+                            const f_bar_y: u32 = if (f_is_upper)
+                                @max(f_region.screen_y_px, f_toolbar_min_y)
+                            else
+                                @min((f_region.screen_y_px + f_region.height_px) -| f_bar_h, f_toolbar_max_y);
+
+                            const f_corner_radius: f32 = if (self.config.command_blocks_toolbar_radius > 0)
+                                @floatFromInt(self.config.command_blocks_toolbar_radius)
+                            else
+                                @as(f32, @floatFromInt(f_bar_h)) / 4.0;
+
+                            if (f_bar_h > 0 and f_bar_w > 0) {
+                                const f_toolbar_scratch: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(num_blocks)) * 3.0;
+                                const fb_x_f: f32 = @floatFromInt(f_bar_x);
+                                const fb_y_f: f32 = @floatFromInt(f_bar_y);
+                                const fb_w_f: f32 = @floatFromInt(f_bar_w);
+                                const fb_h_f: f32 = @floatFromInt(f_bar_h);
+
+                                // Filter bar background pill.
+                                pass.step(.{
+                                    .pipeline = self.shaders.pipelines.cell_bg,
+                                    .uniforms = frame.uniforms.buffer,
+                                    .buffers = &.{ null, frame.cells_bg.buffer },
+                                    .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                    .scissor = .{
+                                        .x = f_bar_x,
+                                        .y = f_bar_y,
+                                        .width = f_bar_w,
+                                        .height = f_bar_h,
+                                    },
+                                    .block_params = .{
+                                        .block_y_offset = 0,
+                                        .block_first_row = f_toolbar_scratch,
+                                        .block_x_offset = -pad_left,
+                                        .block_y_flat = 1.0,
+                                        .block_corner_radius = f_corner_radius,
+                                        .block_scissor_x = fb_x_f,
+                                        .block_scissor_y = fb_y_f,
+                                        .block_scissor_w = fb_w_f,
+                                        .block_scissor_h = fb_h_f,
+                                    },
+                                });
+
+                                // Draw filter text using the icon scratch row color.
+                                const f_icon_scratch: f32 = f_toolbar_scratch + 1.0;
+
+                                // Regex toggle button highlight background when active.
+                                if (ts.filter_regex_mode) {
+                                    const rx_margin: u32 = @max(1, f_bar_h / 6);
+                                    const rx_x = f_bar_x + rx_margin;
+                                    const rx_y = f_bar_y + rx_margin;
+                                    // Width covers ".*" text (2 cells + padding).
+                                    const rx_w = f_cell_w * 2 + f_bar_h / 4 + 4 -| rx_margin;
+                                    const rx_h = f_bar_h -| rx_margin * 2;
+                                    const rx_x_f: f32 = @floatFromInt(rx_x);
+                                    const rx_y_f: f32 = @floatFromInt(rx_y);
+                                    const rx_w_f: f32 = @floatFromInt(rx_w);
+                                    const rx_h_f: f32 = @floatFromInt(rx_h);
+                                    const rx_radius: f32 = if (self.config.command_blocks_toolbar_icon_radius > 0)
+                                        @floatFromInt(self.config.command_blocks_toolbar_icon_radius)
+                                    else
+                                        4.0;
+                                    // Use the pressed highlight scratch row (brighter bg).
+                                    const f_pressed_scratch: f32 = f_toolbar_scratch + 3.0;
+                                    pass.step(.{
+                                        .pipeline = self.shaders.pipelines.cell_bg,
+                                        .uniforms = frame.uniforms.buffer,
+                                        .buffers = &.{ null, frame.cells_bg.buffer },
+                                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                        .scissor = .{ .x = rx_x, .y = rx_y, .width = rx_w, .height = rx_h },
+                                        .block_params = .{
+                                            .block_y_offset = 0,
+                                            .block_first_row = f_pressed_scratch,
+                                            .block_x_offset = -pad_left,
+                                            .block_y_flat = 1.0,
+                                            .block_corner_radius = rx_radius,
+                                            .block_scissor_x = rx_x_f,
+                                            .block_scissor_y = rx_y_f,
+                                            .block_scissor_w = rx_w_f,
+                                            .block_scissor_h = rx_h_f,
+                                        },
+                                    });
+                                }
+
+                                // Render filter text as actual glyphs and a cursor bar.
+                                // We add glyph cells to fg_rows[0] and issue a separate
+                                // cell_text draw call with block_params that map grid positions
+                                // to the filter bar's pixel location.
+                                const padding_top_u: u32 = self.size.padding.top;
+                                const padding_left_u: u32 = self.size.padding.left;
+                                const filter_text_x_start: u32 = f_bar_x + f_bar_h / 4 + 4;
+                                // block_params map: grid_pos(col, 0) → pixel (padding_left + x_off + col*cell_w, padding_top + y_off)
+                                // We want col 0 at filter_text_x_start, row 0 at f_bar_y
+                                const filter_block_y_off: f32 = @as(f32, @floatFromInt(f_bar_y)) - @as(f32, @floatFromInt(padding_top_u));
+                                const filter_block_x_off: f32 = @as(f32, @floatFromInt(filter_text_x_start)) - @as(f32, @floatFromInt(padding_left_u));
+                                const filter_bp: @TypeOf(pass).Step.BlockParams = .{
+                                    .block_y_offset = filter_block_y_off,
+                                    .block_first_row = 0,
+                                    .block_x_offset = filter_block_x_off,
+                                    .block_y_flat = 0,
+                                };
+
+                                // Use pre-computed filter text glyphs (populated in rebuildCells,
+                                // already synced to GPU buffer).
+                                // filter_text used below for cursor positioning
+
+                                // Cursor bar using cell_bg (thin vertical rectangle).
+                                // Use actual input text length for cursor, not glyph count
+                                // (glyph count may include placeholder "Filter" text).
+                                // Only show when blink state is visible.
+                                const filter_input_len: u32 = @intCast(@min(filter_text.len, std.math.maxInt(u32)));
+                                const cursor_px_x = filter_text_x_start + (@as(u32, self.filter_text_col_offset) + filter_input_len) * f_cell_w;
+                                const cursor_bar_w: u32 = @max(2, f_cell_w / 5);
+                                const close_region_w: u32 = f_bar_h;
+                                const max_text_x: u32 = (f_bar_x + f_bar_w) -| close_region_w;
+                                if (self.filter_cursor_blink_visible and cursor_px_x + cursor_bar_w < max_text_x) {
+                                    const cb_y_top = f_bar_y + f_bar_h / 6;
+                                    const cb_h_px = f_bar_h -| f_bar_h / 3;
+                                    const cb_x_f: f32 = @floatFromInt(cursor_px_x);
+                                    const cb_y_f: f32 = @floatFromInt(cb_y_top);
+                                    const cb_w_f: f32 = @floatFromInt(cursor_bar_w);
+                                    const cb_h_f: f32 = @floatFromInt(cb_h_px);
+                                    pass.step(.{
+                                        .pipeline = self.shaders.pipelines.cell_bg,
+                                        .uniforms = frame.uniforms.buffer,
+                                        .buffers = &.{ null, frame.cells_bg.buffer },
+                                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                        .scissor = .{
+                                            .x = cursor_px_x,
+                                            .y = cb_y_top,
+                                            .width = cursor_bar_w,
+                                            .height = cb_h_px,
+                                        },
+                                        .block_params = .{
+                                            .block_y_offset = 0,
+                                            .block_first_row = f_icon_scratch,
+                                            .block_x_offset = -pad_left,
+                                            .block_y_flat = 1.0,
+                                            .block_corner_radius = 1.0,
+                                            .block_scissor_x = cb_x_f,
+                                            .block_scissor_y = cb_y_f,
+                                            .block_scissor_w = cb_w_f,
+                                            .block_scissor_h = cb_h_f,
+                                        },
+                                    });
+                                }
+
+                                // Issue cell_text draw call for the pre-computed filter text glyphs.
+                                if (self.filter_text_glyph_count > 0) {
+                                    pass.step(.{
+                                        .pipeline = self.shaders.pipelines.cell_text,
+                                        .uniforms = frame.uniforms.buffer,
+                                        .buffers = &.{
+                                            frame.cells.buffer,
+                                            frame.cells_bg.buffer,
+                                        },
+                                        .textures = &.{
+                                            frame.grayscale,
+                                            frame.color,
+                                        },
+                                        .draw = .{
+                                            .type = .triangle_strip,
+                                            .vertex_count = 4,
+                                            .instance_count = self.filter_text_glyph_count,
+                                            .base_instance = self.filter_text_base_instance,
+                                        },
+                                        .scissor = .{
+                                            .x = f_bar_x,
+                                            .y = f_bar_y,
+                                            .width = f_bar_w,
+                                            .height = f_bar_h,
+                                        },
+                                        .block_params = filter_bp,
+                                    });
+                                }
+
+                                // Copy button to the left of the X close button.
+                                {
+                                    const copy_region_w: u32 = f_bar_h;
+                                    const copy_region_x: u32 = (f_bar_x + f_bar_w) -| f_bar_h -| copy_region_w;
+
+                                    // Draw pressed highlight background.
+                                    if (ts.pressed_filter_copy) {
+                                        const f_pressed_scratch: f32 = f_toolbar_scratch + 3.0;
+                                        const cp_margin: u32 = @max(1, f_bar_h / 8);
+                                        const cp_hx = copy_region_x + cp_margin;
+                                        const cp_hy = f_bar_y + cp_margin;
+                                        const cp_hw = copy_region_w -| cp_margin * 2;
+                                        const cp_hh = f_bar_h -| cp_margin * 2;
+                                        const cp_hx_f: f32 = @floatFromInt(cp_hx);
+                                        const cp_hy_f: f32 = @floatFromInt(cp_hy);
+                                        const cp_hw_f: f32 = @floatFromInt(cp_hw);
+                                        const cp_hh_f: f32 = @floatFromInt(cp_hh);
+                                        const cp_radius: f32 = if (self.config.command_blocks_toolbar_icon_radius > 0)
+                                            @floatFromInt(self.config.command_blocks_toolbar_icon_radius)
+                                        else
+                                            4.0;
+                                        pass.step(.{
+                                            .pipeline = self.shaders.pipelines.cell_bg,
+                                            .uniforms = frame.uniforms.buffer,
+                                            .buffers = &.{ null, frame.cells_bg.buffer },
+                                            .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                            .scissor = .{ .x = cp_hx, .y = cp_hy, .width = cp_hw, .height = cp_hh },
+                                            .block_params = .{
+                                                .block_y_offset = 0,
+                                                .block_first_row = f_pressed_scratch,
+                                                .block_x_offset = -pad_left,
+                                                .block_y_flat = 1.0,
+                                                .block_corner_radius = cp_radius,
+                                                .block_scissor_x = cp_hx_f,
+                                                .block_scissor_y = cp_hy_f,
+                                                .block_scissor_w = cp_hw_f,
+                                                .block_scissor_h = cp_hh_f,
+                                            },
+                                        });
+                                    }
+
+                                    const copy_cx: u32 = copy_region_x + copy_region_w / 2;
+                                    const copy_cy: u32 = f_bar_y + f_bar_h / 2;
+                                    const copy_icon_area: u32 = @max(6, f_bar_h * 2 / 5);
+                                    const copy_rect_w: u32 = copy_icon_area * 2 / 3;
+                                    const copy_rect_h: u32 = copy_icon_area * 3 / 4;
+                                    const copy_offset: u32 = copy_icon_area / 5;
+                                    // Back rectangle (upper-left).
+                                    const copy_back_x = copy_cx -| copy_icon_area / 2;
+                                    const copy_back_y = copy_cy -| copy_icon_area / 2;
+                                    const cbx_f: f32 = @floatFromInt(copy_back_x);
+                                    const cby_f: f32 = @floatFromInt(copy_back_y);
+                                    const cbw_f: f32 = @floatFromInt(copy_rect_w);
+                                    const cbh_f: f32 = @floatFromInt(copy_rect_h);
+                                    pass.step(.{
+                                        .pipeline = self.shaders.pipelines.cell_bg,
+                                        .uniforms = frame.uniforms.buffer,
+                                        .buffers = &.{ null, frame.cells_bg.buffer },
+                                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                        .scissor = .{ .x = copy_back_x, .y = copy_back_y, .width = copy_rect_w, .height = copy_rect_h },
+                                        .block_params = .{
+                                            .block_y_offset = 0,
+                                            .block_first_row = f_icon_scratch,
+                                            .block_x_offset = -pad_left,
+                                            .block_y_flat = 1.0,
+                                            .block_corner_radius = 1.0,
+                                            .block_scissor_x = cbx_f,
+                                            .block_scissor_y = cby_f,
+                                            .block_scissor_w = cbw_f,
+                                            .block_scissor_h = cbh_f,
+                                        },
+                                    });
+                                    // Separator gap (toolbar bg color).
+                                    const csep_x = copy_back_x + copy_offset -| 1;
+                                    const csep_y = copy_back_y + copy_offset -| 1;
+                                    const csep_w = copy_rect_w + 2;
+                                    const csep_h = copy_rect_h + 2;
+                                    const csx_f: f32 = @floatFromInt(csep_x);
+                                    const csy_f: f32 = @floatFromInt(csep_y);
+                                    const csw_f: f32 = @floatFromInt(csep_w);
+                                    const csh_f: f32 = @floatFromInt(csep_h);
+                                    pass.step(.{
+                                        .pipeline = self.shaders.pipelines.cell_bg,
+                                        .uniforms = frame.uniforms.buffer,
+                                        .buffers = &.{ null, frame.cells_bg.buffer },
+                                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                        .scissor = .{ .x = csep_x, .y = csep_y, .width = csep_w, .height = csep_h },
+                                        .block_params = .{
+                                            .block_y_offset = 0,
+                                            .block_first_row = f_toolbar_scratch,
+                                            .block_x_offset = -pad_left,
+                                            .block_y_flat = 1.0,
+                                            .block_corner_radius = 1.0,
+                                            .block_scissor_x = csx_f,
+                                            .block_scissor_y = csy_f,
+                                            .block_scissor_w = csw_f,
+                                            .block_scissor_h = csh_f,
+                                        },
+                                    });
+                                    // Front rectangle (lower-right, icon color).
+                                    const copy_front_x = copy_back_x + copy_offset;
+                                    const copy_front_y = copy_back_y + copy_offset;
+                                    const cfx_f: f32 = @floatFromInt(copy_front_x);
+                                    const cfy_f: f32 = @floatFromInt(copy_front_y);
+                                    pass.step(.{
+                                        .pipeline = self.shaders.pipelines.cell_bg,
+                                        .uniforms = frame.uniforms.buffer,
+                                        .buffers = &.{ null, frame.cells_bg.buffer },
+                                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                        .scissor = .{ .x = copy_front_x, .y = copy_front_y, .width = copy_rect_w, .height = copy_rect_h },
+                                        .block_params = .{
+                                            .block_y_offset = 0,
+                                            .block_first_row = f_icon_scratch,
+                                            .block_x_offset = -pad_left,
+                                            .block_y_flat = 1.0,
+                                            .block_corner_radius = 1.0,
+                                            .block_scissor_x = cfx_f,
+                                            .block_scissor_y = cfy_f,
+                                            .block_scissor_w = cbw_f,
+                                            .block_scissor_h = cbh_f,
+                                        },
+                                    });
+                                }
+
+                                // "X" close button on the right side.
+                                const close_size: u32 = @max(6, f_bar_h / 3);
+                                const close_x: u32 = (f_bar_x + f_bar_w) -| f_bar_h / 2 -| close_size / 2;
+                                const close_y: u32 = f_bar_y + f_bar_h / 2 - close_size / 2;
+                                const close_th: u32 = @max(2, close_size / 4);
+                                const close_steps: u32 = @max(3, close_size);
+                                const ct_f: f32 = @floatFromInt(close_th);
+                                {
+                                    var csi: u32 = 0;
+                                    while (csi <= close_steps) : (csi += 1) {
+                                        // Diagonal 1: top-left to bottom-right.
+                                        const d1x = close_x + csi * close_size / close_steps;
+                                        const d1y = close_y + csi * close_size / close_steps;
+                                        const d1x_f: f32 = @floatFromInt(d1x);
+                                        const d1y_f: f32 = @floatFromInt(d1y);
+                                        pass.step(.{
+                                            .pipeline = self.shaders.pipelines.cell_bg,
+                                            .uniforms = frame.uniforms.buffer,
+                                            .buffers = &.{ null, frame.cells_bg.buffer },
+                                            .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                            .scissor = .{ .x = d1x, .y = d1y, .width = close_th, .height = close_th },
+                                            .block_params = .{
+                                                .block_y_offset = 0,
+                                                .block_first_row = f_icon_scratch,
+                                                .block_x_offset = -pad_left,
+                                                .block_y_flat = 1.0,
+                                                .block_corner_radius = ct_f / 2.0,
+                                                .block_scissor_x = d1x_f,
+                                                .block_scissor_y = d1y_f,
+                                                .block_scissor_w = ct_f,
+                                                .block_scissor_h = ct_f,
+                                            },
+                                        });
+                                        // Diagonal 2: top-right to bottom-left.
+                                        const d2x = (close_x + close_size) -| csi * close_size / close_steps;
+                                        const d2y = close_y + csi * close_size / close_steps;
+                                        const d2x_f: f32 = @floatFromInt(d2x);
+                                        const d2y_f: f32 = @floatFromInt(d2y);
+                                        pass.step(.{
+                                            .pipeline = self.shaders.pipelines.cell_bg,
+                                            .uniforms = frame.uniforms.buffer,
+                                            .buffers = &.{ null, frame.cells_bg.buffer },
+                                            .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                            .scissor = .{ .x = d2x, .y = d2y, .width = close_th, .height = close_th },
+                                            .block_params = .{
+                                                .block_y_offset = 0,
+                                                .block_first_row = f_icon_scratch,
+                                                .block_x_offset = -pad_left,
+                                                .block_y_flat = 1.0,
+                                                .block_corner_radius = ct_f / 2.0,
+                                                .block_scissor_x = d2x_f,
+                                                .block_scissor_y = d2y_f,
+                                                .block_scissor_w = ct_f,
+                                                .block_scissor_h = ct_f,
+                                            },
+                                        });
+                                    }
+                                }
+                            }
+                            break :toolbar;
+                        }
+
+                        const hovered_bl_idx = ts.hovered_block_idx orelse
+                            (ts.highlighted_block_idx orelse break :toolbar);
+                        // Find the BlockRegion for the hovered block.
+                        const hovered_region: ?BlockRegion = for (self.block_regions.items) |reg| {
+                            if (reg.block_idx < ts.block_render_list.items.len and
+                                ts.block_render_list.items[reg.block_idx].block_list_index == hovered_bl_idx)
+                                break reg;
+                        } else null;
+                        const region = hovered_region orelse break :toolbar;
+
+                        const icons_cfg = self.config.command_blocks_toolbar_icons;
+                        const enabled = icons_cfg.enabledIcons();
+                        const icon_count = enabled.len;
+                        if (icon_count == 0) break :toolbar;
+
+                        // Toolbar dimensions: each icon gets a square slot (cell_h x cell_h).
+                        const cell_h = self.grid_metrics.cell_height;
+                        const cell_w = self.grid_metrics.cell_width;
+                        const toolbar_h: u32 = @min(cell_h, region.height_px);
+                        const icon_slot_w: u32 = toolbar_h; // square slots
+                        const icon_padding: u32 = @max(2, toolbar_h / 6);
+                        const toolbar_w: u32 = icon_count * icon_slot_w + icon_padding * 2;
+
+                        // Position based on config.
+                        const grid_cols: u32 = self.cells.size.columns;
+                        const grid_right: u32 = self.size.padding.left + grid_cols * cell_w;
+                        const is_right = self.config.command_blocks_toolbar_position == .@"upper-right" or
+                            self.config.command_blocks_toolbar_position == .@"lower-right";
+                        const is_upper = self.config.command_blocks_toolbar_position == .@"upper-right" or
+                            self.config.command_blocks_toolbar_position == .@"upper-left";
+                        const blk_pad_right: u32 = self.config.command_blocks_padding_right;
+                        const blk_pad_left: u32 = self.config.command_blocks_padding_left;
+                        const toolbar_x: u32 = if (is_right)
+                            grid_right -| toolbar_w -| blk_pad_right
+                        else
+                            self.size.padding.left + blk_pad_left;
+                        const toolbar_min_y: u32 = self.config.command_blocks_padding_header;
+                        const toolbar_max_y: u32 = self.size.screen.height -| self.config.command_blocks_padding_footer -| toolbar_h;
+                        const toolbar_y: u32 = if (is_upper)
+                            @max(region.screen_y_px, toolbar_min_y)
+                        else
+                            @min((region.screen_y_px + region.height_px) -| toolbar_h, toolbar_max_y);
+
+                        const corner_radius: f32 = if (self.config.command_blocks_toolbar_radius > 0)
+                            @floatFromInt(self.config.command_blocks_toolbar_radius)
+                        else
+                            @as(f32, @floatFromInt(toolbar_h)) / 4.0;
+
+                        if (toolbar_h > 0 and toolbar_w > 0) {
+                            const toolbar_scratch: f32 = sep_row + 1.0 + @as(f32, @floatFromInt(num_blocks)) * 3.0;
+                            const tb_x_f: f32 = @floatFromInt(toolbar_x);
+                            const tb_y_f: f32 = @floatFromInt(toolbar_y);
+                            const tb_w_f: f32 = @floatFromInt(toolbar_w);
+                            const tb_h_f: f32 = @floatFromInt(toolbar_h);
+                            // Toolbar pill background.
+                            pass.step(.{
+                                .pipeline = self.shaders.pipelines.cell_bg,
+                                .uniforms = frame.uniforms.buffer,
+                                .buffers = &.{ null, frame.cells_bg.buffer },
+                                .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                .scissor = .{
+                                    .x = toolbar_x,
+                                    .y = toolbar_y,
+                                    .width = toolbar_w,
+                                    .height = toolbar_h,
+                                },
+                                .block_params = .{
+                                    .block_y_offset = 0,
+                                    .block_first_row = toolbar_scratch,
+                                    .block_x_offset = -pad_left,
+                                    .block_y_flat = 1.0,
+                                    .block_corner_radius = corner_radius,
+                                    .block_scissor_x = tb_x_f,
+                                    .block_scissor_y = tb_y_f,
+                                    .block_scissor_w = tb_w_f,
+                                    .block_scissor_h = tb_h_f,
+                                },
+                            });
+
+                            // Draw each icon shape in its slot with margins and hover highlight.
+                            const icon_scratch: f32 = toolbar_scratch + 1.0;
+                            const hover_scratch: f32 = icon_scratch + 1.0;
+                            const pressed_scratch: f32 = hover_scratch + 1.0;
+                            const icon_margin: u32 = @max(1, toolbar_h / 8);
+                            // Icon drawing area: ~55% of the slot for clean look inside container.
+                            const icon_area: u32 = @max(6, (toolbar_h -| icon_margin * 2) * 55 / 100);
+                            const hovered_icon_idx: ?u32 = ts.hovered_toolbar_icon;
+                            const pressed_icon_idx: ?u32 = ts.pressed_toolbar_icon;
+                            var icon_i: u32 = 0;
+                            while (icon_i < icon_count) : (icon_i += 1) {
+                                const slot_x = toolbar_x + icon_padding + icon_i * icon_slot_w;
+
+                                // Draw hover or pressed highlight background for this icon.
+                                const is_pressed = pressed_icon_idx != null and pressed_icon_idx.? == icon_i;
+                                const is_hovered = hovered_icon_idx != null and hovered_icon_idx.? == icon_i;
+                                if (is_pressed or is_hovered) {
+                                    const hx = slot_x + icon_margin;
+                                    const hy = toolbar_y + icon_margin;
+                                    const hw = icon_slot_w -| icon_margin * 2;
+                                    const hh = toolbar_h -| icon_margin * 2;
+                                    const hx_f: f32 = @floatFromInt(hx);
+                                    const hy_f: f32 = @floatFromInt(hy);
+                                    const hw_f: f32 = @floatFromInt(hw);
+                                    const hh_f: f32 = @floatFromInt(hh);
+                                    const hover_radius: f32 = if (self.config.command_blocks_toolbar_icon_radius > 0)
+                                        @floatFromInt(self.config.command_blocks_toolbar_icon_radius)
+                                    else
+                                        4.0;
+                                    pass.step(.{
+                                        .pipeline = self.shaders.pipelines.cell_bg,
+                                        .uniforms = frame.uniforms.buffer,
+                                        .buffers = &.{ null, frame.cells_bg.buffer },
+                                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                        .scissor = .{
+                                            .x = hx,
+                                            .y = hy,
+                                            .width = hw,
+                                            .height = hh,
+                                        },
+                                        .block_params = .{
+                                            .block_y_offset = 0,
+                                            .block_first_row = if (is_pressed) pressed_scratch else hover_scratch,
+                                            .block_x_offset = -pad_left,
+                                            .block_y_flat = 1.0,
+                                            .block_corner_radius = hover_radius,
+                                            .block_scissor_x = hx_f,
+                                            .block_scissor_y = hy_f,
+                                            .block_scissor_w = hw_f,
+                                            .block_scissor_h = hh_f,
+                                        },
+                                    });
+                                }
+
+                                const icon_cx = slot_x + icon_slot_w / 2;
+                                const icon_cy = toolbar_y + toolbar_h / 2;
+                                const icon_r: f32 = if (self.config.command_blocks_toolbar_icon_radius > 0)
+                                    @floatFromInt(self.config.command_blocks_toolbar_icon_radius)
+                                else
+                                    2.0;
+
+                                switch (enabled.icons[icon_i]) {
+                                    .ellipsis => {
+                                        // Three horizontal dots.
+                                        const dot_size: u32 = @max(3, icon_area / 4);
+                                        const dot_cy = icon_cy - dot_size / 2;
+                                        const total_dots_w = dot_size * 3 + (dot_size / 2) * 2;
+                                        const dots_start = icon_cx -| total_dots_w / 2;
+                                        var di: u32 = 0;
+                                        while (di < 3) : (di += 1) {
+                                            const dx = dots_start + di * (dot_size + dot_size / 2);
+                                            const dx_f: f32 = @floatFromInt(dx);
+                                            const dy_f: f32 = @floatFromInt(dot_cy);
+                                            const ds_f: f32 = @floatFromInt(dot_size);
+                                            pass.step(.{
+                                                .pipeline = self.shaders.pipelines.cell_bg,
+                                                .uniforms = frame.uniforms.buffer,
+                                                .buffers = &.{ null, frame.cells_bg.buffer },
+                                                .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                                .scissor = .{
+                                                    .x = dx,
+                                                    .y = dot_cy,
+                                                    .width = dot_size,
+                                                    .height = dot_size,
+                                                },
+                                                .block_params = .{
+                                                    .block_y_offset = 0,
+                                                    .block_first_row = icon_scratch,
+                                                    .block_x_offset = -pad_left,
+                                                    .block_y_flat = 1.0,
+                                                    .block_corner_radius = ds_f / 2.0,
+                                                    .block_scissor_x = dx_f,
+                                                    .block_scissor_y = dy_f,
+                                                    .block_scissor_w = ds_f,
+                                                    .block_scissor_h = ds_f,
+                                                },
+                                            });
+                                        }
+                                    },
+                                    .copy => {
+                                        // Two overlapping rectangles (clipboard icon).
+                                        const rect_w: u32 = icon_area * 2 / 3;
+                                        const rect_h: u32 = icon_area * 3 / 4;
+                                        const offset: u32 = icon_area / 5;
+                                        // Back rectangle (upper-left).
+                                        const back_x = icon_cx - icon_area / 2;
+                                        const back_y = icon_cy - icon_area / 2;
+                                        const bx_f: f32 = @floatFromInt(back_x);
+                                        const by_f: f32 = @floatFromInt(back_y);
+                                        const bw_f: f32 = @floatFromInt(rect_w);
+                                        const bh_f: f32 = @floatFromInt(rect_h);
+                                        pass.step(.{
+                                            .pipeline = self.shaders.pipelines.cell_bg,
+                                            .uniforms = frame.uniforms.buffer,
+                                            .buffers = &.{ null, frame.cells_bg.buffer },
+                                            .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                            .scissor = .{
+                                                .x = back_x,
+                                                .y = back_y,
+                                                .width = rect_w,
+                                                .height = rect_h,
+                                            },
+                                            .block_params = .{
+                                                .block_y_offset = 0,
+                                                .block_first_row = icon_scratch,
+                                                .block_x_offset = -pad_left,
+                                                .block_y_flat = 1.0,
+                                                .block_corner_radius = icon_r,
+                                                .block_scissor_x = bx_f,
+                                                .block_scissor_y = by_f,
+                                                .block_scissor_w = bw_f,
+                                                .block_scissor_h = bh_f,
+                                            },
+                                        });
+                                        // Separator: toolbar-bg rect to create visual gap.
+                                        const sep_x = back_x + offset - 1;
+                                        const sep_y = back_y + offset - 1;
+                                        const sep_w = rect_w + 2;
+                                        const sep_h = rect_h + 2;
+                                        const sx_f: f32 = @floatFromInt(sep_x);
+                                        const sy_f: f32 = @floatFromInt(sep_y);
+                                        const sw_f: f32 = @floatFromInt(sep_w);
+                                        const sh_f: f32 = @floatFromInt(sep_h);
+                                        pass.step(.{
+                                            .pipeline = self.shaders.pipelines.cell_bg,
+                                            .uniforms = frame.uniforms.buffer,
+                                            .buffers = &.{ null, frame.cells_bg.buffer },
+                                            .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                            .scissor = .{
+                                                .x = sep_x,
+                                                .y = sep_y,
+                                                .width = sep_w,
+                                                .height = sep_h,
+                                            },
+                                            .block_params = .{
+                                                .block_y_offset = 0,
+                                                .block_first_row = toolbar_scratch,
+                                                .block_x_offset = -pad_left,
+                                                .block_y_flat = 1.0,
+                                                .block_corner_radius = icon_r,
+                                                .block_scissor_x = sx_f,
+                                                .block_scissor_y = sy_f,
+                                                .block_scissor_w = sw_f,
+                                                .block_scissor_h = sh_f,
+                                            },
+                                        });
+                                        // Front rectangle (lower-right, icon color).
+                                        const front_x = back_x + offset;
+                                        const front_y = back_y + offset;
+                                        const fx_f: f32 = @floatFromInt(front_x);
+                                        const fy_f: f32 = @floatFromInt(front_y);
+                                        pass.step(.{
+                                            .pipeline = self.shaders.pipelines.cell_bg,
+                                            .uniforms = frame.uniforms.buffer,
+                                            .buffers = &.{ null, frame.cells_bg.buffer },
+                                            .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                            .scissor = .{
+                                                .x = front_x,
+                                                .y = front_y,
+                                                .width = rect_w,
+                                                .height = rect_h,
+                                            },
+                                            .block_params = .{
+                                                .block_y_offset = 0,
+                                                .block_first_row = icon_scratch,
+                                                .block_x_offset = -pad_left,
+                                                .block_y_flat = 1.0,
+                                                .block_corner_radius = icon_r,
+                                                .block_scissor_x = fx_f,
+                                                .block_scissor_y = fy_f,
+                                                .block_scissor_w = bw_f,
+                                                .block_scissor_h = bh_f,
+                                            },
+                                        });
+                                    },
+                                    .collapse => {
+                                        // Chevron icon: ">" when collapsed (click to expand),
+                                        // "v" when expanded (click to collapse).
+                                        // Drawn as two arms of densely overlapping circles
+                                        // to form a smooth diagonal line.
+                                        const is_collapsed = region.collapsed;
+                                        const bar_th: u32 = @max(2, icon_area / 5);
+                                        const arm_len: u32 = icon_area * 2 / 3;
+                                        const half_spread: u32 = arm_len / 2;
+                                        // Dense steps: 1px per step for smooth appearance.
+                                        const num_steps: u32 = @max(3, half_spread);
+                                        const bt_f: f32 = @floatFromInt(bar_th);
+
+                                        var si: u32 = 0;
+                                        while (si <= num_steps) : (si += 1) {
+                                            // Two points per step: one on each arm.
+                                            // Right chevron ">": tip at center-right,
+                                            //   arm1: top-left to center-right
+                                            //   arm2: bottom-left to center-right
+                                            // Down chevron "v": tip at center-bottom,
+                                            //   arm1: top-left to center-bottom
+                                            //   arm2: top-right to center-bottom
+                                            const frac_x: u32 = si * half_spread / num_steps;
+                                            const frac_y: u32 = si * half_spread / num_steps;
+
+                                            // Arm 1 and Arm 2 positions.
+                                            const a1x: u32, const a1y: u32, const a2x: u32, const a2y: u32 = if (!is_collapsed) blk: {
+                                                // Down chevron "v" (expanded): arms go from top-left and top-right to center-bottom.
+                                                const tip_x = icon_cx;
+                                                const tip_y = icon_cy + half_spread / 2;
+                                                const left_x = tip_x -| half_spread;
+                                                const right_x = tip_x + half_spread;
+                                                const top_y = tip_y -| half_spread;
+                                                break :blk .{
+                                                    left_x + frac_x, top_y + frac_y, // arm1: top-left → tip
+                                                    right_x -| frac_x, top_y + frac_y, // arm2: top-right → tip
+                                                };
+                                            } else blk: {
+                                                // Right chevron ">" (collapsed): arms go from top-left and bottom-left to center-right.
+                                                const tip_x = icon_cx + half_spread / 2;
+                                                const tip_y = icon_cy;
+                                                const left_x = tip_x -| half_spread;
+                                                const top_y = tip_y -| half_spread;
+                                                const bot_y = tip_y + half_spread;
+                                                break :blk .{
+                                                    left_x + frac_x, top_y + frac_y, // arm1: top-left → tip
+                                                    left_x + frac_x, bot_y -| frac_y, // arm2: bot-left → tip
+                                                };
+                                            };
+
+                                            // Draw arm 1 dot.
+                                            const a1x_off = a1x -| bar_th / 2;
+                                            const a1y_off = a1y -| bar_th / 2;
+                                            const a1xf: f32 = @floatFromInt(a1x_off);
+                                            const a1yf: f32 = @floatFromInt(a1y_off);
+                                            pass.step(.{
+                                                .pipeline = self.shaders.pipelines.cell_bg,
+                                                .uniforms = frame.uniforms.buffer,
+                                                .buffers = &.{ null, frame.cells_bg.buffer },
+                                                .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                                .scissor = .{ .x = a1x_off, .y = a1y_off, .width = bar_th, .height = bar_th },
+                                                .block_params = .{
+                                                    .block_y_offset = 0,
+                                                    .block_first_row = icon_scratch,
+                                                    .block_x_offset = -pad_left,
+                                                    .block_y_flat = 1.0,
+                                                    .block_corner_radius = bt_f / 2.0,
+                                                    .block_scissor_x = a1xf,
+                                                    .block_scissor_y = a1yf,
+                                                    .block_scissor_w = bt_f,
+                                                    .block_scissor_h = bt_f,
+                                                },
+                                            });
+                                            // Draw arm 2 dot (skip when arms overlap at tip).
+                                            const a2x_off = a2x -| bar_th / 2;
+                                            const a2y_off = a2y -| bar_th / 2;
+                                            if (a2x_off != a1x_off or a2y_off != a1y_off) {
+                                                const a2xf: f32 = @floatFromInt(a2x_off);
+                                                const a2yf: f32 = @floatFromInt(a2y_off);
+                                                pass.step(.{
+                                                    .pipeline = self.shaders.pipelines.cell_bg,
+                                                    .uniforms = frame.uniforms.buffer,
+                                                    .buffers = &.{ null, frame.cells_bg.buffer },
+                                                    .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                                    .scissor = .{ .x = a2x_off, .y = a2y_off, .width = bar_th, .height = bar_th },
+                                                    .block_params = .{
+                                                        .block_y_offset = 0,
+                                                        .block_first_row = icon_scratch,
+                                                        .block_x_offset = -pad_left,
+                                                        .block_y_flat = 1.0,
+                                                        .block_corner_radius = bt_f / 2.0,
+                                                        .block_scissor_x = a2xf,
+                                                        .block_scissor_y = a2yf,
+                                                        .block_scissor_w = bt_f,
+                                                        .block_scissor_h = bt_f,
+                                                    },
+                                                });
+                                            }
+                                        }
+                                    },
+                                    .filter => {
+                                        // Three horizontal lines of decreasing width (funnel).
+                                        const line_h: u32 = @max(2, icon_area / 6);
+                                        const line_gap: u32 = @max(1, (icon_area - line_h * 3) / 4);
+                                        const lines_total_h = line_h * 3 + line_gap * 2;
+                                        const line_start_y = icon_cy - lines_total_h / 2;
+                                        var li: u32 = 0;
+                                        while (li < 3) : (li += 1) {
+                                            // Each line gets narrower: 100%, 66%, 33%.
+                                            const line_w: u32 = @max(3, icon_area * (3 - li) / 3);
+                                            const lx = icon_cx - line_w / 2;
+                                            const ly = line_start_y + li * (line_h + line_gap);
+                                            const lx_f: f32 = @floatFromInt(lx);
+                                            const ly_f: f32 = @floatFromInt(ly);
+                                            const lw_f: f32 = @floatFromInt(line_w);
+                                            const lh_f: f32 = @floatFromInt(line_h);
+                                            pass.step(.{
+                                                .pipeline = self.shaders.pipelines.cell_bg,
+                                                .uniforms = frame.uniforms.buffer,
+                                                .buffers = &.{ null, frame.cells_bg.buffer },
+                                                .draw = .{ .type = .triangle, .vertex_count = 3 },
+                                                .scissor = .{
+                                                    .x = lx,
+                                                    .y = ly,
+                                                    .width = line_w,
+                                                    .height = line_h,
+                                                },
+                                                .block_params = .{
+                                                    .block_y_offset = 0,
+                                                    .block_first_row = icon_scratch,
+                                                    .block_x_offset = -pad_left,
+                                                    .block_y_flat = 1.0,
+                                                    .block_corner_radius = @min(icon_r, lh_f / 2.0),
+                                                    .block_scissor_x = lx_f,
+                                                    .block_scissor_y = ly_f,
+                                                    .block_scissor_w = lw_f,
+                                                    .block_scissor_h = lh_f,
+                                                },
+                                            });
+                                        }
+                                    },
+                                }
+                            }
+                        }
+                    }
+
+                    // Draw cursor cells. Block cursors go to lists[0] (drawn
+                    // first), bar/hollow/underline cursors go to lists[rows+1]
+                    // (drawn last). Both need the active block's params/scissor.
+                    const lists = self.cells.fg_rows.lists;
+                    const block_cursor_count = if (lists.len > 0) lists[0].items.len -| self.filter_text_glyph_count else 0;
+                    const overlay_cursor_idx = self.cells.size.rows + 1;
+                    const overlay_cursor_count = if (overlay_cursor_idx < lists.len) lists[overlay_cursor_idx].items.len else 0;
+
+                    if (block_cursor_count > 0) {
+                        pass.step(.{
+                            .pipeline = self.shaders.pipelines.cell_text,
+                            .uniforms = frame.uniforms.buffer,
+                            .buffers = &.{
+                                frame.cells.buffer,
+                                frame.cells_bg.buffer,
+                            },
+                            .textures = &.{
+                                frame.grayscale,
+                                frame.color,
+                            },
+                            .draw = .{
+                                .type = .triangle_strip,
+                                .vertex_count = 4,
+                                .instance_count = block_cursor_count,
+                            },
+                            .scissor = last_scissor,
+                            .block_params = last_bp,
+                        });
+                    }
+
+                    if (overlay_cursor_count > 0) {
+                        // Compute base_instance: sum of all cells in lists[0..rows+1].
+                        var overlay_base: usize = 0;
+                        for (lists[0..overlay_cursor_idx]) |list| {
+                            overlay_base += list.items.len;
+                        }
+                        pass.step(.{
+                            .pipeline = self.shaders.pipelines.cell_text,
+                            .uniforms = frame.uniforms.buffer,
+                            .buffers = &.{
+                                frame.cells.buffer,
+                                frame.cells_bg.buffer,
+                            },
+                            .textures = &.{
+                                frame.grayscale,
+                                frame.color,
+                            },
+                            .draw = .{
+                                .type = .triangle_strip,
+                                .vertex_count = 4,
+                                .instance_count = overlay_cursor_count,
+                                .base_instance = overlay_base,
+                            },
+                            .scissor = last_scissor,
+                            .block_params = last_bp,
+                        });
+                    }
+                } else if (!self.config.command_blocks) {
+                    // Non-block mode: draw all cell backgrounds and text
+                    // without scissoring. In block mode, bg_color already
+                    // covers the screen and blocks draw their own content.
+                    pass.step(.{
+                        .pipeline = self.shaders.pipelines.cell_bg,
+                        .uniforms = frame.uniforms.buffer,
+                        .buffers = &.{ null, frame.cells_bg.buffer },
+                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                        .block_params = default_bp,
+                    });
+
+                    pass.step(.{
+                        .pipeline = self.shaders.pipelines.cell_text,
+                        .uniforms = frame.uniforms.buffer,
+                        .buffers = &.{
+                            frame.cells.buffer,
+                            frame.cells_bg.buffer,
+                        },
+                        .textures = &.{
+                            frame.grayscale,
+                            frame.color,
+                        },
+                        .draw = .{
+                            .type = .triangle_strip,
+                            .vertex_count = 4,
+                            .instance_count = fg_count,
+                        },
+                        .block_params = default_bp,
+                    });
+                }
 
                 // Kitty images between cell backgrounds and text.
                 self.images.draw(
@@ -1651,25 +3218,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     &pass,
                     .kitty_below_text,
                 );
-
-                // Text.
-                pass.step(.{
-                    .pipeline = self.shaders.pipelines.cell_text,
-                    .uniforms = frame.uniforms.buffer,
-                    .buffers = &.{
-                        frame.cells.buffer,
-                        frame.cells_bg.buffer,
-                    },
-                    .textures = &.{
-                        frame.grayscale,
-                        frame.color,
-                    },
-                    .draw = .{
-                        .type = .triangle_strip,
-                        .vertex_count = 4,
-                        .instance_count = fg_count,
-                    },
-                });
 
                 // Kitty images in front of text.
                 self.images.draw(
@@ -2320,22 +3868,42 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             //     std.log.warn("[rebuildCells time] {}\t{}", .{start_micro, end.since(start) / std.time.ns_per_us});
             // }
 
+            // Count blocks for scratch row allocation from BlockLayout.
+            const num_blocks: u16 = blk: {
+                if (!self.config.command_blocks) break :blk 0;
+                break :blk @intCast(@min(state.block_render_list.items.len, std.math.maxInt(u16)));
+            };
+            // Extra rows: 1 separator + num_blocks stripe + num_blocks tint + num_blocks collapse + 1 toolbar.
+            const has_toolbar: bool = num_blocks > 0 and self.config.command_blocks_toolbar;
+            const toolbar_scratch_count: u16 = if (has_toolbar) 4 else 0; // bg + icon color + icon hover + icon pressed
+            // Extra rows: 1 separator + num_blocks stripe + num_blocks tint + num_blocks collapse + 1 toolbar.
+            const scratch_rows: u16 = if (num_blocks > 0) 1 + num_blocks * 3 + toolbar_scratch_count else 0;
+            // When block-aware rendering is active, use block_cell_row_count
+            // (the actual number of populated rows) instead of state.rows.
+            const content_rows: u16 = if (state.block_cell_row_count > 0)
+                @intCast(@min(state.block_cell_row_count, std.math.maxInt(u16)))
+            else
+                state.rows;
+            const total_rows = content_rows + scratch_rows;
+
             const grid_size_diff =
-                self.cells.size.rows != state.rows or
+                self.cells.size.rows != total_rows or
                 self.cells.size.columns != state.cols;
 
             if (grid_size_diff) {
                 var new_size = self.cells.size;
-                new_size.rows = state.rows;
+                new_size.rows = total_rows;
                 new_size.columns = state.cols;
                 try self.cells.resize(self.alloc, new_size);
 
-                // Update our uniforms accordingly, otherwise
-                // our background cells will be out of place.
+                // grid_size tells the shader the valid cell range.
+                // This includes scratch rows because the shader needs to
+                // reference them for separator, stripe, and tint rendering.
                 self.uniforms.grid_size = .{ new_size.columns, new_size.rows };
             }
 
             const rebuild = state.dirty == .full or grid_size_diff;
+
             if (rebuild) {
                 // If we are doing a full rebuild, then we clear the entire cell buffer.
                 self.cells.reset();
@@ -2355,6 +3923,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         };
                     },
                 }
+
+                // Command blocks: extend left/right so separators, stripes,
+                // and tints reach the screen edges horizontally. Explicitly
+                // disable up/down because scratch rows beyond the viewport
+                // (separator grey, stripe/tint colors) would bleed into the
+                // vertical padding area via extension.
+                if (self.config.command_blocks) {
+                    self.uniforms.padding_extend = .{
+                        .up = false,
+                        .down = false,
+                        .left = true,
+                        .right = true,
+                    };
+                }
             }
 
             // From this point on we never fail. We produce some kind of
@@ -2373,10 +3955,152 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // we render the rows that fit, starting from the bottom. If instead
             // the viewport is shorter than the cell contents buffer, we align
             // the top of the viewport with the top of the contents buffer.
-            const row_len: usize = @min(
-                state.rows,
-                self.cells.size.rows,
-            );
+            //
+            // When block-aware rendering is active, block_cell_row_count gives
+            // the actual number of populated rows (may differ from state.rows).
+            const row_len: usize = if (state.block_cell_row_count > 0)
+                @min(state.block_cell_row_count, self.cells.size.rows)
+            else
+                @min(state.rows, self.cells.size.rows);
+
+            // Compute block regions for per-block scissored rendering.
+            {
+                self.block_regions.clearRetainingCapacity();
+                self.next_off_screen_y = null;
+                self.prev_off_screen_bottom = null;
+
+                const brl = state.block_render_list.items;
+                const use_layout = brl.len > 0 and self.config.command_blocks;
+
+                if (use_layout) {
+                    // --- BlockLayout-driven block region computation ---
+                    // BlockLayout provides stable, viewport-independent virtual coordinates.
+                    // We compute viewport_top_px from the scroll offset, then map each
+                    // block's virtual_y_px to screen coordinates.
+                    //
+                    // With block-aware rendering, the cell buffer is populated directly
+                    // from block pins (decoupled from PageList viewport). Each block's
+                    // viewport_first_row is a contiguous cell buffer offset assigned by
+                    // RenderState.populateBlockRows(). No skip_top logic is needed —
+                    // the scissor rect clips partial rows and grid_y_offset positions
+                    // content at sub-cell-height pixel precision for smooth scrolling.
+                    const padding_top = self.size.padding.top;
+                    const screen_h = self.size.screen.height;
+                    const cell_h_vp = self.grid_metrics.cell_height;
+                    const doc_h = state.total_doc_height_px;
+                    // Use rows * cell_height to match Terminal.height_px, which is
+                    // the same value used by BlockLayout for scroll calculations.
+                    const viewport_h: u32 = @as(u32, state.rows) * cell_h_vp;
+                    const scroll_px = state.scroll_offset_px;
+
+                    const viewport_top_px: i64 = @max(0, @as(i64, @intCast(doc_h)) -
+                        @as(i64, @intCast(viewport_h)) -
+                        @as(i64, @intCast(scroll_px)));
+
+                    const vp_top_u32: u32 = @intCast(viewport_top_px);
+
+                    for (brl, 0..) |info, layout_i| {
+                        // screen_y = padding_top + (block.virtual_y_px - viewport_top_px)
+                        const block_screen_y_i64: i64 = @as(i64, @intCast(padding_top)) +
+                            @as(i64, @intCast(info.virtual_y_px)) - viewport_top_px;
+
+                        // Skip blocks entirely above or below the screen.
+                        const block_bottom_i64 = block_screen_y_i64 + @as(i64, @intCast(info.visible_height_px));
+                        if (block_bottom_i64 <= 0) {
+                            // Track the bottom edge of this off-screen block above
+                            // the viewport so we can draw a leading separator.
+                            self.prev_off_screen_bottom = block_bottom_i64;
+                            continue;
+                        }
+                        if (block_screen_y_i64 >= @as(i64, @intCast(screen_h))) {
+                            // Track the first off-screen block below the viewport
+                            // so we can draw the trailing separator in the gap.
+                            if (self.next_off_screen_y == null) {
+                                self.next_off_screen_y = @intCast(block_screen_y_i64);
+                            }
+                            continue;
+                        }
+
+                        // Clip to screen bounds.
+                        const screen_y: u32 = if (block_screen_y_i64 >= 0)
+                            @intCast(block_screen_y_i64)
+                        else
+                            0;
+
+                        const clip_top: u32 = if (block_screen_y_i64 < 0)
+                            @intCast(-block_screen_y_i64)
+                        else
+                            0;
+
+                        const visible_h: u32 = info.visible_height_px -| clip_top;
+                        const height: u32 = @min(visible_h, screen_h -| screen_y);
+
+                        if (height == 0) continue;
+
+                        // viewport_first_row is the contiguous cell buffer offset assigned
+                        // by populateBlockRows. maxInt means this block's rows weren't
+                        // populated (block not visible).
+                        if (info.viewport_first_row == std.math.maxInt(u16)) continue;
+                        const first_row: u16 = info.viewport_first_row;
+
+                        // Row count and skip values: use pre-computed values from
+                        // populateBlockRows when available (block-aware path) to
+                        // ensure perfect consistency between cell buffer population
+                        // and rendering. Falls back to recomputation for the
+                        // standard (non-block-layout) path.
+                        const rows_above: u32 = if (info.viewport_row_count > 0)
+                            info.viewport_rows_skipped_top
+                        else blk: {
+                            const px_above: u32 = if (info.virtual_y_px < vp_top_u32)
+                                vp_top_u32 - info.virtual_y_px
+                            else
+                                0;
+                            break :blk if (cell_h_vp > 0) px_above / cell_h_vp else 0;
+                        };
+                        const display_rc: u16 = if (info.viewport_row_count > 0)
+                            @min(info.viewport_row_count, @as(u16, @intCast(@min(
+                                @as(usize, row_len) -| @as(usize, first_row),
+                                std.math.maxInt(u16),
+                            ))))
+                        else blk: {
+                            const visible_rc: u16 = @intCast(@min(info.visible_rows -| rows_above, std.math.maxInt(u16)));
+                            const max_rows: u16 = @intCast(@min(
+                                @as(usize, row_len) -| @as(usize, first_row),
+                                std.math.maxInt(u16),
+                            ));
+                            break :blk @min(visible_rc, max_rows);
+                        };
+
+                        // Grid Y offset: pixel-precise position for the first rendered
+                        // row. The block's virtual_y_px + rows_above * cell_h gives the
+                        // pixel position of the first row in the cell buffer. Subtracting
+                        // viewport_top_px converts to screen space. This naturally handles
+                        // sub-cell-height offsets for smooth scrolling — the scissor rect
+                        // clips partial rows at the top and bottom.
+                        const grid_y: f32 = @as(f32, @floatFromInt(info.virtual_y_px)) -
+                            @as(f32, @floatFromInt(vp_top_u32)) +
+                            @as(f32, @floatFromInt(rows_above * cell_h_vp));
+
+                        const hidden: u16 = @intCast(@min(info.hiddenLines(), std.math.maxInt(u16)));
+
+                        self.block_regions.append(self.alloc, .{
+                            .first_row = first_row,
+                            .row_count = display_rc,
+                            .screen_y_px = screen_y,
+                            .height_px = height,
+                            .grid_y_offset = grid_y,
+                            .exit_code = info.exit_code,
+                            .collapsed = info.collapsed,
+                            .hidden_lines = hidden,
+                            .block_idx = @intCast(@min(layout_i, std.math.maxInt(u16))),
+                            .filtered = info.filtered,
+                            .filter_match_rows = info.filter_match_rows,
+                            .output_row_offset = info.output_row_offset,
+                        }) catch {};
+                    }
+
+                }
+            }
 
             // Determine our x/y range for preedit. We don't want to render anything
             // here because we will render the preedit separately.
@@ -2440,6 +4164,143 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     log.warn("error building row y={} err={}", .{ y, err });
                     self.cells.clear(y);
                 };
+
+                // Block tint is applied as a draw-level background layer,
+                // not per-cell, so it covers gaps and supports hover/click.
+            }
+
+            // Filtered block rows are now loaded directly into the correct
+            // cell buffer positions by populateBlockRows (which skips non-matching
+            // output rows during iteration). No remap needed.
+
+            // Populate scratch rows for separator and per-row stripes.
+            // sep_row is the index of the first scratch row, after all content rows.
+            const sep_row: usize = content_rows;
+            if (scratch_rows > 0) {
+                const cols_u: usize = state.cols;
+
+                // Scratch row for separator: all columns use config separator color.
+                // When separator color is null (hidden), fill with transparent so
+                // the scratch row exists but draws nothing.
+                const sep_color: [4]u8 = if (self.config.command_blocks_separator_color) |c|
+                    .{ c.r, c.g, c.b, 255 }
+                else
+                    .{ 0, 0, 0, 0 };
+                var sx: usize = 0;
+                while (sx < cols_u) : (sx += 1) {
+                    self.cells.bgCell(@intCast(sep_row), @intCast(sx)).* = sep_color;
+                }
+
+                // Per-block scratch rows: stripe colors and tint colors.
+                const brl_items = state.block_render_list.items;
+                var bi: u16 = 0;
+                while (bi < num_blocks) : (bi += 1) {
+                    const ec: i32 = if (bi < brl_items.len)
+                        brl_items[bi].exit_code
+                    else
+                        -1;
+
+                    // Stripe scratch row.
+                    const stripe_row: usize = sep_row + 1 + bi;
+                    const sc = self.stripeColor(ec);
+                    var scx: usize = 0;
+                    while (scx < cols_u) : (scx += 1) {
+                        self.cells.bgCell(@intCast(stripe_row), @intCast(scx)).* = sc;
+                    }
+
+                    // Tint scratch row (full-width block bg tint).
+                    // Blend against the actual terminal background color so
+                    // the tint is visible on both light and dark themes.
+                    // When this block is highlighted, use the highlight tint
+                    // instead of the exit-code tint.
+                    const tint_row: usize = sep_row + 1 + num_blocks + bi;
+                    const bg = state.colors.background;
+                    const bg_rgba: [4]u8 = .{ bg.r, bg.g, bg.b, 255 };
+                    const is_highlighted = if (state.highlighted_block_idx) |hl_block_list_idx| blk: {
+                        if (bi < brl_items.len) {
+                            break :blk brl_items[bi].block_list_index == hl_block_list_idx;
+                        }
+                        break :blk false;
+                    } else false;
+
+                    const tc: [4]u8 = if (is_highlighted)
+                        self.blendHighlightTint(bg_rgba)
+                    else if (ec >= 128 and ec <= 255)
+                        self.blendSignalTint(bg_rgba)
+                    else if (ec > 0)
+                        self.blendErrorTint(bg_rgba)
+                    else if (ec == 0)
+                        self.blendSuccessTint(bg_rgba)
+                    else
+                        .{ 0, 0, 0, 0 };
+                    var tcx: usize = 0;
+                    while (tcx < cols_u) : (tcx += 1) {
+                        self.cells.bgCell(@intCast(tint_row), @intCast(tcx)).* = tc;
+                    }
+
+                    // Collapse indicator scratch row: fully transparent so the
+                    // underlying block tint shows through unchanged. The collapse
+                    // indicator draw call still needs a valid scratch row, but with
+                    // alpha=0 it won't alter the block's appearance.
+                    const collapse_row: usize = sep_row + 1 + @as(usize, num_blocks) * 2 + bi;
+                    var ccx: usize = 0;
+                    while (ccx < cols_u) : (ccx += 1) {
+                        self.cells.bgCell(@intCast(collapse_row), @intCast(ccx)).* = .{ 0, 0, 0, 0 };
+                    }
+                }
+
+                // Toolbar scratch rows: background pill + icon color + icon hover.
+                if (has_toolbar) {
+                    const toolbar_bg_row: usize = sep_row + 1 + @as(usize, num_blocks) * 3;
+                    const toolbar_icon_row: usize = toolbar_bg_row + 1;
+                    const toolbar_hover_row: usize = toolbar_icon_row + 1;
+                    const toolbar_pressed_row: usize = toolbar_hover_row + 1;
+                    const tb_color: [4]u8 = if (self.config.command_blocks_toolbar_color) |c|
+                        .{ c.r, c.g, c.b, 230 }
+                    else
+                        .{ 0x1a, 0x1a, 0x2e, 230 };
+                    // Icon color: lighter version of fg.
+                    const fg = state.colors.foreground;
+                    const icon_color: [4]u8 = .{
+                        @intCast((@as(u16, fg.r) * 2 + 255) / 3),
+                        @intCast((@as(u16, fg.g) * 2 + 255) / 3),
+                        @intCast((@as(u16, fg.b) * 2 + 255) / 3),
+                        200,
+                    };
+                    // Hover color: semi-transparent lighter version of toolbar bg.
+                    const hover_color: [4]u8 = .{
+                        @intCast(@min(255, @as(u16, tb_color[0]) + 40)),
+                        @intCast(@min(255, @as(u16, tb_color[1]) + 40)),
+                        @intCast(@min(255, @as(u16, tb_color[2]) + 40)),
+                        200,
+                    };
+                    // Pressed color: brighter than hover for click feedback.
+                    const pressed_color: [4]u8 = .{
+                        @intCast(@min(255, @as(u16, tb_color[0]) + 80)),
+                        @intCast(@min(255, @as(u16, tb_color[1]) + 80)),
+                        @intCast(@min(255, @as(u16, tb_color[2]) + 80)),
+                        230,
+                    };
+                    var tbx: usize = 0;
+                    while (tbx < cols_u) : (tbx += 1) {
+                        self.cells.bgCell(@intCast(toolbar_bg_row), @intCast(tbx)).* = tb_color;
+                        self.cells.bgCell(@intCast(toolbar_icon_row), @intCast(tbx)).* = icon_color;
+                        self.cells.bgCell(@intCast(toolbar_hover_row), @intCast(tbx)).* = hover_color;
+                        self.cells.bgCell(@intCast(toolbar_pressed_row), @intCast(tbx)).* = pressed_color;
+                    }
+                }
+            }
+
+            // Replace cells on the last visible row of collapsed blocks with
+            // the "... N lines hidden" indicator text. This modifies the cell
+            // buffer directly so selection/highlight sees the indicator text,
+            // while copy operations read from the original PageList data.
+            for (self.block_regions.items) |region| {
+                if (region.collapsed and region.hidden_lines > 0 and region.row_count > 0) {
+                    const last_row: terminal.size.CellCountInt =
+                        @intCast(region.first_row + region.row_count - 1);
+                    self.replaceCollapseIndicatorCells(last_row, region.hidden_lines);
+                }
             }
 
             // Setup our cursor rendering information.
@@ -2595,6 +4456,134 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     };
 
                     x += if (cp.wide) 2 else 1;
+                }
+            }
+
+            // Populate filter text glyphs into fg_rows[0].
+            // This MUST be after cursor setup (setCursor clears fg_rows[0]).
+            self.filter_text_glyph_count = 0;
+            self.filter_text_base_instance = 0;
+            self.filter_text_col_offset = 0;
+            if (state.filter_input_block_idx != null) {
+                const lists_ft = self.cells.fg_rows.lists;
+                if (lists_ft.len > 0) {
+                    self.filter_text_base_instance = lists_ft[0].items.len;
+                    const has_text = state.filter_input_text.items.len > 0;
+                    const fg_ft = state.colors.foreground;
+                    // Dimmer color for placeholder, full brightness for typed text.
+                    const filter_fg_ft: [4]u8 = if (has_text)
+                        .{ fg_ft.r, fg_ft.g, fg_ft.b, 255 }
+                    else
+                        .{ fg_ft.r / 2, fg_ft.g / 2, fg_ft.b / 2, 255 };
+
+                    var ft_col: u16 = 0;
+
+                    // Render ".*" regex mode indicator at the start of the filter bar.
+                    // Bright when active, dim when inactive.
+                    {
+                        const regex_active = state.filter_regex_mode;
+                        const regex_fg: [4]u8 = if (regex_active)
+                            .{ fg_ft.r, fg_ft.g, fg_ft.b, 255 }
+                        else
+                            .{ fg_ft.r / 3, fg_ft.g / 3, fg_ft.b / 3, 255 };
+                        for (".*") |ch| {
+                            const render_rx = self.font_grid.renderCodepoint(
+                                self.alloc,
+                                @intCast(ch),
+                                .regular,
+                                .text,
+                                .{ .grid_metrics = self.grid_metrics },
+                            ) catch continue;
+                            const glyph_rx = render_rx orelse continue;
+                            lists_ft[0].append(self.alloc, .{
+                                .atlas = .grayscale,
+                                .grid_pos = .{ ft_col, 0 },
+                                .color = regex_fg,
+                                .glyph_pos = .{ glyph_rx.glyph.atlas_x, glyph_rx.glyph.atlas_y },
+                                .glyph_size = .{ glyph_rx.glyph.width, glyph_rx.glyph.height },
+                                .bearings = .{ @intCast(glyph_rx.glyph.offset_x), @intCast(glyph_rx.glyph.offset_y) },
+                            }) catch continue;
+                            ft_col += 1;
+                        }
+                        ft_col += 1; // space after ".*"
+                        self.filter_text_col_offset = ft_col;
+                    }
+
+                    const text_to_render: []const u8 = if (has_text)
+                        state.filter_input_text.items
+                    else
+                        "Filter";
+                    for (text_to_render) |ch| {
+                        if (ch < 0x20 or ch > 0x7e) continue;
+                        const render_ft = self.font_grid.renderCodepoint(
+                            self.alloc,
+                            @intCast(ch),
+                            .regular,
+                            .text,
+                            .{ .grid_metrics = self.grid_metrics },
+                        ) catch continue;
+                        const glyph_ft = render_ft orelse continue;
+                        lists_ft[0].append(self.alloc, .{
+                            .atlas = .grayscale,
+                            .grid_pos = .{ ft_col, 0 },
+                            .color = filter_fg_ft,
+                            .glyph_pos = .{ glyph_ft.glyph.atlas_x, glyph_ft.glyph.atlas_y },
+                            .glyph_size = .{ glyph_ft.glyph.width, glyph_ft.glyph.height },
+                            .bearings = .{ @intCast(glyph_ft.glyph.offset_x), @intCast(glyph_ft.glyph.offset_y) },
+                        }) catch continue;
+                        ft_col += 1;
+                    }
+
+                    // Append right-aligned match count label (e.g., "3 of 47")
+                    // in dimmed color, only when there's actual filter input.
+                    if (has_text and state.filter_total_rows > 0) {
+                        var count_buf: [32]u8 = undefined;
+                        const count_str = std.fmt.bufPrint(&count_buf, "{d} of {d}", .{
+                            state.filter_match_count,
+                            state.filter_total_rows,
+                        }) catch "";
+                        // Compute max text columns in the filter bar.
+                        // Bar layout: [pad] [text area] [copy btn] [close btn]
+                        // Each button is cell_height wide; text starts at ~cell_h/4+4 from bar left.
+                        const cell_w_ft = self.grid_metrics.cell_width;
+                        const cell_h_ft = self.grid_metrics.cell_height;
+                        const grid_cols_ft: u32 = self.cells.size.columns;
+                        const grid_right_ft: u32 = self.size.padding.left + grid_cols_ft * cell_w_ft;
+                        const bar_w_ft: u32 = @min(grid_right_ft -| self.size.padding.left -| cell_w_ft * 2, cell_w_ft * 30);
+                        const text_start_offset: u32 = cell_h_ft / 4 + 4;
+                        const buttons_w: u32 = cell_h_ft * 2; // copy + close
+                        const text_area_px: u32 = bar_w_ft -| text_start_offset -| buttons_w;
+                        const max_text_cols: u16 = @intCast(@min(text_area_px / cell_w_ft, std.math.maxInt(u16)));
+                        const count_len: u16 = @intCast(@min(count_str.len, std.math.maxInt(u16)));
+                        // Right-align: place count at (max_text_cols - count_len - 1) for a gap.
+                        if (count_len + 1 < max_text_cols) {
+                            const count_start_col: u16 = max_text_cols - count_len;
+                            const count_fg: [4]u8 = .{ fg_ft.r / 2, fg_ft.g / 2, fg_ft.b / 2, 255 };
+                            var ct_col: u16 = count_start_col;
+                            for (count_str) |ch| {
+                                if (ch < 0x20 or ch > 0x7e) continue;
+                                const render_ct = self.font_grid.renderCodepoint(
+                                    self.alloc,
+                                    @intCast(ch),
+                                    .regular,
+                                    .text,
+                                    .{ .grid_metrics = self.grid_metrics },
+                                ) catch continue;
+                                const glyph_ct = render_ct orelse continue;
+                                lists_ft[0].append(self.alloc, .{
+                                    .atlas = .grayscale,
+                                    .grid_pos = .{ ct_col, 0 },
+                                    .color = count_fg,
+                                    .glyph_pos = .{ glyph_ct.glyph.atlas_x, glyph_ct.glyph.atlas_y },
+                                    .glyph_size = .{ glyph_ct.glyph.width, glyph_ct.glyph.height },
+                                    .bearings = .{ @intCast(glyph_ct.glyph.offset_x), @intCast(glyph_ct.glyph.offset_y) },
+                                }) catch continue;
+                                ct_col += 1;
+                            }
+                        }
+                    }
+
+                    self.filter_text_glyph_count = lists_ft[0].items.len - self.filter_text_base_instance;
                 }
             }
 
@@ -3349,6 +5338,83 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             try self.addUnderline(@intCast(coord.x), @intCast(coord.y), .single, screen_fg, 255);
             if (cp.wide and coord.x < self.cells.size.columns - 1) {
                 try self.addUnderline(@intCast(coord.x + 1), @intCast(coord.y), .single, screen_fg, 255);
+            }
+        }
+
+        /// Replace cells on the last visible row of a collapsed block with
+        /// the "... N lines hidden" indicator. This modifies the cell buffer
+        /// directly (removing original fg glyphs and bg colors for the
+        /// indicator columns) so that selection sees the indicator text.
+        /// Copy operations read from PageList pins and get the original data.
+        fn replaceCollapseIndicatorCells(
+            self: *Self,
+            y: terminal.size.CellCountInt,
+            hidden_lines: u16,
+        ) void {
+            // Format the indicator string into a stack buffer.
+            var buf: [64]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, " ... {d} {s} hidden ", .{ hidden_lines, if (hidden_lines == 1) @as([]const u8, "line") else @as([]const u8, "lines") }) catch return;
+
+            // Compute right-aligned starting column. Skip if the indicator
+            // text would overlap with the first half of the row (prompt text).
+            const cols: u16 = self.cells.size.columns;
+            const text_len: u16 = @intCast(@min(text.len, cols));
+            if (text_len == 0) return;
+            const start_x: u16 = cols - text_len;
+            if (start_x < cols / 2) return;
+
+            // Remove existing fg cells on the indicator columns.
+            // fg_rows is indexed as [y + 1] (index 0 is reserved for cursor).
+            const row_list = &self.cells.fg_rows.lists[y + 1];
+            var i: usize = 0;
+            while (i < row_list.items.len) {
+                if (row_list.items[i].grid_pos[0] >= start_x) {
+                    _ = row_list.swapRemove(i);
+                } else {
+                    i += 1;
+                }
+            }
+
+            // Clear bg cells for the indicator columns (transparent).
+            var cx: u16 = start_x;
+            while (cx < cols) : (cx += 1) {
+                self.cells.bgCell(y, cx).* = .{ 0, 0, 0, 0 };
+            }
+
+            // Use a dimmed foreground color (blend fg toward bg).
+            const fg = self.terminal_state.colors.foreground;
+            const bg = self.terminal_state.colors.background;
+            const dim_fg: terminal.color.RGB = .{
+                .r = @intCast((@as(u16, fg.r) + @as(u16, bg.r)) / 2),
+                .g = @intCast((@as(u16, fg.g) + @as(u16, bg.g)) / 2),
+                .b = @intCast((@as(u16, fg.b) + @as(u16, bg.b)) / 2),
+            };
+
+            // Add the indicator text glyphs.
+            for (text, 0..) |ch, ci| {
+                const x: u16 = start_x + @as(u16, @intCast(ci));
+                if (x >= cols) break;
+
+                const render_ = self.font_grid.renderCodepoint(
+                    self.alloc,
+                    @intCast(ch),
+                    .regular,
+                    .text,
+                    .{ .grid_metrics = self.grid_metrics },
+                ) catch continue;
+                const render = render_ orelse continue;
+
+                self.cells.add(self.alloc, .text, .{
+                    .atlas = .grayscale,
+                    .grid_pos = .{ x, y },
+                    .color = .{ dim_fg.r, dim_fg.g, dim_fg.b, 255 },
+                    .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
+                    .glyph_size = .{ render.glyph.width, render.glyph.height },
+                    .bearings = .{
+                        @intCast(render.glyph.offset_x),
+                        @intCast(render.glyph.offset_y),
+                    },
+                }) catch continue;
             }
         }
 

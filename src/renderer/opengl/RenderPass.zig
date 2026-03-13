@@ -34,18 +34,45 @@ pub const Step = struct {
     textures: []const ?Texture = &.{},
     samplers: []const ?Sampler = &.{},
     draw: Draw,
+    /// Optional scissor rect to clip rendering to a subregion.
+    scissor: ?ScissorRect = null,
+    /// Optional per-draw block parameters for command block rendering.
+    block_params: ?BlockParams = null,
+
+    pub const BlockParams = extern struct {
+        block_y_offset: f32,
+        block_first_row: f32,
+        block_x_offset: f32 = 0,
+        block_y_flat: f32 = 0,
+        block_corner_radius: f32 = 0,
+        block_scissor_x: f32 = 0,
+        block_scissor_y: f32 = 0,
+        block_scissor_w: f32 = 0,
+        block_scissor_h: f32 = 0,
+    };
+
+    pub const ScissorRect = struct {
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    };
 
     /// Describes the draw call for this step.
     pub const Draw = struct {
         type: gl.Primitive,
         vertex_count: usize,
         instance_count: usize = 1,
+        base_instance: usize = 0,
     };
 };
 
 attachments: []const Options.Attachment,
 
 step_number: usize = 0,
+
+/// Lazily-created UBO for block parameters, reused across steps in a pass.
+block_params_ubo: ?gl.Buffer = null,
 
 /// Begin a render pass.
 pub fn begin(
@@ -128,6 +155,34 @@ pub fn step(self: *Self, s: Step) void {
         gl.disable(gl.c.GL_BLEND) catch return;
     }
 
+    if (s.scissor) |sc| {
+        gl.enable(gl.c.GL_SCISSOR_TEST) catch return;
+        gl.c.glScissor(
+            @intCast(sc.x),
+            @intCast(sc.y),
+            @intCast(sc.width),
+            @intCast(sc.height),
+        );
+    } else {
+        gl.disable(gl.c.GL_SCISSOR_TEST) catch return;
+    }
+
+    // Bind block parameters UBO at binding index 3, matching Metal convention.
+    if (s.block_params) |bp| {
+        // Lazily create the UBO on first use.
+        if (self.block_params_ubo == null) {
+            self.block_params_ubo = gl.Buffer.create() catch return;
+        }
+        const ubo = self.block_params_ubo.?;
+        const binding = ubo.bind(.uniform) catch return;
+        binding.setData(&bp, .dynamic_draw) catch {
+            binding.unbind();
+            return;
+        };
+        binding.unbind();
+        ubo.bindBase(.uniform, 3) catch return;
+    }
+
     gl.drawArraysInstanced(
         s.draw.type,
         0,
@@ -138,7 +193,11 @@ pub fn step(self: *Self, s: Step) void {
 
 /// Complete this render pass.
 /// This struct can no longer be used after calling this.
-pub fn complete(self: *const Self) void {
-    _ = self;
+pub fn complete(self: *Self) void {
+    // Clean up the block parameters UBO if it was created.
+    if (self.block_params_ubo) |ubo| {
+        ubo.destroy();
+        self.block_params_ubo = null;
+    }
     gl.flush();
 }
