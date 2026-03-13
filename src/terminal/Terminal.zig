@@ -13178,3 +13178,380 @@ test "Terminal: mode 1049 alt screen plain" {
         try testing.expectEqualStrings("", str);
     }
 }
+
+// ─── Command Block Tests ─────────────────────────────────────────────────────
+
+/// Helper: simulate a full command with OSC 133 A/B/C/D and print text.
+/// Returns the terminal positioned after the command completes.
+fn testSimulateCommand(
+    t: *Terminal,
+    prompt: []const u8,
+    command: []const u8,
+    output: []const u8,
+    exit_code: i32,
+) !void {
+    // OSC 133 A — new prompt
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    for (prompt) |c| try t.print(c);
+    // OSC 133 B — start input
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    for (command) |c| try t.print(c);
+    // OSC 133 C — start output
+    try t.semanticPrompt(.init(.end_input_start_output));
+    t.carriageReturn();
+    try t.linefeed();
+    // Print output lines (split on \n)
+    for (output) |c| {
+        if (c == '\n') {
+            t.carriageReturn();
+            try t.linefeed();
+        } else {
+            try t.print(c);
+        }
+    }
+    t.carriageReturn();
+    try t.linefeed();
+    // OSC 133 D — command done with exit code
+    var buf: [16]u8 = undefined;
+    const exit_str = std.fmt.bufPrint(&buf, "{d}", .{exit_code}) catch "";
+    try t.semanticPrompt(.{ .action = .end_command, .options_unvalidated = exit_str });
+}
+
+test "Terminal: block list created on OSC 133 A" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    // No block list initially.
+    try testing.expect(t.block_list == null);
+
+    // OSC 133 A creates the block list.
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try testing.expect(t.block_list != null);
+    try testing.expectEqual(@as(usize, 1), t.block_list.?.blockCount());
+}
+
+test "Terminal: block list tracks multiple commands" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    try testSimulateCommand(&t, "$ ", "echo hello", "hello", 0);
+    try testSimulateCommand(&t, "$ ", "echo world", "world", 0);
+    // After the second command completes, a third prompt starts.
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    const bl = t.block_list.?;
+    try testing.expectEqual(@as(usize, 3), bl.blockCount());
+
+    // First block should have exit code 0.
+    try testing.expectEqual(@as(?i32, 0), bl.blocks.items[0].exit_code);
+    // Second block should have exit code 0.
+    try testing.expectEqual(@as(?i32, 0), bl.blocks.items[1].exit_code);
+    // Third (active) block has no exit code.
+    try testing.expect(bl.blocks.items[2].exit_code == null);
+}
+
+test "Terminal: block exit codes tracked correctly" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    try testSimulateCommand(&t, "$ ", "true", "", 0);
+    try testSimulateCommand(&t, "$ ", "false", "", 1);
+    try testSimulateCommand(&t, "$ ", "kill-me", "", 137);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    const bl = t.block_list.?;
+    try testing.expectEqual(@as(?i32, 0), bl.blocks.items[0].exit_code);
+    try testing.expectEqual(@as(?i32, 1), bl.blocks.items[1].exit_code);
+    try testing.expectEqual(@as(?i32, 137), bl.blocks.items[2].exit_code);
+}
+
+test "Terminal: block input and output pins set" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    try testSimulateCommand(&t, "$ ", "echo hi", "hi", 0);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    const bl = t.block_list.?;
+    const block = &bl.blocks.items[0];
+
+    // All pins should be set for a completed block.
+    try testing.expect(block.input_start != null);
+    try testing.expect(block.output_start != null);
+    try testing.expect(block.end != null);
+    try testing.expect(!block.prompt_start.garbage);
+}
+
+test "Terminal: gotoBlock navigates between blocks" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    try testSimulateCommand(&t, "$ ", "cmd1", "out1", 0);
+    try testSimulateCommand(&t, "$ ", "cmd2", "out2", 0);
+    try testSimulateCommand(&t, "$ ", "cmd3", "out3", 0);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    // 4 blocks: 3 completed + 1 active.
+    try testing.expectEqual(@as(usize, 4), t.block_list.?.blockCount());
+
+    // Nothing highlighted initially.
+    try testing.expect(t.highlighted_block_idx == null);
+
+    // "Previous" with nothing highlighted → selects last completed (index 2).
+    t.gotoBlock(true);
+    try testing.expectEqual(@as(?usize, 2), t.highlighted_block_idx);
+
+    // "Previous" again → selects block 1.
+    t.gotoBlock(true);
+    try testing.expectEqual(@as(?usize, 1), t.highlighted_block_idx);
+
+    // "Previous" again → selects block 0.
+    t.gotoBlock(true);
+    try testing.expectEqual(@as(?usize, 0), t.highlighted_block_idx);
+
+    // "Previous" at block 0 → stays at block 0.
+    t.gotoBlock(true);
+    try testing.expectEqual(@as(?usize, 0), t.highlighted_block_idx);
+
+    // "Next" → selects block 1.
+    t.gotoBlock(false);
+    try testing.expectEqual(@as(?usize, 1), t.highlighted_block_idx);
+
+    // "Next" → selects block 2.
+    t.gotoBlock(false);
+    try testing.expectEqual(@as(?usize, 2), t.highlighted_block_idx);
+
+    // "Next" from last completed → deselects.
+    t.gotoBlock(false);
+    try testing.expect(t.highlighted_block_idx == null);
+
+    // "Next" with nothing highlighted → no-op.
+    t.gotoBlock(false);
+    try testing.expect(t.highlighted_block_idx == null);
+}
+
+test "Terminal: gotoBlock with single block is no-op" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    // Only active block — need at least 2 for navigation.
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try testing.expectEqual(@as(usize, 1), t.block_list.?.blockCount());
+
+    t.gotoBlock(true);
+    try testing.expect(t.highlighted_block_idx == null);
+    t.gotoBlock(false);
+    try testing.expect(t.highlighted_block_idx == null);
+}
+
+test "Terminal: toggleHighlightedBlockCollapse" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    try testSimulateCommand(&t, "$ ", "echo hi", "hello\nworld", 0);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    const bl = &t.block_list.?;
+    const block = &bl.blocks.items[0];
+
+    // Initially expanded.
+    try testing.expect(!block.collapsed);
+
+    // No-op when nothing highlighted.
+    t.toggleHighlightedBlockCollapse();
+    try testing.expect(!block.collapsed);
+
+    // Highlight block 0 and toggle collapse.
+    t.highlighted_block_idx = 0;
+    t.toggleHighlightedBlockCollapse();
+    try testing.expect(block.collapsed);
+
+    // Toggle again — expand.
+    t.toggleHighlightedBlockCollapse();
+    try testing.expect(!block.collapsed);
+}
+
+test "Terminal: toggleHighlightedBlockCollapse no-op without output" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    // Block with prompt but no output (no OSC 133 C sent).
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    for ("$ ") |c| try t.print(c);
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    // Add a second block to close the first.
+    t.carriageReturn();
+    try t.linefeed();
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    t.highlighted_block_idx = 0;
+    t.toggleHighlightedBlockCollapse();
+    // Should remain expanded — no output to collapse.
+    try testing.expect(!t.block_list.?.blocks.items[0].collapsed);
+}
+
+test "Terminal: auto-collapse threshold" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    t.auto_collapse_threshold = 0; // Collapse most recently completed block immediately.
+
+    try testSimulateCommand(&t, "$ ", "echo 1", "one", 0);
+    try testSimulateCommand(&t, "$ ", "echo 2", "two", 0);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    const items = t.block_list.?.blocks.items;
+    // Block 0 should be collapsed (it was 2 positions back when block 2 was created,
+    // and threshold=0 means collapse at offset 2 from end).
+    try testing.expect(items[0].collapsed);
+    // Block 1 should also be collapsed when the 4th prompt appeared.
+    try testing.expect(items[1].collapsed);
+}
+
+test "Terminal: filter lifecycle" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    try testSimulateCommand(&t, "$ ", "ls", "foo\nbar\nbaz", 0);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    // No filter initially.
+    try testing.expect(t.filter_input_block_idx == null);
+
+    // Start filter on block 0.
+    t.startFilterInput(0);
+    try testing.expectEqual(@as(?usize, 0), t.filter_input_block_idx);
+
+    // Type "ba" into filter.
+    t.appendFilterText("ba");
+    const block = &t.block_list.?.blocks.items[0];
+    // "bar" and "baz" match "ba".
+    try testing.expect(block.filter_match_rows != null);
+    try testing.expectEqual(@as(usize, 2), block.filter_match_rows.?.len);
+    try testing.expect(block.filter_text != null);
+    try testing.expectEqualStrings("ba", block.filter_text.?);
+
+    // Backspace removes last character.
+    t.backspaceFilterText();
+    try testing.expectEqualStrings("b", t.filter_input_buf.items);
+    // Now "b" matches all 3: "bar", "baz" (and "foo" doesn't match).
+    // Actually: "foo" has no 'b', "bar" has 'b', "baz" has 'b'.
+    try testing.expect(block.filter_match_rows != null);
+    try testing.expectEqual(@as(usize, 2), block.filter_match_rows.?.len);
+
+    // Dismiss filter.
+    t.dismissFilterInput();
+    try testing.expect(t.filter_input_block_idx == null);
+    try testing.expectEqual(@as(usize, 0), t.filter_input_buf.items.len);
+    try testing.expect(block.filter_match_rows == null);
+    try testing.expect(block.filter_text == null);
+}
+
+test "Terminal: filter empty needle clears filter" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    try testSimulateCommand(&t, "$ ", "ls", "foo\nbar", 0);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    t.startFilterInput(0);
+    t.appendFilterText("foo");
+    try testing.expect(t.block_list.?.blocks.items[0].filter_match_rows != null);
+
+    // Backspace all characters — clears filter.
+    t.backspaceFilterText();
+    t.backspaceFilterText();
+    t.backspaceFilterText();
+    try testing.expectEqual(@as(usize, 0), t.filter_input_buf.items.len);
+    // applyFilter with empty needle clears filter_match_rows.
+    try testing.expect(t.block_list.?.blocks.items[0].filter_match_rows == null);
+}
+
+test "Terminal: filter regex mode" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    try testSimulateCommand(&t, "$ ", "ls", "foo123\nbar456\nbaz789", 0);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    t.startFilterInput(0);
+
+    // Literal mode: type a regex pattern as literal text.
+    t.appendFilterText("\\d+");
+    const block = &t.block_list.?.blocks.items[0];
+    // Literal "\\d+" won't match any output line.
+    try testing.expect(block.filter_match_rows != null);
+    try testing.expectEqual(@as(usize, 0), block.filter_match_rows.?.len);
+
+    // Toggle to regex mode.
+    try testing.expect(!t.filter_regex_mode);
+    t.toggleFilterRegexMode();
+    try testing.expect(t.filter_regex_mode);
+    // Now \\d+ is a regex matching digits — all 3 lines have digits.
+    try testing.expect(block.filter_match_rows != null);
+    try testing.expectEqual(@as(usize, 3), block.filter_match_rows.?.len);
+
+    // Toggle back to literal mode.
+    t.toggleFilterRegexMode();
+    try testing.expect(!t.filter_regex_mode);
+    try testing.expectEqual(@as(usize, 0), block.filter_match_rows.?.len);
+
+    // Dismiss resets regex mode.
+    t.filter_regex_mode = true;
+    t.dismissFilterInput();
+    try testing.expect(!t.filter_regex_mode);
+}
+
+test "Terminal: block commandText and outputText" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    try testSimulateCommand(&t, "$ ", "echo hello", "hello", 0);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    const bl = &t.block_list.?;
+    const block = &bl.blocks.items[0];
+
+    var cmd_buf: [256]u8 = undefined;
+    const cmd = block.commandText(&t.screens.active.pages, &cmd_buf);
+    try testing.expectEqualStrings("echo hello", cmd);
+
+    var out_buf: [256]u8 = undefined;
+    const out = block.outputText(&t.screens.active.pages, &out_buf);
+    // Output includes the CR/LF before and after the text.
+    // Just verify "hello" is contained in the output.
+    try testing.expect(std.mem.indexOf(u8, out, "hello") != null);
+}
+
+test "Terminal: block cached_row_count set on close" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    try testSimulateCommand(&t, "$ ", "echo hi", "hello\nworld", 0);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    const block = &t.block_list.?.blocks.items[0];
+    // Completed block should have cached row count.
+    try testing.expect(block.cached_row_count != null);
+    // prompt row + output "hello" + output "world" + blank line from CR/LF = varies,
+    // but should be > 0.
+    try testing.expect(block.cached_row_count.? > 0);
+
+    // Active block should NOT have cached row count.
+    const active = t.block_list.?.activeBlock().?;
+    try testing.expect(active.cached_row_count == null);
+}

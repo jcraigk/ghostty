@@ -892,3 +892,95 @@ test "BlockLayout: collapse reduces document height" {
     const b2_expanded_y: u32 = 118 + 96 + 22; // b0 extent + b1 visible + gap
     try testing.expect(b2.virtual_y_px < b2_expanded_y);
 }
+
+test "BlockLayout: filtered block reduces visible rows" {
+    var s = try Screen.init(testing.allocator, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    defer s.deinit();
+
+    var bl = Block.BlockList.init(testing.allocator, &s.pages);
+    defer bl.deinit();
+
+    const node = s.pages.pages.first.?;
+    _ = try bl.addBlock(.{ .node = node, .y = 0 });
+    // Block 0: rows 0-9 (10 rows), output starts at row 2.
+    bl.blocks.items[0].output_start = try s.pages.trackPin(.{ .node = node, .y = 2 });
+    _ = try bl.addBlock(.{ .node = node, .y = 10 });
+
+    var layout = BlockLayout.init(testing.allocator, &bl);
+    defer layout.deinit();
+
+    var config = testConfig();
+    config.active_block_cursor_row = 5;
+    layout.setConfig(config);
+
+    // Before filter: block 0 has 10 visible rows.
+    const b0_before = layout.blockAt(0).?;
+    try testing.expectEqual(@as(u32, 10), b0_before.total_rows);
+    try testing.expectEqual(@as(u32, 10), b0_before.visible_rows);
+    try testing.expect(!b0_before.filtered);
+
+    // Apply filter: simulate 3 matched output rows (out of 8 output rows).
+    // Allocated with testing.allocator — bl.deinit() will free via bl.alloc.
+    const matches = try testing.allocator.alloc(u32, 3);
+    matches[0] = 0; // output row 0
+    matches[1] = 2; // output row 2
+    matches[2] = 5; // output row 5
+    bl.blocks.items[0].filter_match_rows = matches;
+    layout.invalidate();
+
+    // After filter: visible_rows = output_row_offset (2) + matched (3) = 5.
+    const b0_after = layout.blockAt(0).?;
+    try testing.expectEqual(@as(u32, 10), b0_after.total_rows);
+    try testing.expectEqual(@as(u32, 5), b0_after.visible_rows);
+    try testing.expect(b0_after.filtered);
+    try testing.expect(b0_after.filter_match_rows != null);
+    try testing.expectEqual(@as(usize, 3), b0_after.filter_match_rows.?.len);
+
+    // Document height should have decreased.
+    // Before: 10 * 16 = 160. After: 5 * 16 = 80. Difference = 80.
+    const full_h = (10 * 16) + (16 * 16) + 22; // block0 + block1(active, 16 rows estimated) + gap
+    _ = full_h; // just for documentation
+    // The filtered block's visible_height_px should be 5 * 16 = 80.
+    try testing.expectEqual(@as(u32, 5 * 16), b0_after.visible_height_px);
+
+    // Clear filter.
+    testing.allocator.free(bl.blocks.items[0].filter_match_rows.?);
+    bl.blocks.items[0].filter_match_rows = null;
+    layout.invalidate();
+    const b0_cleared = layout.blockAt(0).?;
+    try testing.expectEqual(@as(u32, 10), b0_cleared.visible_rows);
+    try testing.expect(!b0_cleared.filtered);
+}
+
+test "BlockLayout: filtered block with collapse prefers filter" {
+    var s = try Screen.init(testing.allocator, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    defer s.deinit();
+
+    var bl = Block.BlockList.init(testing.allocator, &s.pages);
+    defer bl.deinit();
+
+    const node = s.pages.pages.first.?;
+    _ = try bl.addBlock(.{ .node = node, .y = 0 });
+    bl.blocks.items[0].output_start = try s.pages.trackPin(.{ .node = node, .y = 1 });
+    _ = try bl.addBlock(.{ .node = node, .y = 10 });
+
+    var layout = BlockLayout.init(testing.allocator, &bl);
+    defer layout.deinit();
+
+    var config = testConfig();
+    config.active_block_cursor_row = 5;
+    layout.setConfig(config);
+
+    // Set both collapsed and filtered — filter should take priority.
+    bl.blocks.items[0].collapsed = true;
+    const matches = try testing.allocator.alloc(u32, 2);
+    matches[0] = 1;
+    matches[1] = 4;
+    bl.blocks.items[0].filter_match_rows = matches;
+    layout.invalidate();
+
+    const b0 = layout.blockAt(0).?;
+    // Filter takes priority: output_row_offset (1) + 2 matches = 3.
+    try testing.expectEqual(@as(u32, 3), b0.visible_rows);
+    try testing.expect(b0.filtered);
+}
