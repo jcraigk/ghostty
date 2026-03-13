@@ -17,6 +17,7 @@ pub const Message = apprt.surface.Message;
 
 const std = @import("std");
 const builtin = @import("builtin");
+const objc = if (builtin.os.tag.isDarwin()) @import("objc") else struct {};
 const assert = @import("quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -220,6 +221,8 @@ const Mouse = struct {
     /// coordinates so that scrolling preserves the location.
     left_click_pin: ?*terminal.Pin = null,
     left_click_screen: terminal.ScreenSet.Key = .primary,
+    /// Block index where the selection started (for clamping drag to block bounds).
+    left_click_block_idx: ?usize = null,
 
     /// The starting xpos/ypos of the left click. Note that if scrolling occurs,
     /// these will point to different "cells", but the xpos/ypos will stay
@@ -336,6 +339,13 @@ const DerivedConfig = struct {
     notify_on_command_finish_action: configpkg.Config.NotifyOnCommandFinishAction,
     notify_on_command_finish_after: Duration,
     key_remaps: input.KeyRemapSet,
+    command_blocks_toolbar: bool,
+    command_blocks_toolbar_icons: configpkg.Config.ToolbarIcons,
+    command_blocks_toolbar_position: configpkg.Config.ToolbarPosition,
+    command_blocks_padding_left: u16,
+    command_blocks_padding_right: u16,
+    command_blocks_padding_header: u16,
+    command_blocks_padding_footer: u16,
 
     const Link = struct {
         regex: oni.Regex,
@@ -414,6 +424,13 @@ const DerivedConfig = struct {
             .notify_on_command_finish_action = config.@"notify-on-command-finish-action",
             .notify_on_command_finish_after = config.@"notify-on-command-finish-after",
             .key_remaps = try config.@"key-remap".clone(alloc),
+            .command_blocks_toolbar = config.@"command-blocks-toolbar",
+            .command_blocks_toolbar_icons = config.@"command-blocks-toolbar-icons",
+            .command_blocks_toolbar_position = config.@"command-blocks-toolbar-position",
+            .command_blocks_padding_left = config.@"command-blocks-padding-left",
+            .command_blocks_padding_right = config.@"command-blocks-padding-right",
+            .command_blocks_padding_header = config.@"command-blocks-padding-header",
+            .command_blocks_padding_footer = config.@"command-blocks-padding-footer",
 
             // Assignments happen sequentially so we have to do this last
             // so that the memory is captured from allocs above.
@@ -1161,7 +1178,6 @@ fn selectionScrollTick(self: *Surface) !void {
     if (self.mouse.left_click_count == 0) return;
 
     const pos = try self.rt_surface.getCursorPos();
-    const pos_vp = self.posToViewport(pos.x, pos.y);
     const delta: isize = if (pos.y < 0) -1 else 1;
 
     // We need our locked state for the remainder
@@ -1182,15 +1198,26 @@ fn selectionScrollTick(self: *Surface) !void {
     // Scroll the viewport as required
     t.scrollViewport(.{ .delta = delta });
 
-    // Next, trigger our drag behavior
-    const pin = t.screens.active.pages.pin(.{
-        .viewport = .{
-            .x = pos_vp.x,
-            .y = pos_vp.y,
-        },
-    }) orelse {
-        if (comptime std.debug.runtime_safety) unreachable;
-        return;
+    // Compute pin for the drag position.
+    const pin = pin: {
+        if (t.block_list != null) {
+            if (self.blockPinFromPos(pos.y)) |bp| {
+                const pt = self.posToViewport(pos.x, pos.y);
+                var p = bp;
+                p.x = pt.x;
+                break :pin p;
+            }
+        }
+        const pos_vp = self.posToViewport(pos.x, self.blockAdjustedY(pos.y));
+        break :pin t.screens.active.pages.pin(.{
+            .viewport = .{
+                .x = pos_vp.x,
+                .y = pos_vp.y,
+            },
+        }) orelse {
+            if (comptime std.debug.runtime_safety) unreachable;
+            return;
+        };
     };
     try self.dragLeftClickSingle(pin, pos.x);
 
@@ -2185,6 +2212,346 @@ fn clipboardWrite(self: *const Surface, data: []const u8, loc: apprt.Clipboard) 
     };
 }
 
+/// Copy the text of a specific block (by block_list_index) to the system clipboard.
+/// Used by the toolbar click handler.
+fn copyBlockToClipboard(self: *Surface, t: *terminal.Terminal, block_idx: usize) void {
+    const bl = &(t.block_list orelse return);
+    if (block_idx >= bl.blocks.items.len) return;
+    const block = bl.blocks.items[block_idx];
+
+    const start_pin: terminal.PageList.Pin = pin: {
+        var p = block.prompt_start.*;
+        p.x = 0;
+        break :pin p;
+    };
+    const end_pin: terminal.PageList.Pin = pin: {
+        const e = block.end orelse break :pin start_pin;
+        var p = e.up(1) orelse e.*;
+        p.x = t.screens.active.pages.cols - 1;
+        break :pin p;
+    };
+    const sel = terminal.Selection.init(start_pin, end_pin, false);
+    self.copySelectionToClipboards(
+        sel,
+        &.{.standard},
+        .plain,
+    ) catch |err| {
+        log.err("copy block to clipboard failed: {}", .{err});
+    };
+}
+
+/// Copy only the matched (filtered) output lines from a block to the clipboard.
+/// Each matched line is separated by a newline.
+fn copyFilteredLinesToClipboard(
+    self: *Surface,
+    output_start: terminal.Pin,
+    matches: []const u32,
+) !void {
+    var arena = ArenaAllocator.init(self.alloc);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const opts: terminal.formatter.Options = .{
+        .emit = .plain,
+        .unwrap = true,
+        .trim = self.config.clipboard_trim_trailing_spaces,
+        .codepoint_map = self.config.clipboard_codepoint_map.map.list,
+        .background = self.io.terminal.colors.background.get(),
+        .foreground = self.io.terminal.colors.foreground.get(),
+        .palette = &self.io.terminal.colors.palette.current,
+    };
+    const ScreenFormatter = terminal.formatter.ScreenFormatter;
+
+    // For each matched row, format it and collect lines.
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    for (matches) |match_row_idx| {
+        // Navigate to the matched output row.
+        const row_pin = output_start.down(match_row_idx) orelse continue;
+        var start = row_pin;
+        start.x = 0;
+        var end = row_pin;
+        end.x = self.io.terminal.screens.active.pages.cols - 1;
+        const sel = terminal.Selection.init(start, end, false);
+
+        if (aw.written().len > 0) try aw.writer.writeByte('\n');
+        var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, opts);
+        formatter.content = .{ .selection = sel };
+        try formatter.format(&aw.writer);
+    }
+
+    if (aw.written().len == 0) return;
+
+    const data = try aw.toOwnedSliceSentinel(0);
+    var contents: std.ArrayList(apprt.ClipboardContent) = .empty;
+    try contents.append(alloc, .{ .mime = "text/plain", .data = data });
+    self.rt_surface.setClipboard(.standard, contents.items, false) catch |err| {
+        log.err("error setting clipboard err={}", .{err});
+    };
+}
+
+/// Show a dropdown menu for the block toolbar at the given screen position.
+/// On macOS, uses NSMenu via the objc bridge; on other platforms, this is a no-op.
+fn showBlockToolbarMenu(self: *Surface, block_idx: usize, menu_x_px: u32, menu_y_px: u32, margin_px: u32, align_right: bool) void {
+    if (comptime !builtin.os.tag.isDarwin()) return;
+
+    // Get the NSView from our surface (only available for embedded apprt on macOS).
+    const RtSurface = @TypeOf(self.rt_surface.*);
+    const nsview = if (comptime @hasField(RtSurface, "platform"))
+        switch (self.rt_surface.platform) {
+            .macos => |p| p.nsview,
+            .ios => return,
+        }
+    else
+        return;
+
+    // Menu item tags for identifying the selected action.
+    const tag_copy_command: c_long = 1;
+    const tag_copy_output: c_long = 2;
+    const tag_copy_block: c_long = 3;
+    const tag_copy_cwd: c_long = 4;
+    const tag_scroll_top: c_long = 5;
+    const tag_scroll_bottom: c_long = 6;
+    const tag_collapse: c_long = 7;
+    const tag_expand: c_long = 8;
+    const tag_filter: c_long = 9;
+
+    // Register a runtime ObjC class to act as menu item target. The class
+    // has a single method (menuItemClicked:) that records the sender's tag
+    // in a struct-level static. Since popUpMenuPositioningItem: is
+    // modal/synchronous, we read the tag after it returns.
+    const MenuHelperImp = struct {
+        var selected_tag: c_long = 0;
+
+        fn imp(target: objc.c.id, sel_cmd: objc.c.SEL, sender: objc.c.id) callconv(.c) void {
+            _ = target;
+            _ = sel_cmd;
+            if (sender == null) return;
+            const sender_obj: objc.Object = .{ .value = @ptrCast(sender) };
+            selected_tag = sender_obj.msgSend(c_long, objc.sel("tag"), .{});
+        }
+    };
+
+    const helper_cls = blk: {
+        if (objc.getClass("GhosttyMenuHelper")) |existing| {
+            break :blk existing;
+        }
+        const NSObject = objc.getClass("NSObject") orelse return;
+        const cls = objc.allocateClassPair(NSObject, "GhosttyMenuHelper") orelse return;
+        _ = cls.addMethod("menuItemClicked:", MenuHelperImp.imp);
+        objc.registerClassPair(cls);
+        break :blk objc.getClass("GhosttyMenuHelper") orelse return;
+    };
+
+    const helper: objc.Object = helper_cls.msgSend(objc.Object, objc.sel("alloc"), .{})
+        .msgSend(objc.Object, objc.sel("init"), .{});
+
+    MenuHelperImp.selected_tag = 0;
+
+    const NSMenuClass = objc.getClass("NSMenu") orelse return;
+    const NSMenuItem = objc.getClass("NSMenuItem") orelse return;
+    const NSString = objc.getClass("NSString") orelse return;
+    const empty = NSString.msgSend(objc.Object, objc.sel("string"), .{});
+
+    const menu_obj: objc.Object = NSMenuClass.msgSend(objc.Object, objc.sel("alloc"), .{})
+        .msgSend(objc.Object, objc.sel("initWithTitle:"), .{empty});
+
+    // Check block state (collapsed, has output) under the lock.
+    const is_collapsed, const has_output = blk: {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        const t: *terminal.Terminal = self.renderer_state.terminal;
+        const bl = &(t.block_list orelse break :blk .{ false, false });
+        if (block_idx >= bl.blocks.items.len) break :blk .{ false, false };
+        const block = bl.blocks.items[block_idx];
+        break :blk .{ block.collapsed, block.output_start != null };
+    };
+
+    const action_sel = objc.sel("menuItemClicked:");
+    const Item = struct { title: [*:0]const u8, tag: c_long, sep: bool };
+    const entries = [_]Item{
+        .{ .title = "Copy Command", .tag = tag_copy_command, .sep = false },
+        .{ .title = "Copy Output", .tag = tag_copy_output, .sep = false },
+        .{ .title = "Copy Block", .tag = tag_copy_block, .sep = false },
+        .{ .title = "Copy Working Directory", .tag = tag_copy_cwd, .sep = false },
+        .{ .title = "", .tag = 0, .sep = true },
+        .{ .title = "Filter\u{2026}", .tag = tag_filter, .sep = false },
+        .{ .title = if (is_collapsed) "Expand Block" else "Collapse Block",
+           .tag = if (is_collapsed) tag_expand else tag_collapse,
+           .sep = false },
+        .{ .title = "", .tag = 0, .sep = true },
+        .{ .title = "Scroll to Top", .tag = tag_scroll_top, .sep = false },
+        .{ .title = "Scroll to Bottom", .tag = tag_scroll_bottom, .sep = false },
+    };
+
+    for (entries) |entry| {
+        if (entry.sep) {
+            const sep: objc.Object = NSMenuItem.msgSend(objc.Object, objc.sel("separatorItem"), .{});
+            menu_obj.msgSend(void, objc.sel("addItem:"), .{sep});
+        } else {
+            const ns_title = NSString.msgSend(objc.Object, objc.sel("stringWithUTF8String:"), .{
+                @as([*c]const u8, entry.title),
+            });
+            const item: objc.Object = NSMenuItem.msgSend(objc.Object, objc.sel("alloc"), .{})
+                .msgSend(objc.Object, objc.sel("initWithTitle:action:keyEquivalent:"), .{
+                ns_title, action_sel, empty,
+            });
+            item.msgSend(void, objc.sel("setTag:"), .{entry.tag});
+            item.msgSend(void, objc.sel("setTarget:"), .{helper});
+            // Disable collapse/expand/filter when the block has no output.
+            if ((entry.tag == tag_collapse or entry.tag == tag_expand or entry.tag == tag_filter) and !has_output) {
+                item.msgSend(void, objc.sel("setEnabled:"), .{false});
+            }
+            menu_obj.msgSend(void, objc.sel("addItem:"), .{item});
+        }
+    }
+
+    // Convert pixel coordinates to NSView point coordinates.
+    const content_scale = self.rt_surface.getContentScale() catch .{ .x = 1, .y = 1 };
+    const view_h_points: f64 = @as(f64, @floatFromInt(self.size.screen.height)) / content_scale.y;
+    const point_x: f64 = @as(f64, @floatFromInt(menu_x_px)) / content_scale.x;
+
+    // Force layout to get actual menu size for alignment.
+    menu_obj.msgSend(void, objc.sel("update"), .{});
+    const NSSize = extern struct { width: f64, height: f64 };
+    const menu_size: NSSize = menu_obj.msgSend(NSSize, objc.sel("size"), .{});
+    const menu_width: f64 = if (menu_size.width > 0) menu_size.width else 170;
+    const adjusted_x: f64 = if (align_right) point_x - menu_width else point_x;
+
+    // Position below the toolbar. macOS handles flipping the menu
+    // upward automatically when near the bottom of the screen.
+    const point_y: f64 = view_h_points - @as(f64, @floatFromInt(menu_y_px + margin_px * 2)) / content_scale.y;
+
+    const NSPoint = extern struct { x: f64, y: f64 };
+    _ = menu_obj.msgSend(
+        bool,
+        objc.sel("popUpMenuPositioningItem:atLocation:inView:"),
+        .{ @as(objc.c.id, null), NSPoint{ .x = adjusted_x, .y = point_y }, nsview },
+    );
+
+    // Read the tag that was set by the callback during the modal popup.
+    const selected_tag = MenuHelperImp.selected_tag;
+
+    // Release the helper now that the popup is done.
+    helper.msgSend(void, objc.sel("release"), .{});
+
+    // Reset mouse state so that mouse-move after the menu closes
+    // doesn't start a text selection. The menu consumed this click.
+    self.mouse.left_click_count = 0;
+    self.mouse.click_state[@intFromEnum(input.MouseButton.left)] = .release;
+
+    if (selected_tag == 0) return;
+
+    switch (selected_tag) {
+        tag_copy_command => self.copyBlockPartToClipboard(block_idx, .command),
+        tag_copy_output => self.copyBlockPartToClipboard(block_idx, .output),
+        tag_copy_block => self.copyBlockPartToClipboard(block_idx, .block),
+        tag_copy_cwd => self.copyBlockPartToClipboard(block_idx, .cwd),
+        tag_scroll_top => self.scrollToBlock(block_idx, .top),
+        tag_scroll_bottom => self.scrollToBlock(block_idx, .bottom),
+        tag_collapse, tag_expand => self.toggleBlockCollapse(block_idx),
+        tag_filter => self.startBlockFilter(block_idx),
+        else => {},
+    }
+}
+
+/// Copy a specific part of a block to the system clipboard.
+fn copyBlockPartToClipboard(self: *Surface, block_idx: usize, part: enum { command, output, block, cwd }) void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    const t: *terminal.Terminal = self.renderer_state.terminal;
+
+    if (part == .block) {
+        self.copyBlockToClipboard(t, block_idx);
+        return;
+    }
+
+    const bl = &(t.block_list orelse return);
+    if (block_idx >= bl.blocks.items.len) return;
+    const block = bl.blocks.items[block_idx];
+
+    var buf: [64 * 1024]u8 = undefined;
+    const text: []const u8 = switch (part) {
+        .command => block.commandText(&t.screens.active.pages, &buf),
+        .output => block.outputText(&t.screens.active.pages, &buf),
+        .cwd => block.cwd orelse return,
+        .block => unreachable,
+    };
+    if (text.len == 0) return;
+
+    const data = self.alloc.dupeZ(u8, text) catch return;
+    defer self.alloc.free(data);
+    self.rt_surface.setClipboard(.standard, &.{.{
+        .mime = "text/plain",
+        .data = data,
+    }}, false) catch |err| {
+        log.err("copy block part to clipboard failed: {}", .{err});
+    };
+}
+
+/// Scroll the viewport to the top or bottom of a specific block.
+fn scrollToBlock(self: *Surface, block_idx: usize, position: enum { top, bottom }) void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    const t: *terminal.Terminal = self.renderer_state.terminal;
+
+    const layout = &(t.block_layout orelse return);
+    layout.ensureValid();
+
+    const block_y = layout.virtualYForBlock(block_idx) orelse return;
+    const doc_h = layout.total_height_px;
+    const viewport_h = t.height_px;
+    if (doc_h <= viewport_h) return;
+
+    const max_scroll = doc_h - viewport_h;
+
+    switch (position) {
+        .top => {
+            // Scroll so the block's top is at the viewport top.
+            t.scroll_offset_px = @min(
+                if (block_y < max_scroll) max_scroll - block_y else 0,
+                max_scroll,
+            );
+        },
+        .bottom => {
+            // Scroll so the block's bottom is at the viewport bottom.
+            // Find the layout info for this block to get its height.
+            const info = for (layout.block_offsets.items) |info| {
+                if (info.block_list_index == block_idx) break info;
+            } else return;
+            const block_bottom = block_y + info.visible_height_px;
+            t.scroll_offset_px = @min(
+                if (block_bottom < doc_h) doc_h - block_bottom else 0,
+                max_scroll,
+            );
+        },
+    }
+    t.syncPageListViewport();
+    self.queueRender() catch {};
+}
+
+/// Toggle the collapsed state of a specific block by index.
+fn toggleBlockCollapse(self: *Surface, block_idx: usize) void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    const t: *terminal.Terminal = self.renderer_state.terminal;
+
+    const bl = &(t.block_list orelse return);
+    if (block_idx >= bl.blocks.items.len) return;
+    const block = &bl.blocks.items[block_idx];
+    if (block.output_start == null) return;
+    block.collapsed = !block.collapsed;
+    if (t.block_layout) |*layout| layout.invalidate();
+    self.queueRender() catch {};
+}
+
+fn startBlockFilter(self: *Surface, block_idx: usize) void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    const t: *terminal.Terminal = self.renderer_state.terminal;
+    t.startFilterInput(block_idx);
+    self.queueRender() catch {};
+}
+
 fn copySelectionToClipboards(
     self: *Surface,
     sel: terminal.Selection,
@@ -2650,6 +3017,48 @@ pub fn keyCallback(
         event,
         if (insp_ev) |*ev| ev else null,
     )) |v| return v;
+
+    // Intercept keys when block filter input is active.
+    if (event.action == .press or event.action == .repeat) {
+        self.renderer_state.mutex.lock();
+        const filter_active = self.renderer_state.terminal.filter_input_block_idx != null;
+        if (filter_active) {
+            const t = self.renderer_state.terminal;
+            if (event.key == .escape) {
+                t.dismissFilterInput();
+                self.renderer_state.mutex.unlock();
+                try self.queueRender();
+                return .consumed;
+            } else if (event.key == .backspace) {
+                t.backspaceFilterText();
+                self.renderer_state.mutex.unlock();
+                try self.queueRender();
+                return .consumed;
+            } else if (event.key == .enter or event.key == .numpad_enter) {
+                // Enter dismisses the filter but keeps the filter applied
+                t.filter_input_block_idx = null;
+                t.filter_input_buf.clearRetainingCapacity();
+                self.renderer_state.mutex.unlock();
+                try self.queueRender();
+                return .consumed;
+            } else if (event.key == .key_r and event.mods.super) {
+                // Cmd+R toggles regex mode.
+                t.toggleFilterRegexMode();
+                self.renderer_state.mutex.unlock();
+                try self.queueRender();
+                return .consumed;
+            } else if (event.utf8.len > 0) {
+                t.appendFilterText(event.utf8);
+                self.renderer_state.mutex.unlock();
+                try self.queueRender();
+                return .consumed;
+            }
+            self.renderer_state.mutex.unlock();
+        } else {
+            self.renderer_state.mutex.unlock();
+        }
+    }
+
     // If we allow KAM and KAM is enabled then we do nothing.
     if (self.config.vt_kam_allowed) {
         self.renderer_state.mutex.lock();
@@ -2746,6 +3155,25 @@ pub fn keyCallback(
 
         break :event copy;
     };
+
+    // Command blocks: when scrolled up from the bottom, Enter should
+    // scroll to bottom without sending the keystroke to the terminal.
+    if ((event.key == .enter or event.key == .numpad_enter) and
+        event.action != .release and event.mods.empty())
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        const t: *terminal.Terminal = self.renderer_state.terminal;
+        if (t.block_list != null) {
+            const scrolled_up = t.scroll_offset_px > 0 or
+                !t.screens.active.viewportIsBottom();
+            if (scrolled_up) {
+                t.scrollViewport(.bottom);
+                try self.queueRender();
+                return .consumed;
+            }
+        }
+    }
 
     // Encode and send our key. If we didn't encode anything, then we
     // return the effect as ignored.
@@ -3388,6 +3816,33 @@ pub fn scrollCallback(
     // Always show the mouse again if it is hidden
     if (self.mouse.hidden) self.showMouse();
 
+    // Block-mode precision scrolling: pass pixel offsets directly
+    // without row quantization. Must happen BEFORE the row-based Y
+    // computation to avoid double-consuming pending_scroll_y.
+    if (yoff != 0 and scroll_mods.precision) {
+        const yoff_px: f64 = yoff * self.config.mouse_scroll_multiplier.precision;
+        const poff: f64 = self.mouse.pending_scroll_y + yoff_px;
+        var handled = false;
+        {
+            self.renderer_state.mutex.lock();
+            defer self.renderer_state.mutex.unlock();
+            if (self.io.terminal.block_list != null and !self.isMouseReporting()) {
+                if (@abs(poff) >= 1.0) {
+                    const delta_px: isize = @intFromFloat(@trunc(poff));
+                    self.mouse.pending_scroll_y = poff - @as(f64, @floatFromInt(delta_px));
+                    self.io.terminal.scrollViewport(.{ .delta_px = -delta_px });
+                } else {
+                    self.mouse.pending_scroll_y = poff;
+                }
+                handled = true;
+            }
+        }
+        if (handled) {
+            try self.queueRender();
+            return;
+        }
+    }
+
     const y: ScrollAmount = if (yoff == 0) .{} else y: {
         // We use cell_size to determine if we have accumulated enough to trigger a scroll
         const cell_size: f64 = @floatFromInt(self.size.cell.height);
@@ -3769,6 +4224,14 @@ pub fn mouseButtonCallback(
     }
 
     if (button == .left and action == .release) {
+        // Clear pressed toolbar/filter icon state on mouse-up.
+        {
+            self.renderer_state.mutex.lock();
+            defer self.renderer_state.mutex.unlock();
+            self.renderer_state.terminal.pressed_toolbar_icon = null;
+            self.renderer_state.terminal.pressed_filter_copy = false;
+        }
+
         // Stop selection scrolling when releasing the left mouse button
         // but only when selection scrolling is active.
         if (self.selection_scroll_active) {
@@ -3857,6 +4320,10 @@ pub fn mouseButtonCallback(
 
     // For left button clicks we always record some information for
     // selection/highlighting purposes.
+    // Deferred menu popup info (must be shown after mutex is released).
+    const DeferredMenu = struct { block_idx: usize, menu_x_px: u32, menu_y_px: u32, margin_px: u32, align_right: bool };
+    var deferred_menu: ?DeferredMenu = null;
+
     if (button == .left and action == .press) click: {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
@@ -3865,7 +4332,19 @@ pub fn mouseButtonCallback(
 
         const pos = try self.rt_surface.getCursorPos();
         const pin = pin: {
-            const pt_viewport = self.posToViewport(pos.x, pos.y);
+            // When command-blocks is active, use blockPinFromPos to get
+            // the pin directly (bypasses PageList viewport which is
+            // pinned at the active area and can't address scrollback).
+            if (t.block_list != null) {
+                if (self.blockPinFromPos(pos.y)) |bp| {
+                    const pt_viewport = self.posToViewport(pos.x, pos.y);
+                    var p = bp;
+                    p.x = pt_viewport.x;
+                    break :pin try screen.pages.trackPin(p);
+                }
+            }
+            const adjusted_y = self.blockAdjustedY(pos.y);
+            const pt_viewport = self.posToViewport(pos.x, adjusted_y);
             const pin = screen.pages.pin(.{
                 .viewport = .{
                     .x = pt_viewport.x,
@@ -3908,6 +4387,7 @@ pub fn mouseButtonCallback(
         self.mouse.left_click_screen = t.screens.active_key;
         self.mouse.left_click_xpos = pos.x;
         self.mouse.left_click_ypos = pos.y;
+        self.mouse.left_click_block_idx = if (t.block_list != null) self.blockIndexFromPos(pos.y) else null;
 
         // Setup our click counter and timer
         if (std.time.Instant.now()) |now| {
@@ -3942,11 +4422,264 @@ pub fn mouseButtonCallback(
                     try self.io.terminal.screens.active.select(null);
                     try self.queueRender();
                 }
+
+                // Command blocks: toggle block highlight on single click.
+                // Use BlockLayout to map click position to block.
+                // If toolbar is enabled and click is on the toolbar pill,
+                // open the dropdown menu instead of toggling highlight.
+                if (t.block_list != null) blk: {
+                    const layout = t.block_layout orelse break :blk;
+                    const brl = layout.block_offsets.items;
+                    if (brl.len == 0) break :blk;
+
+                    const cell_h: u32 = self.size.cell.height;
+                    if (cell_h == 0) break :blk;
+                    const cell_w: u32 = self.size.cell.width;
+                    const padding_top: u32 = self.size.padding.top;
+                    // Use rows * cell_height for viewport_h to match Terminal.height_px
+                    // and the renderer's viewport_top_px computation.
+                    const viewport_h: u32 = @as(u32, t.rows) * cell_h;
+                    const doc_h: u32 = layout.total_height_px;
+                    const scroll_px: u32 = t.scroll_offset_px;
+
+                    // Convert click pixel Y to virtual document Y.
+                    // Clamped to 0: when doc_h < viewport_h, content starts at top.
+                    const viewport_top_i64: i64 = @max(0, @as(i64, @intCast(doc_h)) -
+                        @as(i64, @intCast(viewport_h)) -
+                        @as(i64, @intCast(scroll_px)));
+                    // Clamp content_y to 0 so clicks in the window padding area
+                    // still reach toolbars rendered at the top (clamped screen_y=0).
+                    const content_y_f: f64 = @max(0, pos.y - @as(f64, @floatFromInt(padding_top)));
+                    const virtual_y_i64: i64 = @as(i64, @intFromFloat(content_y_f)) + viewport_top_i64;
+                    if (virtual_y_i64 < 0) break :blk;
+                    const virtual_y: u32 = @intCast(@min(virtual_y_i64, @as(i64, @intCast(doc_h))));
+
+                    // Find which block contains this virtual Y.
+                    // Also check gaps: if virtual_y is in a gap, attribute
+                    // it to the next block (for toolbar clicks in padding area).
+                    const found_info: ?@TypeOf(brl[0]) = fi: {
+                        for (brl) |info| {
+                            const block_end = info.virtual_y_px + info.visible_height_px;
+                            if (virtual_y >= info.virtual_y_px and virtual_y < block_end)
+                                break :fi info;
+                        }
+                        // Gap fallback: find the first block below virtual_y.
+                        for (brl) |info| {
+                            if (virtual_y < info.virtual_y_px)
+                                break :fi info;
+                        }
+                        break :fi null;
+                    };
+                    if (found_info) |info| handle_block: {
+                        // Check if click is on the filter bar close button.
+                        if (t.filter_input_block_idx) |fbi| filter_check: {
+                            if (info.block_list_index != fbi) break :filter_check;
+                            const block_screen_y_fc: i64 = @as(i64, @intCast(padding_top)) +
+                                @as(i64, @intCast(info.virtual_y_px)) - viewport_top_i64;
+                            const f_screen_y: u32 = if (block_screen_y_fc >= 0)
+                                @intCast(block_screen_y_fc)
+                            else
+                                0;
+                            const f_bar_h_c = cell_h;
+                            const grid_right_c = self.size.padding.left + t.cols * cell_w;
+                            const f_bar_w_c: u32 = @min(grid_right_c -| self.size.padding.left -| cell_w * 2, cell_w * 30);
+                            const f_is_right = self.config.command_blocks_toolbar_position == .@"upper-right" or
+                                self.config.command_blocks_toolbar_position == .@"lower-right";
+                            const f_is_upper = self.config.command_blocks_toolbar_position == .@"upper-right" or
+                                self.config.command_blocks_toolbar_position == .@"upper-left";
+                            const f_blk_pad_right: u32 = self.config.command_blocks_padding_right;
+                            const f_blk_pad_left: u32 = self.config.command_blocks_padding_left;
+                            const f_bar_x_c: u32 = if (f_is_right)
+                                grid_right_c -| f_bar_w_c -| f_blk_pad_right
+                            else
+                                self.size.padding.left + f_blk_pad_left;
+                            const click_x_fc: u32 = @intFromFloat(@max(0, pos.x));
+                            const click_y_fc: u32 = @intFromFloat(@max(0, pos.y));
+
+                            // Clamp filter bar position the same way the renderer does:
+                            // upper: @max(screen_y, header_padding)
+                            // lower: @min(screen_y + height - bar_h, screen_h - footer - bar_h)
+                            const f_header_pad: u32 = self.config.command_blocks_padding_header;
+                            const f_footer_pad: u32 = self.config.command_blocks_padding_footer;
+                            const f_bar_y_c: u32 = if (f_is_upper)
+                                @max(f_screen_y, f_header_pad)
+                            else
+                                @min((f_screen_y + info.visible_height_px) -| f_bar_h_c, self.size.screen.height -| f_footer_pad -| f_bar_h_c);
+
+                            if (click_y_fc >= f_bar_y_c and click_y_fc < f_bar_y_c + f_bar_h_c and
+                                click_x_fc >= f_bar_x_c and click_x_fc < f_bar_x_c + f_bar_w_c)
+                            {
+                                // Check if click is on the X close button (rightmost region).
+                                const close_region_x = (f_bar_x_c + f_bar_w_c) -| f_bar_h_c;
+                                if (click_x_fc >= close_region_x) {
+                                    t.dismissFilterInput();
+                                    try self.queueRender();
+                                    break :handle_block;
+                                }
+                                // Check if click is on the copy button (to the left of close).
+                                const copy_region_x = close_region_x -| f_bar_h_c;
+                                if (click_x_fc >= copy_region_x and click_x_fc < close_region_x) {
+                                    // Set pressed state for visual feedback.
+                                    t.pressed_filter_copy = true;
+                                    // Copy filtered lines to clipboard.
+                                    if (t.block_list) |*bl| {
+                                        if (fbi < bl.blocks.items.len) {
+                                            const block = &bl.blocks.items[fbi];
+                                            if (block.filter_match_rows) |matches| {
+                                                if (matches.len > 0) {
+                                                    if (block.output_start) |os| {
+                                                        self.copyFilteredLinesToClipboard(os.*, matches) catch |err| {
+                                                            log.err("copy filtered lines failed: {}", .{err});
+                                                        };
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    try self.queueRender();
+                                    break :handle_block;
+                                }
+                                // Check if click is on the ".*" regex toggle (left region).
+                                // The ".*" glyphs start at f_bar_x + f_bar_h/4 + 4 and span
+                                // 3 cell widths (2 chars + space). Use that as the hit region.
+                                const regex_region_end = f_bar_x_c + f_bar_h_c / 4 + 4 + cell_w * 3;
+                                if (click_x_fc < regex_region_end) {
+                                    t.toggleFilterRegexMode();
+                                    try self.queueRender();
+                                    break :handle_block;
+                                }
+                                // Click is on the filter text area — consume but don't dismiss.
+                                try self.queueRender();
+                                break :handle_block;
+                            }
+                        }
+
+                        // Check if click is on the toolbar pill.
+                        if (self.config.command_blocks_toolbar) toolbar_check: {
+                            const icons_cfg = self.config.command_blocks_toolbar_icons;
+                            const icon_count = icons_cfg.count();
+                            if (icon_count == 0) break :toolbar_check;
+
+                            // Skip active block (last in layout).
+                            if (info.block_list_index == brl[brl.len - 1].block_list_index) break :toolbar_check;
+
+                            // Compute toolbar screen bounds (same as renderer).
+                            // Clamp to 0 when block is partially above viewport,
+                            // matching how the renderer clips screen_y_px.
+                            const block_screen_y_i64: i64 = @as(i64, @intCast(padding_top)) +
+                                @as(i64, @intCast(info.virtual_y_px)) - viewport_top_i64;
+                            const block_screen_y: u32 = if (block_screen_y_i64 >= 0)
+                                @intCast(block_screen_y_i64)
+                            else
+                                0;
+
+                            const toolbar_h = cell_h;
+                            const icon_slot_w = toolbar_h; // square slots, same as renderer
+                            const icon_padding: u32 = @max(2, toolbar_h / 6);
+                            const toolbar_w = icon_count * icon_slot_w + icon_padding * 2;
+                            const grid_cols = t.cols;
+                            const grid_right = self.size.padding.left + grid_cols * cell_w;
+                            const is_right = self.config.command_blocks_toolbar_position == .@"upper-right" or
+                                self.config.command_blocks_toolbar_position == .@"lower-right";
+                            const is_upper = self.config.command_blocks_toolbar_position == .@"upper-right" or
+                                self.config.command_blocks_toolbar_position == .@"upper-left";
+                            const blk_pad_right: u32 = self.config.command_blocks_padding_right;
+                            const blk_pad_left: u32 = self.config.command_blocks_padding_left;
+                            const toolbar_x: u32 = if (is_right)
+                                grid_right -| toolbar_w -| blk_pad_right
+                            else
+                                self.size.padding.left + blk_pad_left;
+                            // Clip block height to viewport, same as the renderer.
+                            const clip_top: u32 = if (block_screen_y_i64 < 0)
+                                @intCast(-block_screen_y_i64)
+                            else
+                                0;
+                            const clipped_h: u32 = @min(info.visible_height_px -| clip_top, self.size.screen.height -| block_screen_y);
+                            const toolbar_min_y: u32 = self.config.command_blocks_padding_header;
+                            const toolbar_max_y: u32 = self.size.screen.height -| self.config.command_blocks_padding_footer -| toolbar_h;
+                            const toolbar_y: u32 = if (is_upper)
+                                @max(block_screen_y, toolbar_min_y)
+                            else
+                                @min((block_screen_y + clipped_h) -| toolbar_h, toolbar_max_y);
+
+                            const click_x: u32 = @intFromFloat(@max(0, pos.x));
+                            const click_y: u32 = @intFromFloat(@max(0, pos.y));
+
+                            if (click_x >= toolbar_x and click_x < toolbar_x + toolbar_w and
+                                click_y >= toolbar_y and click_y < toolbar_y + toolbar_h)
+                            {
+                                // Determine which icon was clicked.
+                                const rel_x = click_x - toolbar_x - icon_padding;
+                                const icon_idx = @min(rel_x / icon_slot_w, icon_count - 1);
+                                const enabled = icons_cfg.enabledIcons();
+                                if (icon_idx < enabled.len) {
+                                    // Set pressed state for visual feedback.
+                                    t.pressed_toolbar_icon = @intCast(icon_idx);
+                                    switch (enabled.icons[icon_idx]) {
+                                        .copy => {
+                                            self.copyBlockToClipboard(t, info.block_list_index);
+                                        },
+                                        .collapse => {
+                                            t.highlighted_block_idx = info.block_list_index;
+                                            t.toggleHighlightedBlockCollapse();
+                                        },
+                                        .ellipsis => {
+                                            // Defer menu popup to after mutex is released,
+                                            // since NSMenu runs a modal event loop that
+                                            // needs to render (which requires the mutex).
+                                            // Position dropdown: right-aligned with toolbar,
+                                            // appearing below the toolbar.
+                                            deferred_menu = .{
+                                                .block_idx = info.block_list_index,
+                                                .menu_x_px = if (is_right) toolbar_x + toolbar_w else toolbar_x,
+                                                .menu_y_px = toolbar_y + toolbar_h,
+                                                .margin_px = icon_padding,
+                                                .align_right = is_right,
+                                            };
+                                        },
+                                        .filter => {
+                                            // Toggle: if filter active, clear it; else start.
+                                            const bl_idx = info.block_list_index;
+                                            const has_filter = if (t.block_list) |*bl_l|
+                                                bl_idx < bl_l.blocks.items.len and bl_l.blocks.items[bl_idx].filter_match_rows != null
+                                            else
+                                                false;
+                                            if (has_filter) {
+                                                t.dismissFilterInput();
+                                            } else {
+                                                t.startFilterInput(bl_idx);
+                                            }
+                                        },
+                                    }
+                                }
+                                try self.queueRender();
+                                break :handle_block;
+                            }
+                        }
+
+                        // Click was not on toolbar or filter bar — toggle block highlight.
+                        t.toggleBlockHighlight(info.block_list_index);
+                        try self.queueRender();
+                    }
+                }
             },
 
-            // Double click, select the word under our mouse.
-            // First try to detect if we're clicking on a URL to select the entire URL.
+            // Double click: in command-blocks mode, toggle collapse/expand
+            // on the highlighted block. Otherwise, select the word under
+            // our mouse (or URL).
             2 => {
+                // Command blocks: double-click on an empty cell toggles
+                // collapse on the highlighted block. Double-click on a
+                // cell with text falls through to normal word selection.
+                if (t.highlighted_block_idx != null and t.block_list != null) {
+                    const rac = pin.rowAndCell();
+                    if (!rac.cell.hasText()) {
+                        t.toggleHighlightedBlockCollapse();
+                        try self.queueRender();
+                        break :click;
+                    }
+                }
+
                 const sel_ = sel: {
                     // Try link detection without requiring modifier keys
                     if (self.linkAtPin(
@@ -3983,6 +4716,11 @@ pub fn mouseButtonCallback(
             // We should be bounded by 1 to 3
             else => unreachable,
         }
+    }
+
+    // Show deferred menu popup (after mutex is released).
+    if (deferred_menu) |dm| {
+        self.showBlockToolbarMenu(dm.block_idx, dm.menu_x_px, dm.menu_y_px, dm.margin_px, dm.align_right);
     }
 
     // Middle-click pastes from our selection clipboard
@@ -4124,11 +4862,18 @@ fn maybePromptClick(self: *Surface) !bool {
     // our mouse state at the time of writing this doesn't support that.
     if (screen.selection != null) return false;
 
-    // Get the pin for our mouse click.
+    // Get the pin for our mouse click, using gap-adjusted Y for blocks.
     const pos = try self.rt_surface.getCursorPos();
-    const pos_vp = self.posToViewport(pos.x, pos.y);
+    const pos_vp = self.posToViewport(pos.x, self.blockAdjustedY(pos.y));
     const click_pin: terminal.Pin = pin: {
-        const pin = screen.pages.pin(.{
+        if (t.block_list != null) {
+            if (self.blockPinFromPos(pos.y)) |bp| {
+                var p = bp;
+                p.x = pos_vp.x;
+                break :pin p;
+            }
+        }
+        const vp_pin = screen.pages.pin(.{
             .viewport = .{
                 .x = pos_vp.x,
                 .y = pos_vp.y,
@@ -4139,7 +4884,7 @@ fn maybePromptClick(self: *Surface) !bool {
             return false;
         };
 
-        break :pin pin;
+        break :pin vp_pin;
     };
 
     // Get our cursor's most current prompt.
@@ -4229,10 +4974,18 @@ fn linkAtPos(
     self: *Surface,
     pos: apprt.CursorPos,
 ) !?Link {
-    // Convert our cursor position to a screen point.
+    // Convert our cursor position to a screen point, adjusting for block gaps.
     const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
     const mouse_pin: terminal.Pin = mouse_pin: {
-        const point = self.posToViewport(pos.x, pos.y);
+        if (self.renderer_state.terminal.block_list != null) {
+            if (self.blockPinFromPos(pos.y)) |bp| {
+                const pt = self.posToViewport(pos.x, pos.y);
+                var p = bp;
+                p.x = pt.x;
+                break :mouse_pin p;
+            }
+        }
+        const point = self.posToViewport(pos.x, self.blockAdjustedY(pos.y));
         const pin = screen.pages.pin(.{ .viewport = point }) orelse {
             log.warn("failed to get pin for clicked point", .{});
             return null;
@@ -4484,6 +5237,10 @@ pub fn cursorPosCallback(
         // No mouse point so we don't highlight links
         self.renderer_state.mouse.point = null;
 
+        // Clear hovered block when mouse is outside viewport.
+        self.renderer_state.terminal.hovered_block_idx = null;
+        self.renderer_state.terminal.hovered_toolbar_icon = null;
+
         // Mark the link's row as dirty, but continue with updating the
         // mouse state below so we can scroll when our position is negative.
         self.renderer_state.terminal.screens.active.dirty.hyperlink_hover = true;
@@ -4556,6 +5313,162 @@ pub fn cursorPosCallback(
         try self.mouseRefreshLinks(pos, pos_vp, over_link);
     }
 
+    // Command blocks: determine if the mouse is over a completed block
+    // (pointer cursor) vs. the active block (text cursor).
+    // Also track hovered_block_idx for toolbar rendering.
+    // Use BlockLayout to map mouse position to the virtual document.
+    if (self.io.terminal.block_list != null and !self.mouse.over_link) {
+        const t: *terminal.Terminal = self.renderer_state.terminal;
+        if (t.block_layout) |layout| cursor_shape: {
+            const brl = layout.block_offsets.items;
+            if (brl.len == 0) break :cursor_shape;
+
+            const cell_h: u32 = self.size.cell.height;
+            if (cell_h == 0) break :cursor_shape;
+            const padding_top: u32 = self.size.padding.top;
+            // Use rows * cell_height for viewport_h to match Terminal.height_px.
+            const viewport_h: u32 = @as(u32, t.rows) * cell_h;
+            const doc_h: u32 = layout.total_height_px;
+            const scroll_px: u32 = t.scroll_offset_px;
+
+            // Convert mouse pixel Y to virtual document Y.
+            // Clamped to 0: when doc_h < viewport_h, content starts at top.
+            const viewport_top_i64: i64 = @max(0, @as(i64, @intCast(doc_h)) -
+                @as(i64, @intCast(viewport_h)) -
+                @as(i64, @intCast(scroll_px)));
+            // content_y_f can be negative when the mouse is in the window
+            // padding area above the content grid. We clamp to 0 so the
+            // hover/toolbar logic still works for blocks whose toolbar is
+            // rendered in the padding area (clamped to screen Y=0).
+            const content_y_f: f64 = @max(0, pos.y - @as(f64, @floatFromInt(padding_top)));
+            const virtual_y_i64: i64 = @as(i64, @intFromFloat(content_y_f)) + viewport_top_i64;
+
+            // The active block is the last one in the layout.
+            // If the mouse virtual Y is before the active block's start,
+            // we're over completed blocks (pointer cursor).
+            const active_info = brl[brl.len - 1];
+            var hovered_idx: ?usize = null;
+            const in_history = if (virtual_y_i64 < 0)
+                true
+            else ih: {
+                const virtual_y: u32 = @intCast(@min(virtual_y_i64, @as(i64, @intCast(doc_h))));
+                // Find which completed block contains this virtual Y.
+                // Also check the gap above each block — if the toolbar is at
+                // "upper-*" position and the block is near the top of the viewport,
+                // the mouse over the toolbar area may map to the gap above the block.
+                for (brl[0 .. brl.len - 1]) |info| {
+                    const block_end = info.virtual_y_px + info.visible_height_px;
+                    if (virtual_y >= info.virtual_y_px and virtual_y < block_end) {
+                        hovered_idx = info.block_list_index;
+                        break;
+                    }
+                }
+                // If no block matched and the virtual Y is in a gap, attribute
+                // the hover to the next block below the gap. This ensures the
+                // toolbar remains visible when the mouse is in the gap area
+                // above a block that's near the top of the viewport.
+                if (hovered_idx == null) {
+                    for (brl[0 .. brl.len - 1]) |info| {
+                        if (virtual_y < info.virtual_y_px) {
+                            hovered_idx = info.block_list_index;
+                            break;
+                        }
+                    }
+                }
+                break :ih virtual_y < active_info.virtual_y_px;
+            };
+
+            const prev_hovered = t.hovered_block_idx;
+            t.hovered_block_idx = hovered_idx;
+
+            // Determine which toolbar icon the mouse is over (if any).
+            var new_hovered_icon: ?u32 = null;
+            if (hovered_idx != null and self.config.command_blocks_toolbar) icon_detect: {
+                const icons_cfg = self.config.command_blocks_toolbar_icons;
+                const icon_count = icons_cfg.count();
+                if (icon_count == 0) break :icon_detect;
+
+                const cell_w: u32 = self.size.cell.width;
+                const toolbar_h = cell_h;
+                const icon_slot_w = toolbar_h; // square slots, same as renderer
+                const icon_padding_val: u32 = @max(2, toolbar_h / 6);
+                const icon_margin: u32 = @max(1, toolbar_h / 8);
+                const toolbar_w = icon_count * icon_slot_w + icon_padding_val * 2;
+                const grid_cols = t.cols;
+                const grid_right = self.size.padding.left + grid_cols * cell_w;
+                const is_right = self.config.command_blocks_toolbar_position == .@"upper-right" or
+                    self.config.command_blocks_toolbar_position == .@"lower-right";
+                const is_upper = self.config.command_blocks_toolbar_position == .@"upper-right" or
+                    self.config.command_blocks_toolbar_position == .@"upper-left";
+                const blk_pad_right: u32 = self.config.command_blocks_padding_right;
+                const blk_pad_left: u32 = self.config.command_blocks_padding_left;
+                const toolbar_x: u32 = if (is_right)
+                    grid_right -| toolbar_w -| blk_pad_right
+                else
+                    self.size.padding.left + blk_pad_left;
+
+                // Compute toolbar screen Y from the hovered block's virtual position.
+                for (brl) |info| {
+                    if (info.block_list_index == hovered_idx.?) {
+                        const block_screen_y_i64: i64 = @as(i64, @intCast(padding_top)) +
+                            @as(i64, @intCast(info.virtual_y_px)) - viewport_top_i64;
+                        const block_screen_y: u32 = if (block_screen_y_i64 >= 0)
+                            @intCast(block_screen_y_i64)
+                        else
+                            0;
+                        // Clip block height to viewport, same as the renderer.
+                        const clip_top: u32 = if (block_screen_y_i64 < 0)
+                            @intCast(-block_screen_y_i64)
+                        else
+                            0;
+                        const clipped_h: u32 = @min(info.visible_height_px -| clip_top, self.size.screen.height -| block_screen_y);
+                        const toolbar_min_y: u32 = self.config.command_blocks_padding_header;
+                        const toolbar_max_y: u32 = self.size.screen.height -| self.config.command_blocks_padding_footer -| toolbar_h;
+                        const toolbar_y: u32 = if (is_upper)
+                            @max(block_screen_y, toolbar_min_y)
+                        else
+                            @min((block_screen_y + clipped_h) -| toolbar_h, toolbar_max_y);
+
+                        const mx: u32 = @intFromFloat(@max(0, pos.x));
+                        const my: u32 = @intFromFloat(@max(0, pos.y));
+
+                        if (mx >= toolbar_x and mx < toolbar_x + toolbar_w and
+                            my >= toolbar_y and my < toolbar_y + toolbar_h)
+                        {
+                            const rel_x = mx -| toolbar_x -| icon_padding_val;
+                            const icon_idx = @min(rel_x / icon_slot_w, icon_count - 1);
+                            // Check if within the icon's active area (excluding margins).
+                            const icon_start_x = toolbar_x + icon_padding_val + icon_idx * icon_slot_w + icon_margin;
+                            const icon_end_x = toolbar_x + icon_padding_val + (icon_idx + 1) * icon_slot_w -| icon_margin;
+                            const icon_start_y = toolbar_y + icon_margin;
+                            const icon_end_y = toolbar_y + toolbar_h -| icon_margin;
+                            if (mx >= icon_start_x and mx < icon_end_x and
+                                my >= icon_start_y and my < icon_end_y)
+                            {
+                                new_hovered_icon = icon_idx;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            const prev_hovered_icon = t.hovered_toolbar_icon;
+            t.hovered_toolbar_icon = new_hovered_icon;
+
+            if (!std.meta.eql(prev_hovered, hovered_idx) or
+                !std.meta.eql(prev_hovered_icon, new_hovered_icon))
+            {
+                try self.queueRender();
+            }
+
+            _ = try self.rt_app.performAction(
+                .{ .surface = self },
+                .mouse_shape,
+                if (in_history) .default else .text,
+            );
+        }
+    }
+
     // Do a mouse report
     if (self.isMouseReporting()) report: {
         // Shift overrides mouse "grabbing" in the window, taken from Kitty.
@@ -4617,16 +5530,71 @@ pub fn cursorPosCallback(
             );
         }
 
-        // Convert to points
+        // Convert to pin, using block layout when available.
+        // When command-blocks is active, clamp the drag to the block
+        // where the selection started so it doesn't cross block boundaries.
         const screen: *terminal.Screen = t.screens.active;
-        const pin = screen.pages.pin(.{
-            .viewport = .{
-                .x = pos_vp.x,
-                .y = pos_vp.y,
-            },
-        }) orelse {
-            if (comptime std.debug.runtime_safety) unreachable;
-            return;
+        const pin = pin: {
+            if (t.block_list != null) {
+                if (self.mouse.left_click_block_idx) |click_bi| {
+                    const drag_bi = self.blockIndexFromPos(pos.y);
+                    if (drag_bi == null or drag_bi.? != click_bi) {
+                        // Drag crossed block boundary — clamp to block edge.
+                        const bl = t.block_list orelse break :pin screen.pages.pin(.{
+                            .viewport = .{ .x = 0, .y = 0 },
+                        }) orelse return;
+                        if (click_bi >= bl.blocks.items.len) return;
+                        const block = &bl.blocks.items[click_bi];
+                        if (block.prompt_start.garbage) return;
+                        const dragging_above = drag_bi == null or drag_bi.? < click_bi;
+                        if (dragging_above) {
+                            // Clamp to first row of the click block.
+                            var p = block.prompt_start.*;
+                            p.x = 0;
+                            break :pin p;
+                        } else if (block.end != null) {
+                            // Completed block — clamp to last visible row.
+                            const layout = t.block_layout orelse return;
+                            const info = for (layout.block_offsets.items) |li| {
+                                if (li.block_list_index == click_bi) break li;
+                            } else return;
+                            // Map last visual row to actual PageList row offset,
+                            // accounting for filter remapping.
+                            const last_visual: u32 = info.visible_rows -| 1;
+                            const actual_row: u32 = if (info.filtered) blk: {
+                                const out_off: u32 = info.output_row_offset;
+                                if (last_visual < out_off) break :blk last_visual;
+                                const match_idx = last_visual - out_off;
+                                if (info.filter_match_rows) |matches| {
+                                    if (match_idx < matches.len)
+                                        break :blk out_off + matches[match_idx];
+                                }
+                                break :blk last_visual;
+                            } else last_visual;
+                            var p = layout.pinAtBlockRow(click_bi, actual_row) orelse return;
+                            p.x = t.cols -| 1;
+                            break :pin p;
+                        }
+                        // Active block — don't clamp downward, just use normal position.
+                    }
+                }
+                if (self.blockPinFromPos(pos.y)) |bp| {
+                    const pt = self.posToViewport(pos.x, pos.y);
+                    var p = bp;
+                    p.x = pt.x;
+                    break :pin p;
+                }
+            }
+            const adjusted_vp = self.posToViewport(pos.x, self.blockAdjustedY(pos.y));
+            break :pin screen.pages.pin(.{
+                .viewport = .{
+                    .x = adjusted_vp.x,
+                    .y = adjusted_vp.y,
+                },
+            }) orelse {
+                if (comptime std.debug.runtime_safety) unreachable;
+                return;
+            };
         };
 
         // Handle dragging depending on click count
@@ -4903,6 +5871,146 @@ pub fn posToViewport(self: Surface, xpos: f64, ypos: f64) terminal.point.Coordin
     const coord: rendererpkg.Coordinate = .{ .surface = .{ .x = xpos, .y = ypos } };
     const grid = coord.convert(.grid, self.size).grid;
     return .{ .x = grid.x, .y = grid.y };
+}
+
+/// Adjust a raw pixel Y position to remove inter-block gap pixels, so that
+/// the resulting Y can be used with posToViewport to get the correct grid row
+/// even in command-block mode. Returns the adjusted Y.
+///
+/// Precondition: the renderer_state mutex must be held.
+fn blockAdjustedY(self: *const Surface, raw_y: f64) f64 {
+    // When block layout is active, use blockPinFromPos to get the actual pin,
+    // then convert to a Y that posToViewport will map correctly.
+    const t: *terminal.Terminal = self.renderer_state.terminal;
+    if (t.block_list == null) return raw_y;
+    const layout = &(t.block_layout orelse return raw_y);
+    if (layout.block_offsets.items.len == 0) return raw_y;
+
+    const cell_h: u32 = self.size.cell.height;
+    if (cell_h == 0) return raw_y;
+
+    const pin = self.blockPinFromPos(raw_y) orelse return raw_y;
+    const screen_active: *terminal.Screen = t.screens.active;
+    const vp_pt = screen_active.pages.pointFromPin(.viewport, pin) orelse return raw_y;
+    const padding_top: u32 = self.size.padding.top;
+    return @as(f64, @floatFromInt(padding_top)) +
+        @as(f64, @floatFromInt(vp_pt.viewport.y)) * @as(f64, @floatFromInt(cell_h)) +
+        @as(f64, @floatFromInt(cell_h)) / 2.0;
+}
+
+/// Map a screen pixel Y position to a PageList Pin using BlockLayout.
+/// This correctly handles filtered blocks (skipped output rows) and
+/// collapsed blocks. Returns null if no block contains the position.
+///
+/// Precondition: the renderer_state mutex must be held.
+fn blockPinFromPos(self: *const Surface, raw_y: f64) ?terminal.Pin {
+    const t: *terminal.Terminal = self.renderer_state.terminal;
+    const layout = &(t.block_layout orelse return null);
+    const brl = layout.block_offsets.items;
+    if (brl.len == 0) return null;
+
+    const cell_h: u32 = self.size.cell.height;
+    if (cell_h == 0) return null;
+
+    const padding_top: u32 = self.size.padding.top;
+    const viewport_h: u32 = @as(u32, t.rows) * cell_h;
+    const doc_h: u32 = layout.total_height_px;
+    const scroll_px: u32 = t.scroll_offset_px;
+
+    const viewport_top_i64: i64 = @max(0, @as(i64, @intCast(doc_h)) -
+        @as(i64, @intCast(viewport_h)) -
+        @as(i64, @intCast(scroll_px)));
+
+    const content_y_f: f64 = raw_y - @as(f64, @floatFromInt(padding_top));
+    if (content_y_f < 0) return null;
+    const virtual_y_i64: i64 = @as(i64, @intFromFloat(content_y_f)) + viewport_top_i64;
+    if (virtual_y_i64 < 0) return null;
+    const virtual_y: u32 = @intCast(@min(virtual_y_i64, @as(i64, @intCast(doc_h))));
+
+    for (brl, 0..) |info, layout_i| {
+        const block_end = info.virtual_y_px + info.visible_height_px;
+
+        // Check if virtual_y is in this block's content.
+        if (virtual_y >= info.virtual_y_px and virtual_y < block_end) {
+            const offset_in_block: u32 = virtual_y - info.virtual_y_px;
+            const row_in_block: u32 = @min(offset_in_block / cell_h, info.visible_rows -| 1);
+
+            // For filtered blocks, map visual row to actual PageList row.
+            const actual_row_offset: u32 = if (info.filtered) blk: {
+                const out_off: u32 = info.output_row_offset;
+                if (row_in_block < out_off) break :blk row_in_block;
+                const match_idx = row_in_block - out_off;
+                if (info.filter_match_rows) |matches| {
+                    if (match_idx < matches.len) break :blk out_off + matches[match_idx];
+                }
+                break :blk row_in_block;
+            } else row_in_block;
+
+            return layout.pinAtBlockRow(info.block_list_index, actual_row_offset);
+        }
+
+        // Check if virtual_y is in a gap between this block and the next.
+        if (layout_i + 1 < brl.len) {
+            const next = brl[layout_i + 1];
+            if (virtual_y >= block_end and virtual_y < next.virtual_y_px) {
+                // In a gap — clamp to last visible row of current block.
+                const last_visual: u32 = info.visible_rows -| 1;
+                const last_actual: u32 = if (info.filtered) blk: {
+                    const out_off: u32 = info.output_row_offset;
+                    if (last_visual < out_off) break :blk last_visual;
+                    const match_idx = last_visual - out_off;
+                    if (info.filter_match_rows) |matches| {
+                        if (match_idx < matches.len) break :blk out_off + matches[match_idx];
+                    }
+                    break :blk last_visual;
+                } else last_visual;
+                return layout.pinAtBlockRow(info.block_list_index, last_actual);
+            }
+        }
+    }
+
+    return null;
+}
+
+/// Returns the block_list_index for the block at the given screen Y position.
+/// Precondition: the renderer_state mutex must be held.
+fn blockIndexFromPos(self: *const Surface, raw_y: f64) ?usize {
+    const t: *terminal.Terminal = self.renderer_state.terminal;
+    const layout = &(t.block_layout orelse return null);
+    const brl = layout.block_offsets.items;
+    if (brl.len == 0) return null;
+
+    const cell_h: u32 = self.size.cell.height;
+    if (cell_h == 0) return null;
+
+    const padding_top: u32 = self.size.padding.top;
+    const viewport_h: u32 = @as(u32, t.rows) * cell_h;
+    const doc_h: u32 = layout.total_height_px;
+    const scroll_px: u32 = t.scroll_offset_px;
+
+    const viewport_top_i64: i64 = @max(0, @as(i64, @intCast(doc_h)) -
+        @as(i64, @intCast(viewport_h)) -
+        @as(i64, @intCast(scroll_px)));
+
+    const content_y_f: f64 = raw_y - @as(f64, @floatFromInt(padding_top));
+    if (content_y_f < 0) return null;
+    const virtual_y_i64: i64 = @as(i64, @intFromFloat(content_y_f)) + viewport_top_i64;
+    if (virtual_y_i64 < 0) return null;
+    const virtual_y: u32 = @intCast(@min(virtual_y_i64, @as(i64, @intCast(doc_h))));
+
+    for (brl, 0..) |info, layout_i| {
+        const block_end = info.virtual_y_px + info.visible_height_px;
+        if (virtual_y >= info.virtual_y_px and virtual_y < block_end)
+            return info.block_list_index;
+        // Gap between blocks — attribute to current block.
+        if (layout_i + 1 < brl.len) {
+            const next = brl[layout_i + 1];
+            if (virtual_y >= block_end and virtual_y < next.virtual_y_px)
+                return info.block_list_index;
+        }
+    }
+
+    return null;
 }
 
 /// Scroll to the bottom of the viewport.
@@ -5189,6 +6297,50 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 return true;
             }
 
+            // No active selection — if a block is highlighted, copy
+            // the block text. When a filter is active, copy only the
+            // matched output lines; otherwise copy the full block.
+            if (self.io.terminal.highlighted_block_idx) |hl_idx| {
+                if (self.io.terminal.block_list) |bl| {
+                    if (hl_idx < bl.blocks.items.len) {
+                        const block = bl.blocks.items[hl_idx];
+
+                        // If block has an active filter, copy matched lines only.
+                        if (block.filter_match_rows) |matches| {
+                            if (matches.len > 0) {
+                                if (block.output_start) |os| {
+                                    self.copyFilteredLinesToClipboard(os.*, matches) catch |err| {
+                                        log.err("copy filtered lines failed: {}", .{err});
+                                    };
+                                    return true;
+                                }
+                            }
+                        }
+
+                        const start_pin: terminal.PageList.Pin = pin: {
+                            var p = block.prompt_start.*;
+                            p.x = 0;
+                            break :pin p;
+                        };
+                        // end points to the first row of the NEXT block;
+                        // we want the last row of THIS block, so go up 1.
+                        const end_pin: terminal.PageList.Pin = pin: {
+                            const e = block.end orelse break :pin start_pin;
+                            var p = e.up(1) orelse e.*;
+                            p.x = self.io.terminal.screens.active.pages.cols - 1;
+                            break :pin p;
+                        };
+                        const sel = terminal.Selection.init(start_pin, end_pin, false);
+                        try self.copySelectionToClipboards(
+                            sel,
+                            &.{.standard},
+                            format,
+                        );
+                        return true;
+                    }
+                }
+            }
+
             return false;
         },
 
@@ -5370,7 +6522,27 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 self.renderer_state.mutex.lock();
                 defer self.renderer_state.mutex.unlock();
                 const t: *terminal.Terminal = self.renderer_state.terminal;
-                t.screens.active.scroll(.{ .row = n });
+
+                // When BlockLayout is active, convert the row offset (from
+                // the top of the document, as the scrollbar sends it) into
+                // scroll_offset_px (pixels from the bottom).
+                if (t.block_layout) |*layout| {
+                    layout.ensureValid();
+                    const doc_h = layout.total_height_px;
+                    const viewport_h = t.height_px;
+                    const cell_h: u32 = if (t.rows > 0 and viewport_h > 0)
+                        viewport_h / @as(u32, t.rows)
+                    else
+                        16;
+                    // The row offset from the top in pixels.
+                    const top_px: u32 = @intCast(@as(u64, n) * @as(u64, cell_h));
+                    // scroll_offset_px = max_scroll - top_px, clamped.
+                    const max_scroll: u32 = if (doc_h > viewport_h) doc_h - viewport_h else 0;
+                    t.scroll_offset_px = max_scroll -| top_px;
+                    t.syncPageListViewport();
+                } else {
+                    t.screens.active.scroll(.{ .row = n });
+                }
             }
 
             try self.queueRender();
@@ -5419,6 +6591,24 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         .jump_to_prompt => |delta| {
             self.queueIo(.{
                 .jump_to_prompt = @intCast(delta),
+            }, .unlocked);
+        },
+
+        .toggle_block_collapse => {
+            self.queueIo(.{
+                .toggle_block_collapse = {},
+            }, .unlocked);
+        },
+
+        .goto_block_previous => {
+            self.queueIo(.{
+                .goto_block = .previous,
+            }, .unlocked);
+        },
+
+        .goto_block_next => {
+            self.queueIo(.{
+                .goto_block = .next,
             }, .unlocked);
         },
 
