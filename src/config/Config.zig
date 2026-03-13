@@ -2840,6 +2840,146 @@ keybind: Keybinds = .{},
 /// `xterm-256color` with environment variables if terminfo installation fails.
 @"shell-integration-features": ShellIntegrationFeatures = .{},
 
+/// Enable command blocks mode. When enabled, terminal output is visually
+/// segmented into discrete blocks, one per command interaction. Each block
+/// contains a prompt, user input, and command output, separated by visual
+/// dividers with padding. Blocks support interactions like click-to-select,
+/// copy command/output, collapse/expand, and scoped search.
+///
+/// This feature requires shell integration to be active for block boundary
+/// detection via OSC 133 sequences. When shell integration is not available
+/// (e.g. SSH sessions), the terminal gracefully degrades to a single
+/// unsegmented view.
+///
+/// Default is `false`.
+@"command-blocks": bool = false,
+
+/// Padding in points above the separator line between command blocks
+/// (below the last output line of the previous block). Only applies
+/// when `command-blocks` is enabled.
+@"command-blocks-padding-footer": u16 = 25,
+
+/// Padding in points below the separator line between command blocks
+/// (above the prompt of the next block). Only applies when
+/// `command-blocks` is enabled.
+@"command-blocks-padding-header": u16 = 25,
+
+/// Left padding in points within command blocks. Text is indented from
+/// the window edge by this amount, while separators remain edge-to-edge.
+/// The status stripe is drawn within this space. Only applies when
+/// `command-blocks` is enabled.
+@"command-blocks-padding-left": u16 = 12,
+
+/// Right padding in points within command blocks. Only applies when
+/// `command-blocks` is enabled.
+@"command-blocks-padding-right": u16 = 8,
+
+/// Width in points of the status stripe on the left edge of each command
+/// block. The stripe color indicates exit status. Set to 0 to disable.
+/// Clamped to `command-blocks-padding-left` if it exceeds it.
+@"command-blocks-stripe-width": u16 = 9,
+
+/// Color of the separator line drawn between command blocks. Set to empty
+/// to hide the separator line entirely (gaps between blocks are preserved).
+/// Only applies when `command-blocks` is enabled.
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"command-blocks-separator-color": ?Color = .{ .r = 0x50, .g = 0x50, .b = 0x50 },
+
+/// Stripe color for commands that exited successfully (exit code 0).
+/// Set to empty to hide the stripe on success. Only applies when
+/// `command-blocks` is enabled. Hidden by default to reduce visual
+/// noise for successful commands.
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"command-blocks-stripe-success": ?Color = null,
+
+/// Stripe color for commands that failed (non-zero exit code).
+/// Only applies when `command-blocks` is enabled.
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"command-blocks-stripe-error": ?Color = .{ .r = 0xff, .g = 0x5f, .b = 0x5f },
+
+/// Stripe color for blocks that are still running (no exit code yet).
+/// Set to empty to hide the stripe while running. Only applies when
+/// `command-blocks` is enabled.
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"command-blocks-stripe-running": ?Color = null,
+
+/// Stripe color for commands killed by a signal (exit code 128-255,
+/// e.g. Ctrl+C = 130). Set to empty to hide. Falls back to
+/// `command-blocks-stripe-error` if not set. Only applies when
+/// `command-blocks` is enabled.
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"command-blocks-stripe-signal": ?Color = .{ .r = 0xd7, .g = 0xaf, .b = 0x5f },
+
+/// Background tint color blended over error blocks (non-zero exit code).
+/// The tint is applied at low opacity so text remains readable. Set to
+/// empty to disable the error tint. Only applies when `command-blocks`
+/// is enabled.
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"command-blocks-tint-error": ?Color = .{ .r = 0x2d, .g = 0x06, .b = 0x06 },
+
+/// Background tint color blended over success blocks (exit code 0).
+/// Set to empty to disable the success tint. Only applies when
+/// `command-blocks` is enabled. Hidden by default to reduce visual
+/// noise for successful commands.
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"command-blocks-tint-success": ?Color = null,
+
+/// Background tint color blended over signal-killed blocks (exit code
+/// 128-255, e.g. Ctrl+C). Set to empty to disable. Only applies when
+/// `command-blocks` is enabled.
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"command-blocks-tint-signal": ?Color = .{ .r = 0x2d, .g = 0x1f, .b = 0x06 },
+
+/// Background tint color used when a block is highlighted (clicked).
+/// Clicking a non-active block highlights it with this tint; clicking
+/// again removes the highlight. Set to empty to disable highlight tint.
+/// Only applies when `command-blocks` is enabled.
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"command-blocks-tint-highlight": ?Color = .{ .r = 0x06, .g = 0x0d, .b = 0x2d },
+
+/// Number of output preview lines to show when a command block is
+/// collapsed. When set to 0, collapsed blocks show only the prompt and
+/// input lines (no output). When set to N > 0, the first N output lines
+/// remain visible. Only applies when `command-blocks` is enabled.
+@"command-blocks-collapse-preview-lines": u16 = 0,
+
+/// Automatically collapse completed blocks when new commands are
+/// started. The value specifies how many recent completed blocks to
+/// keep expanded — blocks further back are automatically collapsed.
+///
+/// For example, a value of 1 means that when a new prompt appears, the
+/// block before the most recently completed block is auto-collapsed.
+/// A value of 0 collapses the most recently completed block immediately
+/// when a new prompt starts.
+///
+/// Leave empty (default) to disable auto-collapse entirely.
+@"command-blocks-auto-collapse-threshold": ?u16 = null,
+
+/// Enable the block toolbar that appears on hover over completed blocks.
+/// The toolbar provides quick actions like copy, collapse, and a dropdown
+/// menu for additional operations.
+@"command-blocks-toolbar": bool = false,
+
+/// Which icons to show in the toolbar. Each icon is a boolean flag;
+/// enabled icons appear in a fixed order: copy, filter, collapse, ellipsis.
+/// The ellipsis icon opens a dropdown menu with additional actions.
+/// By default only the ellipsis is shown.
+@"command-blocks-toolbar-icons": ToolbarIcons = .{ .ellipsis = true },
+
+/// Corner the toolbar attaches to within each block.
+/// Icons grow inward from the anchor corner.
+@"command-blocks-toolbar-position": ToolbarPosition = .@"upper-right",
+
+/// Background color for the toolbar pill. Specified as a typical color
+/// value (hex, named, etc.). Empty string disables the toolbar background.
+@"command-blocks-toolbar-color": ?Color = .{ .r = 0x1a, .g = 0x1a, .b = 0x2e },
+
+/// Border radius (in points) for the toolbar container.
+@"command-blocks-toolbar-radius": u16 = 6,
+
+/// Border radius (in points) for individual icon buttons within the toolbar.
+@"command-blocks-toolbar-icon-radius": u16 = 4,
+
 /// Custom entries into the command palette.
 ///
 /// Each entry requires the title, the corresponding action, and an optional
@@ -4658,6 +4798,33 @@ pub fn finalize(self: *Config) !void {
     // Minimum window size
     if (self.@"window-width" > 0) self.@"window-width" = @max(10, self.@"window-width");
     if (self.@"window-height" > 0) self.@"window-height" = @max(4, self.@"window-height");
+
+    // Command blocks: clamp stripe width to left padding so the stripe
+    // never extends beyond the text indent area.
+    if (self.@"command-blocks") {
+        if (self.@"command-blocks-stripe-width" > self.@"command-blocks-padding-left") {
+            self.@"command-blocks-stripe-width" = self.@"command-blocks-padding-left";
+        }
+    }
+
+    // Command blocks: left padding indents text from the stripe area.
+    // Right padding is zero so separators extend to the right edge.
+    // Top padding includes header padding so the first prompt has
+    // breathing room from the start (no jump when blocks appear).
+    if (self.@"command-blocks") {
+        self.@"window-padding-x" = .{
+            .top_left = self.@"command-blocks-padding-left",
+            .bottom_right = 0,
+        };
+        const current_top = self.@"window-padding-y".top_left;
+        const header = self.@"command-blocks-padding-header";
+        if (current_top < header) {
+            self.@"window-padding-y" = .{
+                .top_left = header,
+                .bottom_right = self.@"window-padding-y".bottom_right,
+            };
+        }
+    }
 
     // If URLs are disabled, cut off the first link. The first link is
     // always the URL matcher.
@@ -9554,6 +9721,58 @@ pub const AlphaBlending = enum {
             .linear, .@"linear-corrected" => true,
         };
     }
+};
+
+/// See command-blocks-toolbar-icons
+pub const ToolbarIcons = packed struct {
+    copy: bool = false,
+    filter: bool = false,
+    collapse: bool = false,
+    ellipsis: bool = false,
+
+    /// Returns the total number of enabled icons.
+    pub fn count(self: ToolbarIcons) u32 {
+        var n: u32 = 0;
+        if (self.copy) n += 1;
+        if (self.filter) n += 1;
+        if (self.collapse) n += 1;
+        if (self.ellipsis) n += 1;
+        return n;
+    }
+
+    /// Icon identifiers in display order (left-to-right for upper-right position).
+    pub const Icon = enum { copy, filter, collapse, ellipsis };
+
+    /// Iterates enabled icons in display order, returning up to 4 icons.
+    pub fn enabledIcons(self: ToolbarIcons) struct { icons: [4]Icon, len: u32 } {
+        var result: [4]Icon = undefined;
+        var n: u32 = 0;
+        if (self.copy) {
+            result[n] = .copy;
+            n += 1;
+        }
+        if (self.filter) {
+            result[n] = .filter;
+            n += 1;
+        }
+        if (self.collapse) {
+            result[n] = .collapse;
+            n += 1;
+        }
+        if (self.ellipsis) {
+            result[n] = .ellipsis;
+            n += 1;
+        }
+        return .{ .icons = result, .len = n };
+    }
+};
+
+/// See command-blocks-toolbar-position
+pub const ToolbarPosition = enum {
+    @"upper-right",
+    @"upper-left",
+    @"lower-right",
+    @"lower-left",
 };
 
 /// See background-image-position
