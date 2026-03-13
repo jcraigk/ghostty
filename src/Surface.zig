@@ -221,6 +221,8 @@ const Mouse = struct {
     /// coordinates so that scrolling preserves the location.
     left_click_pin: ?*terminal.Pin = null,
     left_click_screen: terminal.ScreenSet.Key = .primary,
+    /// Block index where the selection started (for clamping drag to block bounds).
+    left_click_block_idx: ?usize = null,
 
     /// The starting xpos/ypos of the left click. Note that if scrolling occurs,
     /// these will point to different "cells", but the xpos/ypos will stay
@@ -4544,6 +4546,7 @@ pub fn mouseButtonCallback(
         self.mouse.left_click_screen = t.screens.active_key;
         self.mouse.left_click_xpos = pos.x;
         self.mouse.left_click_ypos = pos.y;
+        self.mouse.left_click_block_idx = if (t.block_list != null) self.blockIndexFromPos(pos.y) else null;
 
         // Setup our click counter and timer
         if (std.time.Instant.now()) |now| {
@@ -5679,9 +5682,53 @@ pub fn cursorPosCallback(
         }
 
         // Convert to pin, using block layout when available.
+        // When command-blocks is active, clamp the drag to the block
+        // where the selection started so it doesn't cross block boundaries.
         const screen: *terminal.Screen = t.screens.active;
         const pin = pin: {
             if (t.block_list != null) {
+                if (self.mouse.left_click_block_idx) |click_bi| {
+                    const drag_bi = self.blockIndexFromPos(pos.y);
+                    if (drag_bi == null or drag_bi.? != click_bi) {
+                        // Drag crossed block boundary — clamp to block edge.
+                        const bl = t.block_list orelse break :pin screen.pages.pin(.{
+                            .viewport = .{ .x = 0, .y = 0 },
+                        }) orelse return;
+                        if (click_bi >= bl.blocks.items.len) return;
+                        const block = &bl.blocks.items[click_bi];
+                        if (block.prompt_start.garbage) return;
+                        const dragging_above = drag_bi == null or drag_bi.? < click_bi;
+                        if (dragging_above) {
+                            // Clamp to first row of the click block.
+                            var p = block.prompt_start.*;
+                            p.x = 0;
+                            break :pin p;
+                        } else if (block.end != null) {
+                            // Completed block — clamp to last visible row.
+                            const layout = t.block_layout orelse return;
+                            const info = for (layout.block_offsets.items) |li| {
+                                if (li.block_list_index == click_bi) break li;
+                            } else return;
+                            // Map last visual row to actual PageList row offset,
+                            // accounting for filter remapping.
+                            const last_visual: u32 = info.visible_rows -| 1;
+                            const actual_row: u32 = if (info.filtered) blk: {
+                                const out_off: u32 = info.output_row_offset;
+                                if (last_visual < out_off) break :blk last_visual;
+                                const match_idx = last_visual - out_off;
+                                if (info.filter_match_rows) |matches| {
+                                    if (match_idx < matches.len)
+                                        break :blk out_off + matches[match_idx];
+                                }
+                                break :blk last_visual;
+                            } else last_visual;
+                            var p = layout.pinAtBlockRow(click_bi, actual_row) orelse return;
+                            p.x = t.cols -| 1;
+                            break :pin p;
+                        }
+                        // Active block — don't clamp downward, just use normal position.
+                    }
+                }
                 if (self.blockPinFromPos(pos.y)) |bp| {
                     const pt = self.posToViewport(pos.x, pos.y);
                     var p = bp;
@@ -6070,6 +6117,47 @@ fn blockPinFromPos(self: *const Surface, raw_y: f64) ?terminal.Pin {
                 } else last_visual;
                 return layout.pinAtBlockRow(info.block_list_index, last_actual);
             }
+        }
+    }
+
+    return null;
+}
+
+/// Returns the block_list_index for the block at the given screen Y position.
+/// Precondition: the renderer_state mutex must be held.
+fn blockIndexFromPos(self: *const Surface, raw_y: f64) ?usize {
+    const t: *terminal.Terminal = self.renderer_state.terminal;
+    const layout = &(t.block_layout orelse return null);
+    const brl = layout.block_offsets.items;
+    if (brl.len == 0) return null;
+
+    const cell_h: u32 = self.size.cell.height;
+    if (cell_h == 0) return null;
+
+    const padding_top: u32 = self.size.padding.top;
+    const viewport_h: u32 = @as(u32, t.rows) * cell_h;
+    const doc_h: u32 = layout.total_height_px;
+    const scroll_px: u32 = t.scroll_offset_px;
+
+    const viewport_top_i64: i64 = @max(0, @as(i64, @intCast(doc_h)) -
+        @as(i64, @intCast(viewport_h)) -
+        @as(i64, @intCast(scroll_px)));
+
+    const content_y_f: f64 = raw_y - @as(f64, @floatFromInt(padding_top));
+    if (content_y_f < 0) return null;
+    const virtual_y_i64: i64 = @as(i64, @intFromFloat(content_y_f)) + viewport_top_i64;
+    if (virtual_y_i64 < 0) return null;
+    const virtual_y: u32 = @intCast(@min(virtual_y_i64, @as(i64, @intCast(doc_h))));
+
+    for (brl, 0..) |info, layout_i| {
+        const block_end = info.virtual_y_px + info.visible_height_px;
+        if (virtual_y >= info.virtual_y_px and virtual_y < block_end)
+            return info.block_list_index;
+        // Gap between blocks — attribute to current block.
+        if (layout_i + 1 < brl.len) {
+            const next = brl[layout_i + 1];
+            if (virtual_y >= block_end and virtual_y < next.virtual_y_px)
+                return info.block_list_index;
         }
     }
 
