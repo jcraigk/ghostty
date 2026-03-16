@@ -31,6 +31,23 @@ pub fn drawArraysInstanced(
     try errors.getError();
 }
 
+pub fn drawArraysInstancedBaseInstance(
+    mode: Primitive,
+    first: c.GLint,
+    count: c.GLsizei,
+    primcount: c.GLsizei,
+    baseinstance: c.GLuint,
+) !void {
+    glad.context.DrawArraysInstancedBaseInstance.?(
+        @intCast(@intFromEnum(mode)),
+        first,
+        count,
+        primcount,
+        baseinstance,
+    );
+    try errors.getError();
+}
+
 pub fn drawElements(mode: c.GLenum, count: c.GLsizei, typ: c.GLenum, offset: usize) !void {
     const offsetPtr = if (offset == 0) null else @as(*const anyopaque, @ptrFromInt(offset));
     glad.context.DrawElements.?(mode, count, typ, offsetPtr);
@@ -82,6 +99,11 @@ pub fn pixelStore(mode: c.GLenum, value: anytype) !void {
         .ComptimeInt, .Int => glad.context.PixelStorei.?(mode, value),
         else => unreachable,
     }
+    try errors.getError();
+}
+
+pub fn scissor(x: c.GLint, y: c.GLint, width: c.GLsizei, height: c.GLsizei) !void {
+    glad.context.Scissor.?(x, y, width, height);
     try errors.getError();
 }
 

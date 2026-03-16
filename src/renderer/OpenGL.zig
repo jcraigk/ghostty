@@ -308,6 +308,18 @@ pub fn present(self: *OpenGL, target: Target) !void {
         log.err("Error re-enabling GL_FRAMEBUFFER_SRGB, err={}", .{err});
     };
 
+    // Ensure scissor test is disabled so the blit covers the full framebuffer.
+    // The block rendering path uses scissor rects per block, and if the
+    // disable in RenderPass.complete() silently fails, a leftover scissor
+    // rect would clip the blit to a single block's region.
+    gl.disable(gl.c.GL_SCISSOR_TEST) catch {};
+
+    // Clear the destination (default/GTK) framebuffer before blitting.
+    // This prevents stale content from showing through if the blit
+    // doesn't cover the entire destination for any reason.
+    gl.clearColor(0.0, 0.0, 0.0, 1.0);
+    gl.clear(gl.c.GL_COLOR_BUFFER_BIT);
+
     // Bind the target for reading.
     const fbobind = try target.framebuffer.bind(.read);
     defer fbobind.unbind();

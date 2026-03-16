@@ -43,8 +43,11 @@ pub inline fn renderPass(
     self: *const Self,
     attachments: []const RenderPass.Options.Attachment,
 ) RenderPass {
-    _ = self;
-    return RenderPass.begin(.{ .attachments = attachments });
+    return RenderPass.begin(.{
+        .attachments = attachments,
+        .viewport_width = self.renderer.size.screen.width,
+        .viewport_height = self.renderer.size.screen.height,
+    });
 }
 
 /// Complete this frame and present the target.
@@ -56,8 +59,20 @@ pub fn complete(self: *const Self, sync: bool) void {
     _ = sync;
     gl.finish();
 
-    // If there are any GL errors, consider the frame unhealthy.
-    const health: Health = if (gl.errors.getError()) .healthy else |_| .unhealthy;
+    // Drain all GL errors. A single getError() only returns one error;
+    // if multiple errors accumulated we must loop to clear them all.
+    // Otherwise a stale error from a previous step could leak into the
+    // next frame's health check and cause alternating frame drops.
+    var health: Health = .healthy;
+    var error_count: u32 = 0;
+    while (error_count < 100) : (error_count += 1) {
+        if (gl.errors.getError()) {
+            break;
+        } else |err| {
+            log.warn("GL error during frame: {}", .{err});
+            health = .unhealthy;
+        }
+    }
 
     // If the frame is healthy, present it.
     if (health == .healthy) {
