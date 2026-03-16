@@ -77,6 +77,21 @@ vec4 cell_bg() {
             use_linear_blending
         );
 
+    // Rounded corners: discard fragments outside the rounded rect.
+    if (block_corner_radius > 0.0) {
+        float r = block_corner_radius;
+        vec2 rect_origin = vec2(block_scissor_x, block_scissor_y);
+        vec2 rect_size = vec2(block_scissor_w, block_scissor_h);
+        // SDF for rounded rectangle: position relative to rect center.
+        vec2 center = rect_origin + rect_size * 0.5;
+        vec2 half_size = rect_size * 0.5;
+        vec2 q = abs(gl_FragCoord.xy - center) - half_size + vec2(r);
+        float d = length(max(q, vec2(0.0))) - r;
+        if (d > 0.0) {
+            return vec4(0.0);
+        }
+    }
+
     return cell_color;
 }
 
