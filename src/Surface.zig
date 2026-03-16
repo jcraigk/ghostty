@@ -2290,8 +2290,39 @@ fn copyFilteredLinesToClipboard(
 }
 
 /// Show a dropdown menu for the block toolbar at the given screen position.
-/// On macOS, uses NSMenu via the objc bridge; on other platforms, this is a no-op.
+/// On macOS, uses NSMenu via the objc bridge; on GTK, uses GtkPopoverMenu.
 fn showBlockToolbarMenu(self: *Surface, block_idx: usize, menu_x_px: u32, menu_y_px: u32, margin_px: u32, align_right: bool) void {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .freebsd) {
+        // GTK path: delegate to the apprt surface.
+        const RtSurface = @TypeOf(self.rt_surface.*);
+        if (comptime @hasDecl(RtSurface, "showBlockToolbarMenu")) {
+            // Get block state under the terminal lock.
+            const is_collapsed, const has_output = blk: {
+                self.renderer_state.mutex.lock();
+                defer self.renderer_state.mutex.unlock();
+                const t: *terminal.Terminal = self.renderer_state.terminal;
+                const bl = &(t.block_list orelse break :blk .{ false, false });
+                if (block_idx >= bl.blocks.items.len) break :blk .{ false, false };
+                const block = bl.blocks.items[block_idx];
+                break :blk .{ block.collapsed, block.output_start != null };
+            };
+
+            // Convert pixel coordinates to content-scale-independent points.
+            // GTK PopoverMenu positions itself below the pointing rect automatically,
+            // so we don't add margin_px here (unlike macOS which needs explicit offset).
+            const content_scale = self.rt_surface.getContentScale() catch .{ .x = 1, .y = 1 };
+            const point_x: f64 = @as(f64, @floatFromInt(menu_x_px)) / content_scale.x;
+            const point_y: f64 = @as(f64, @floatFromInt(menu_y_px)) / content_scale.y;
+
+            self.rt_surface.showBlockToolbarMenu(self, block_idx, point_x, point_y, align_right, is_collapsed, has_output);
+
+            // Reset mouse state so that mouse-move after the popover opens
+            // doesn't start a text selection. The menu consumed this click.
+            self.mouse.left_click_count = 0;
+            self.mouse.click_state[@intFromEnum(input.MouseButton.left)] = .release;
+        }
+        return;
+    }
     if (comptime !builtin.os.tag.isDarwin()) return;
 
     // Get the NSView from our surface (only available for embedded apprt on macOS).
@@ -2455,7 +2486,7 @@ fn showBlockToolbarMenu(self: *Surface, block_idx: usize, menu_x_px: u32, menu_y
 }
 
 /// Copy a specific part of a block to the system clipboard.
-fn copyBlockPartToClipboard(self: *Surface, block_idx: usize, part: enum { command, output, block, cwd }) void {
+pub fn copyBlockPartToClipboard(self: *Surface, block_idx: usize, part: enum { command, output, block, cwd }) void {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
     const t: *terminal.Terminal = self.renderer_state.terminal;
@@ -2489,7 +2520,7 @@ fn copyBlockPartToClipboard(self: *Surface, block_idx: usize, part: enum { comma
 }
 
 /// Scroll the viewport to the top or bottom of a specific block.
-fn scrollToBlock(self: *Surface, block_idx: usize, position: enum { top, bottom }) void {
+pub fn scrollToBlock(self: *Surface, block_idx: usize, position: enum { top, bottom }) void {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
     const t: *terminal.Terminal = self.renderer_state.terminal;
@@ -2530,7 +2561,7 @@ fn scrollToBlock(self: *Surface, block_idx: usize, position: enum { top, bottom 
 }
 
 /// Toggle the collapsed state of a specific block by index.
-fn toggleBlockCollapse(self: *Surface, block_idx: usize) void {
+pub fn toggleBlockCollapse(self: *Surface, block_idx: usize) void {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
     const t: *terminal.Terminal = self.renderer_state.terminal;
@@ -2544,7 +2575,7 @@ fn toggleBlockCollapse(self: *Surface, block_idx: usize) void {
     self.queueRender() catch {};
 }
 
-fn startBlockFilter(self: *Surface, block_idx: usize) void {
+pub fn startBlockFilter(self: *Surface, block_idx: usize) void {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
     const t: *terminal.Terminal = self.renderer_state.terminal;

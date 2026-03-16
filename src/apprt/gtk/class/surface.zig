@@ -1716,6 +1716,185 @@ pub const Surface = extern struct {
         _ = priv.gl_area.as(gtk.Widget).grabFocus();
     }
 
+    /// Show a block toolbar dropdown menu at the given position.
+    /// Called from the core Surface via the apprt Surface delegation.
+    pub fn showBlockToolbarMenu(
+        self: *Self,
+        core_surface: *CoreSurface,
+        block_idx: usize,
+        point_x: f64,
+        point_y: f64,
+        align_right: bool,
+        is_collapsed: bool,
+        has_output: bool,
+    ) void {
+        const priv = self.private();
+
+        // Build a GMenu model programmatically.
+        const menu = gio.Menu.new();
+        defer menu.as(gobject.Object).unref();
+
+        // Copy section
+        const copy_section = gio.Menu.new();
+        copy_section.append("Copy Command", "block.copy-command");
+        copy_section.append("Copy Output", "block.copy-output");
+        copy_section.append("Copy Block", "block.copy-block");
+        copy_section.append("Copy Working Directory", "block.copy-cwd");
+        menu.appendSection(null, copy_section.as(gio.MenuModel));
+        copy_section.as(gobject.Object).unref();
+
+        // Actions section
+        const actions_section = gio.Menu.new();
+        actions_section.append("Filter\u{2026}", "block.filter");
+        if (is_collapsed) {
+            actions_section.append("Expand Block", "block.toggle-collapse");
+        } else {
+            actions_section.append("Collapse Block", "block.toggle-collapse");
+        }
+        menu.appendSection(null, actions_section.as(gio.MenuModel));
+        actions_section.as(gobject.Object).unref();
+
+        // Scroll section
+        const scroll_section = gio.Menu.new();
+        scroll_section.append("Scroll to Top", "block.scroll-top");
+        scroll_section.append("Scroll to Bottom", "block.scroll-bottom");
+        menu.appendSection(null, scroll_section.as(gio.MenuModel));
+        scroll_section.as(gobject.Object).unref();
+
+        // Create a PopoverMenu from the model.
+        const popover = gtk.PopoverMenu.newFromModel(menu.as(gio.MenuModel));
+        const popover_widget = popover.as(gtk.Popover);
+        popover_widget.setHasArrow(0);
+        popover.as(gtk.Widget).setParent(priv.gl_area.as(gtk.Widget));
+
+        // Create actions for this block. We use a closure struct to capture
+        // the core_surface and block_idx.
+        const ctx_ptr = std.heap.c_allocator.create(ActionCtx) catch return;
+        ctx_ptr.* = .{ .cs = core_surface, .idx = block_idx };
+
+        // Register a SimpleActionGroup with the block actions.
+        // The actions use the "block" prefix to match the menu model.
+        const group = gio.SimpleActionGroup.new();
+
+        const action_defs = [_]struct { name: [:0]const u8, func: *const fn (*gio.SimpleAction, ?*glib.Variant, *ActionCtx) callconv(.c) void }{
+            .{ .name = "copy-command", .func = &blockActionCopyCommand },
+            .{ .name = "copy-output", .func = &blockActionCopyOutput },
+            .{ .name = "copy-block", .func = &blockActionCopyBlock },
+            .{ .name = "copy-cwd", .func = &blockActionCopyCwd },
+            .{ .name = "filter", .func = &blockActionFilter },
+            .{ .name = "toggle-collapse", .func = &blockActionToggleCollapse },
+            .{ .name = "scroll-top", .func = &blockActionScrollTop },
+            .{ .name = "scroll-bottom", .func = &blockActionScrollBottom },
+        };
+
+        const map = group.as(gio.ActionMap);
+        for (action_defs) |def| {
+            const action = gio.SimpleAction.new(def.name, null);
+            defer action.as(gobject.Object).unref();
+            // Disable filter/collapse when no output
+            if (!has_output and (std.mem.eql(u8, def.name, "filter") or
+                std.mem.eql(u8, def.name, "toggle-collapse")))
+            {
+                action.setEnabled(0);
+            }
+            _ = gio.SimpleAction.signals.activate.connect(
+                action,
+                *ActionCtx,
+                def.func,
+                ctx_ptr,
+                .{},
+            );
+            map.addAction(action.as(gio.Action));
+        }
+
+        // Insert the action group on the popover widget so "block.*" resolves.
+        popover.as(gtk.Widget).insertActionGroup("block", group.as(gio.ActionGroup));
+
+        // Position the popover at the toolbar location.
+        // halign controls which edge of the popover aligns with the pointing rect:
+        // .end = popover's right edge at the rect (for right-aligned toolbar)
+        // .start = popover's left edge at the rect (for left-aligned toolbar)
+        const popover_as_widget = popover.as(gtk.Widget);
+        popover_as_widget.setHalign(if (align_right) .end else .start);
+        const rect: gdk.Rectangle = .{
+            .f_x = @intFromFloat(point_x),
+            .f_y = @intFromFloat(point_y),
+            .f_width = 1,
+            .f_height = 1,
+        };
+        popover_widget.setPointingTo(&rect);
+
+        // Clean up on close: unparent the popover, remove action group, free context.
+        _ = gtk.Popover.signals.closed.connect(popover_widget, *ActionCtx, &blockMenuClosed, ctx_ptr, .{});
+
+        // Store refs we need in the closed handler via the popover's widget data.
+        // We use the action group ref to remove it; the popover unparents itself.
+        popover.as(gtk.Widget).insertActionGroup("_block_group_ref", group.as(gio.ActionGroup));
+
+        popover_widget.popup();
+
+        // Release our ref on the group (popover holds it via insertActionGroup).
+        group.as(gobject.Object).unref();
+    }
+
+    const BlockMenuCleanup = struct {
+        popover: *gtk.Popover,
+        ctx: *ActionCtx,
+
+        fn idle(data: ?*anyopaque) callconv(.c) c_int {
+            const self: *BlockMenuCleanup = @ptrCast(@alignCast(data));
+            const w = self.popover.as(gtk.Widget);
+            w.insertActionGroup("block", null);
+            w.insertActionGroup("_block_group_ref", null);
+            w.unparent();
+            std.heap.c_allocator.destroy(self.ctx);
+            std.heap.c_allocator.destroy(self);
+            return 0; // G_SOURCE_REMOVE
+        }
+    };
+
+    fn blockMenuClosed(
+        popover: *gtk.Popover,
+        ctx: *ActionCtx,
+    ) callconv(.c) void {
+        // Defer cleanup to an idle callback so that action activation
+        // (which fires after the popover closes) can still access the
+        // action group and context pointer.
+        const cleanup = std.heap.c_allocator.create(BlockMenuCleanup) catch return;
+        cleanup.* = .{ .popover = popover, .ctx = ctx };
+        _ = glib.idleAdd(@ptrCast(&BlockMenuCleanup.idle), cleanup);
+    }
+
+    const ActionCtx = struct {
+        cs: *CoreSurface,
+        idx: usize,
+    };
+
+    fn blockActionCopyCommand(_: *gio.SimpleAction, _: ?*glib.Variant, ctx: *ActionCtx) callconv(.c) void {
+        ctx.cs.copyBlockPartToClipboard(ctx.idx, .command);
+    }
+    fn blockActionCopyOutput(_: *gio.SimpleAction, _: ?*glib.Variant, ctx: *ActionCtx) callconv(.c) void {
+        ctx.cs.copyBlockPartToClipboard(ctx.idx, .output);
+    }
+    fn blockActionCopyBlock(_: *gio.SimpleAction, _: ?*glib.Variant, ctx: *ActionCtx) callconv(.c) void {
+        ctx.cs.copyBlockPartToClipboard(ctx.idx, .block);
+    }
+    fn blockActionCopyCwd(_: *gio.SimpleAction, _: ?*glib.Variant, ctx: *ActionCtx) callconv(.c) void {
+        ctx.cs.copyBlockPartToClipboard(ctx.idx, .cwd);
+    }
+    fn blockActionFilter(_: *gio.SimpleAction, _: ?*glib.Variant, ctx: *ActionCtx) callconv(.c) void {
+        ctx.cs.startBlockFilter(ctx.idx);
+    }
+    fn blockActionToggleCollapse(_: *gio.SimpleAction, _: ?*glib.Variant, ctx: *ActionCtx) callconv(.c) void {
+        ctx.cs.toggleBlockCollapse(ctx.idx);
+    }
+    fn blockActionScrollTop(_: *gio.SimpleAction, _: ?*glib.Variant, ctx: *ActionCtx) callconv(.c) void {
+        ctx.cs.scrollToBlock(ctx.idx, .top);
+    }
+    fn blockActionScrollBottom(_: *gio.SimpleAction, _: ?*glib.Variant, ctx: *ActionCtx) callconv(.c) void {
+        ctx.cs.scrollToBlock(ctx.idx, .bottom);
+    }
+
     pub fn sendDesktopNotification(self: *Self, title: [:0]const u8, body: [:0]const u8) void {
         const app = Application.default();
         const priv: *Private = self.private();

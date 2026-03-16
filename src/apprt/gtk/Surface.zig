@@ -102,3 +102,25 @@ pub fn defaultTermioEnv(self: *Self) !std.process.EnvMap {
 pub fn redrawInspector(self: *Self) void {
     self.surface.redrawInspector();
 }
+
+/// Show a block toolbar dropdown menu at the given position.
+pub fn showBlockToolbarMenu(
+    self: *Self,
+    core_surface: *CoreSurface,
+    block_idx: usize,
+    point_x: f64,
+    point_y: f64,
+    align_right: bool,
+    is_collapsed: bool,
+    has_output: bool,
+) void {
+    self.surface.showBlockToolbarMenu(
+        core_surface,
+        block_idx,
+        point_x,
+        point_y,
+        align_right,
+        is_collapsed,
+        has_output,
+    );
+}
