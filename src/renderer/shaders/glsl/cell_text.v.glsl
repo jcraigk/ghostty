@@ -63,7 +63,7 @@ void main() {
     // Convert the grid x, y into world space x, y by accounting for cell size.
     // When block rendering is active, position relative to block origin.
     vec2 cell_pos;
-    cell_pos.x = cell_size.x * float(grid_pos.x);
+    cell_pos.x = cell_size.x * float(grid_pos.x) + block_x_offset;
     cell_pos.y = float(int(grid_pos.y) - int(block_first_row)) * cell_size.y + block_y_offset;
 
     int vid = gl_VertexID;

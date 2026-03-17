@@ -3072,6 +3072,16 @@ pub fn keyCallback(
                 self.renderer_state.mutex.unlock();
                 try self.queueRender();
                 return .consumed;
+            } else if (event.key == .arrow_left) {
+                t.filterCursorLeft();
+                self.renderer_state.mutex.unlock();
+                try self.queueRender();
+                return .consumed;
+            } else if (event.key == .arrow_right) {
+                t.filterCursorRight();
+                self.renderer_state.mutex.unlock();
+                try self.queueRender();
+                return .consumed;
             } else if (event.key == .key_r and event.mods.super) {
                 // Cmd+R toggles regex mode.
                 t.toggleFilterRegexMode();

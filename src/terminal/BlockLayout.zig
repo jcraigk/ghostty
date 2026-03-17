@@ -184,7 +184,10 @@ pub fn rebuild(self: *BlockLayout) void {
             .visible_rows = visible_rows,
             .total_rows = total_rows,
             .output_row_offset = output_row_offset,
-            .exit_code = block.exit_code orelse -1,
+            // Completed blocks (have end pin) without explicit exit code are
+            // treated as success (0). This handles empty-Enter and shells that
+            // send 133;D without an exit code parameter.  -1 = running/active.
+            .exit_code = block.exit_code orelse if (!is_active) @as(i32, 0) else @as(i32, -1),
             .collapsed = block.collapsed,
             .filtered = block.filter_match_rows != null,
             .filter_match_rows = block.filter_match_rows,

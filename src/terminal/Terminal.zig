@@ -114,6 +114,10 @@ filter_input_block_idx: ?usize = null,
 /// Text being typed into the filter input. Owned by gpa.
 filter_input_buf: std.ArrayListUnmanaged(u8) = .empty,
 
+/// Byte offset of the cursor within filter_input_buf.
+/// null means cursor is at the end (append mode).
+filter_input_cursor: ?usize = null,
+
 /// Whether filter uses regex matching instead of literal substring.
 filter_regex_mode: bool = false,
 
@@ -1286,6 +1290,19 @@ pub fn semanticPrompt(
             self.screens.active.cursorSetSemanticContent(.{
                 .prompt = cmd.readOption(.prompt_kind) orelse .initial,
             });
+
+            // If no blocks exist yet and this is an initial prompt, create the
+            // first block. This handles shells/prompt frameworks that emit 133;P
+            // instead of 133;A for the initial prompt (e.g. when Oh My Posh's
+            // precmd runs before Ghostty's and sets PS1 with 133;P marks).
+            const kind = cmd.readOption(.prompt_kind) orelse .initial;
+            if (self.screens.active_key == .primary and kind == .initial) {
+                if (self.block_list == null or
+                    (if (self.block_list) |*bl| bl.blocks.items.len == 0 else false))
+                {
+                    self.blockListAddBlock() catch {};
+                }
+            }
         },
 
         .end_prompt_start_input => {
@@ -1327,10 +1344,6 @@ pub fn semanticPrompt(
         },
 
         .end_command => {
-            // From a terminal state perspective, this doesn't really do
-            // anything. Other terminals appear to do nothing here. I think
-            // its reasonable at this point to reset our semantic content
-            // state but the spec doesn't really say what to do.
             self.screens.active.cursorSetSemanticContent(.output);
 
             if (self.block_list) |*bl| {
@@ -1384,7 +1397,6 @@ fn blockListAddBlock(self: *Terminal) !void {
                 active.prompt_start.y == screen.cursor.page_pin.y;
             if (same_row) {
                 active.prompt_start.* = screen.cursor.page_pin.*;
-                // Reset input_start since the shell will re-send OSC 133 B.
                 if (active.input_start) |pin| {
                     screen.pages.untrackPin(pin);
                     active.input_start = null;
@@ -1563,26 +1575,82 @@ pub fn startFilterInput(self: *Terminal, block_idx: usize) void {
     self.filter_input_block_idx = block_idx;
 }
 
-/// Append UTF-8 text to the filter input buffer and reapply the filter.
+/// Append UTF-8 text to the filter input buffer at the cursor position
+/// and reapply the filter.
 pub fn appendFilterText(self: *Terminal, text: []const u8) void {
     const bi = self.filter_input_block_idx orelse return;
-    self.filter_input_buf.appendSlice(self.gpa(), text) catch return;
+    if (self.filter_input_cursor) |cur| {
+        // Insert at cursor position.
+        self.filter_input_buf.insertSlice(self.gpa(), cur, text) catch return;
+        self.filter_input_cursor = cur + text.len;
+    } else {
+        // Append at end (cursor is at end).
+        self.filter_input_buf.appendSlice(self.gpa(), text) catch return;
+    }
     self.applyFilterToBlock(bi);
 }
 
-/// Remove the last UTF-8 codepoint from the filter input buffer.
+/// Remove the UTF-8 codepoint before the cursor from the filter input buffer.
 pub fn backspaceFilterText(self: *Terminal) void {
     const bi = self.filter_input_block_idx orelse return;
-    if (self.filter_input_buf.items.len == 0) return;
-    // Walk backwards to find the start of the last UTF-8 codepoint.
-    var i = self.filter_input_buf.items.len;
+    const buf = self.filter_input_buf.items;
+    if (buf.len == 0) return;
+
+    const cursor = self.filter_input_cursor orelse buf.len;
+    if (cursor == 0) return;
+
+    // Walk backwards from cursor to find the start of the previous UTF-8 codepoint.
+    var i = cursor;
     while (i > 0) {
         i -= 1;
-        // UTF-8 continuation bytes start with 10xxxxxx.
-        if (self.filter_input_buf.items[i] & 0xC0 != 0x80) break;
+        if (buf[i] & 0xC0 != 0x80) break;
     }
-    self.filter_input_buf.shrinkRetainingCapacity(i);
+    const removed = cursor - i;
+    // Remove bytes [i..cursor] by shifting the tail left.
+    std.mem.copyForwards(u8, buf[i..], buf[cursor..]);
+    self.filter_input_buf.shrinkRetainingCapacity(buf.len - removed);
+
+    // Update cursor position.
+    if (self.filter_input_cursor) |_| {
+        self.filter_input_cursor = i;
+    }
     self.applyFilterToBlock(bi);
+}
+
+/// Move the filter cursor one UTF-8 codepoint to the left.
+pub fn filterCursorLeft(self: *Terminal) void {
+    const buf = self.filter_input_buf.items;
+    if (buf.len == 0) return;
+
+    const cursor = self.filter_input_cursor orelse buf.len;
+    if (cursor == 0) return;
+
+    // Walk backwards to find the start of the previous UTF-8 codepoint.
+    var i = cursor;
+    while (i > 0) {
+        i -= 1;
+        if (buf[i] & 0xC0 != 0x80) break;
+    }
+    self.filter_input_cursor = i;
+}
+
+/// Move the filter cursor one UTF-8 codepoint to the right.
+pub fn filterCursorRight(self: *Terminal) void {
+    const buf = self.filter_input_buf.items;
+    if (buf.len == 0) return;
+
+    const cursor = self.filter_input_cursor orelse return; // already at end
+    if (cursor >= buf.len) {
+        self.filter_input_cursor = null; // at end
+        return;
+    }
+
+    // Advance past the current UTF-8 codepoint.
+    var i = cursor + 1;
+    while (i < buf.len and (buf[i] & 0xC0 == 0x80)) {
+        i += 1;
+    }
+    self.filter_input_cursor = if (i >= buf.len) null else i;
 }
 
 /// Dismiss (close) the filter input and clear the filter on the block.
@@ -1595,6 +1663,7 @@ pub fn dismissFilterInput(self: *Terminal) void {
     }
     self.filter_input_block_idx = null;
     self.filter_input_buf.clearRetainingCapacity();
+    self.filter_input_cursor = null;
     self.filter_regex_mode = false;
     if (self.block_layout) |*layout| layout.invalidate();
 }

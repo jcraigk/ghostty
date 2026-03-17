@@ -138,6 +138,8 @@ pub const RenderState = struct {
     filter_input_text: std.ArrayListUnmanaged(u8) = .empty,
     /// Whether the filter is in regex mode.
     filter_regex_mode: bool = false,
+    /// Cursor byte offset within filter input (null = at end).
+    filter_input_cursor: ?usize = null,
     /// Number of output rows matching the current filter (0 if no filter).
     filter_match_count: u32 = 0,
     /// Total output rows in the filtered block (0 if no filter).
@@ -709,6 +711,10 @@ pub const RenderState = struct {
                     self.dirty = .full;
                 }
             }
+            if (self.filter_input_cursor != t.filter_input_cursor) {
+                self.filter_input_cursor = t.filter_input_cursor;
+                self.dirty = .full;
+            }
 
             // Snapshot filter match counts from the block.
             self.filter_match_count = 0;
@@ -833,6 +839,7 @@ pub const RenderState = struct {
             self.hovered_toolbar_icon = null;
             self.pressed_toolbar_icon = null;
             self.filter_input_block_idx = null;
+            self.filter_input_cursor = null;
             self.filter_input_text.clearRetainingCapacity();
             self.block_render_list.clearRetainingCapacity();
             self.block_render_info_buf.clearRetainingCapacity();

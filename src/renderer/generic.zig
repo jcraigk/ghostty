@@ -2447,11 +2447,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                 // filter_text used below for cursor positioning
 
                                 // Cursor bar using cell_bg (thin vertical rectangle).
-                                // Use actual input text length for cursor, not glyph count
-                                // (glyph count may include placeholder "Filter" text).
+                                // Use filter_input_cursor byte offset to position cursor,
+                                // counting printable columns up to that offset. null = at end.
                                 // Only show when blink state is visible.
-                                const filter_input_len: u32 = @intCast(@min(filter_text.len, std.math.maxInt(u32)));
-                                const cursor_px_x = filter_text_x_start + (@as(u32, self.filter_text_col_offset) + filter_input_len) * f_cell_w;
+                                const cursor_byte_pos = ts.filter_input_cursor orelse filter_text.len;
+                                var filter_cursor_cols: u32 = 0;
+                                for (filter_text[0..@min(cursor_byte_pos, filter_text.len)]) |ch| {
+                                    if (ch >= 0x20 and ch <= 0x7e) filter_cursor_cols += 1;
+                                }
+                                const cursor_px_x = filter_text_x_start + (@as(u32, self.filter_text_col_offset) + filter_cursor_cols) * f_cell_w;
                                 const cursor_bar_w: u32 = @max(2, f_cell_w / 5);
                                 const close_region_w: u32 = f_bar_h;
                                 const max_text_x: u32 = (f_bar_x + f_bar_w) -| close_region_w;
