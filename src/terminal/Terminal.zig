@@ -1483,6 +1483,17 @@ pub fn toggleBlockHighlight(self: *Terminal, block_idx: usize) void {
     self.highlighted_block_idx = block_idx;
 }
 
+/// Set the highlight on a block without toggling. Used on single-click
+/// so that the first click of a double-click doesn't un-highlight.
+pub fn setBlockHighlight(self: *Terminal, block_idx: usize) void {
+    const bl = self.block_list orelse return;
+    // Don't allow highlighting the active (last) block.
+    if (block_idx >= bl.blocks.items.len) return;
+    if (block_idx == bl.blocks.items.len - 1) return;
+
+    self.highlighted_block_idx = block_idx;
+}
+
 /// Navigate to the previous or next completed command block.
 /// Sets highlighted_block_idx and scrolls viewport to make the block visible.
 /// `is_previous`: true = go to earlier block, false = go to later block.

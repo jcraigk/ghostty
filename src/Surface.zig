@@ -4496,23 +4496,43 @@ pub fn mouseButtonCallback(
                     const virtual_y: u32 = @intCast(@min(virtual_y_i64, @as(i64, @intCast(doc_h))));
 
                     // Find which block contains this virtual Y.
-                    // Also check gaps: if virtual_y is in a gap, attribute
-                    // it to the next block (for toolbar clicks in padding area).
+                    // Clicks in block padding (header/footer) count as block
+                    // clicks — only the separator line itself is a "gap" click.
+                    var click_in_gap = false;
                     const found_info: ?@TypeOf(brl[0]) = fi: {
                         for (brl) |info| {
                             const block_end = info.virtual_y_px + info.visible_height_px;
-                            if (virtual_y >= info.virtual_y_px and virtual_y < block_end)
+                            if (virtual_y >= info.virtual_y_px and virtual_y < block_end) {
                                 break :fi info;
+                            }
                         }
-                        // Gap fallback: find the first block below virtual_y.
-                        for (brl) |info| {
-                            if (virtual_y < info.virtual_y_px)
-                                break :fi info;
+                        // Click is in a gap between blocks. Attribute to the
+                        // nearest block (footer padding → block above, header
+                        // padding → block below). This makes clicking in block
+                        // padding behave the same as clicking inside the block.
+                        for (brl, 0..) |info, idx| {
+                            const block_end = info.virtual_y_px + info.visible_height_px;
+                            if (virtual_y >= block_end and virtual_y < info.virtual_y_px + info.total_extent_px) {
+                                // In the gap after this block. Check which half:
+                                // footer padding belongs to this block, header
+                                // padding belongs to the next block.
+                                const gap_mid = block_end + (info.total_extent_px - info.visible_height_px) / 2;
+                                if (virtual_y < gap_mid) {
+                                    // Footer padding — attribute to this block.
+                                    break :fi info;
+                                } else if (idx + 1 < brl.len) {
+                                    // Header padding — attribute to next block.
+                                    break :fi brl[idx + 1];
+                                } else {
+                                    break :fi info;
+                                }
+                            }
                         }
+                        // Click below all blocks.
+                        click_in_gap = true;
                         break :fi null;
                     };
                     if (found_info) |info| handle_block: {
-                        // Check if click is on the filter bar close button.
                         if (t.filter_input_block_idx) |fbi| filter_check: {
                             if (info.block_list_index != fbi) break :filter_check;
                             const block_screen_y_fc: i64 = @as(i64, @intCast(padding_top)) +
@@ -4698,26 +4718,51 @@ pub fn mouseButtonCallback(
                             }
                         }
 
-                        // Click was not on toolbar or filter bar — toggle block highlight.
-                        t.toggleBlockHighlight(info.block_list_index);
+                        if (click_in_gap) {
+                            // Click was in a gap between blocks — un-highlight.
+                            if (t.highlighted_block_idx != null) {
+                                t.highlighted_block_idx = null;
+                                try self.queueRender();
+                            }
+                        } else {
+                            // Click was on a block — highlight it.
+                            // Use setBlockHighlight (not toggle) so the first click
+                            // of a double-click doesn't un-highlight, which would
+                            // break collapse.
+                            t.setBlockHighlight(info.block_list_index);
+                            try self.queueRender();
+                        }
+                    }
+                } else {
+                    // Click outside all blocks — un-highlight.
+                    if (t.highlighted_block_idx != null) {
+                        t.highlighted_block_idx = null;
                         try self.queueRender();
                     }
                 }
             },
 
             // Double click: in command-blocks mode, toggle collapse/expand
-            // on the highlighted block. Otherwise, select the word under
+            // on the clicked block. Otherwise, select the word under
             // our mouse (or URL).
             2 => {
                 // Command blocks: double-click on an empty cell toggles
-                // collapse on the highlighted block. Double-click on a
-                // cell with text falls through to normal word selection.
-                if (t.highlighted_block_idx != null and t.block_list != null) {
-                    const rac = pin.rowAndCell();
-                    if (!rac.cell.hasText()) {
-                        t.toggleHighlightedBlockCollapse();
-                        try self.queueRender();
-                        break :click;
+                // collapse on the clicked block. Double-click on a cell
+                // with text falls through to normal word selection.
+                if (self.mouse.left_click_block_idx) |click_bi| {
+                    if (t.block_list) |*bl| {
+                        // Don't collapse the active (last) block.
+                        if (click_bi < bl.blocks.items.len and
+                            click_bi != bl.blocks.items.len - 1)
+                        {
+                            const rac = pin.rowAndCell();
+                            if (!rac.cell.hasText()) {
+                                t.highlighted_block_idx = click_bi;
+                                t.toggleHighlightedBlockCollapse();
+                                try self.queueRender();
+                                break :click;
+                            }
+                        }
                     }
                 }
 
