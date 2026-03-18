@@ -13928,3 +13928,198 @@ test "Terminal: block cached_row_count set on close" {
     const active = t.block_list.?.activeBlock().?;
     try testing.expect(active.cached_row_count == null);
 }
+
+test "Terminal: setBlockHighlight always highlights" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    try testSimulateCommand(&t, "$ ", "cmd1", "out1", 0);
+    try testSimulateCommand(&t, "$ ", "cmd2", "out2", 0);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    // Initially no highlight.
+    try testing.expect(t.highlighted_block_idx == null);
+
+    // Set highlight on block 0.
+    t.setBlockHighlight(0);
+    try testing.expectEqual(@as(?usize, 0), t.highlighted_block_idx);
+
+    // Set again on same block — stays highlighted (no toggle).
+    t.setBlockHighlight(0);
+    try testing.expectEqual(@as(?usize, 0), t.highlighted_block_idx);
+
+    // Set on different block — switches.
+    t.setBlockHighlight(1);
+    try testing.expectEqual(@as(?usize, 1), t.highlighted_block_idx);
+
+    // Cannot highlight active (last) block.
+    t.setBlockHighlight(2);
+    try testing.expectEqual(@as(?usize, 1), t.highlighted_block_idx);
+
+    // Out of bounds — no change.
+    t.setBlockHighlight(999);
+    try testing.expectEqual(@as(?usize, 1), t.highlighted_block_idx);
+}
+
+test "Terminal: toggleBlockHighlight toggles off same block" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    try testSimulateCommand(&t, "$ ", "cmd1", "out1", 0);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    // Toggle on.
+    t.toggleBlockHighlight(0);
+    try testing.expectEqual(@as(?usize, 0), t.highlighted_block_idx);
+
+    // Toggle off same block.
+    t.toggleBlockHighlight(0);
+    try testing.expect(t.highlighted_block_idx == null);
+
+    // Cannot toggle on active block.
+    t.toggleBlockHighlight(1);
+    try testing.expect(t.highlighted_block_idx == null);
+}
+
+test "Terminal: empty command block" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    // Simulate pressing Enter on an empty prompt (no command text).
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    for ("$ ") |c| try t.print(c);
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    // User presses Enter immediately (no command typed).
+    try t.semanticPrompt(.init(.end_input_start_output));
+    t.carriageReturn();
+    try t.linefeed();
+    try t.semanticPrompt(.{ .action = .end_command, .options_unvalidated = "0" });
+
+    // Start a new prompt to close the first block.
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    const bl = t.block_list.?;
+    try testing.expectEqual(@as(usize, 2), bl.blockCount());
+
+    const block = &bl.blocks.items[0];
+    try testing.expect(block.input_start != null);
+    try testing.expect(block.output_start != null);
+    try testing.expectEqual(@as(?i32, 0), block.exit_code);
+
+    // Command text should be empty.
+    var cmd_buf: [256]u8 = undefined;
+    const cmd = block.commandText(&t.screens.active.pages, &cmd_buf);
+    try testing.expectEqual(@as(usize, 0), cmd.len);
+}
+
+test "Terminal: prompt redraw does not create duplicate block" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    // First prompt.
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    for ("$ ") |c| try t.print(c);
+
+    try testing.expectEqual(@as(usize, 1), t.block_list.?.blockCount());
+
+    // Cursor is still on the same row — redrawing the prompt should NOT
+    // create a new block (this happens on resize or font change).
+    t.screens.active.cursor.x = 0; // Reset to start of row.
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    // Still only 1 block (reused, not duplicated).
+    try testing.expectEqual(@as(usize, 1), t.block_list.?.blockCount());
+}
+
+test "Terminal: no blocks without shell integration" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    // Just print text without any OSC 133 sequences.
+    for ("hello world") |c| try t.print(c);
+    t.carriageReturn();
+    try t.linefeed();
+    for ("another line") |c| try t.print(c);
+
+    // No block list created.
+    try testing.expect(t.block_list == null);
+    try testing.expect(t.highlighted_block_idx == null);
+
+    // Block operations are no-ops.
+    t.gotoBlock(true);
+    try testing.expect(t.highlighted_block_idx == null);
+    t.toggleHighlightedBlockCollapse();
+    t.setBlockHighlight(0);
+    try testing.expect(t.highlighted_block_idx == null);
+}
+
+test "Terminal: block collapse requires output" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    // Block that only has prompt + input (no OSC 133 C, no output).
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    for ("$ ") |c| try t.print(c);
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    for ("hello") |c| try t.print(c);
+    // Close this block by starting another.
+    t.carriageReturn();
+    try t.linefeed();
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    t.highlighted_block_idx = 0;
+    t.toggleHighlightedBlockCollapse();
+    // Cannot collapse — no output_start.
+    try testing.expect(!t.block_list.?.blocks.items[0].collapsed);
+}
+
+test "Terminal: filter on block with no output is no-op" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    for ("$ ") |c| try t.print(c);
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    // Close block.
+    t.carriageReturn();
+    try t.linefeed();
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    t.startFilterInput(0);
+    t.appendFilterText("test");
+
+    // Block has no output_start, so filter_match_rows should be null.
+    const block = &t.block_list.?.blocks.items[0];
+    try testing.expect(block.filter_match_rows == null);
+}
+
+test "Terminal: auto-collapse threshold 1 keeps one expanded" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    t.auto_collapse_threshold = 1; // Keep 1 recent block expanded.
+
+    try testSimulateCommand(&t, "$ ", "echo 1", "one", 0);
+    try testSimulateCommand(&t, "$ ", "echo 2", "two", 0);
+    try testSimulateCommand(&t, "$ ", "echo 3", "three", 0);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    const items = t.block_list.?.blocks.items;
+    // With threshold=1: collapse at offset=3 from end.
+    // After 4 blocks exist (3 completed + 1 active):
+    //   block 0 should be collapsed (offset 3 from end = items[1] when len=4)
+    // Actually: threshold=1 means collapse block at len-3 position.
+    // len=4: collapse items[1]. len=3: collapse items[0].
+    try testing.expect(items[0].collapsed);
+    try testing.expect(items[1].collapsed);
+    // Block 2 (most recently completed) should still be expanded.
+    try testing.expect(!items[2].collapsed);
+}
