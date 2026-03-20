@@ -316,17 +316,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// Blend a cell bg color with a subtle red tint for error blocks.
         fn blendErrorTint(self: *const Self, bg: [4]u8) [4]u8 {
-            return blendTint(bg, self.config.command_blocks_tint_error, 80);
+            return blendTint(bg, self.config.command_blocks_tint_error, 30);
         }
 
         /// Blend a cell bg color with a subtle green tint for success blocks.
         fn blendSuccessTint(self: *const Self, bg: [4]u8) [4]u8 {
-            return blendTint(bg, self.config.command_blocks_tint_success, 50);
+            return blendTint(bg, self.config.command_blocks_tint_success, 20);
         }
 
         /// Blend a cell bg color with a subtle tint for signal-killed blocks (128-255).
         fn blendSignalTint(self: *const Self, bg: [4]u8) [4]u8 {
-            return blendTint(bg, self.config.command_blocks_tint_signal, 60);
+            return blendTint(bg, self.config.command_blocks_tint_signal, 25);
         }
 
         /// Blend a cell bg color with a blue tint for highlighted blocks.
@@ -2725,9 +2725,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         const cell_h = self.grid_metrics.cell_height;
                         const cell_w = self.grid_metrics.cell_width;
                         const toolbar_h: u32 = @min(cell_h, region.height_px);
-                        const icon_slot_w: u32 = toolbar_h; // square slots
-                        const icon_padding: u32 = @max(2, toolbar_h / 6);
-                        const toolbar_w: u32 = icon_count * icon_slot_w + icon_padding * 2;
+                        const icon_gap: u32 = @max(2, toolbar_h / 6);
+                        const icon_size: u32 = toolbar_h -| icon_gap * 2; // square icon area
+                        const toolbar_w: u32 = icon_gap + icon_count * (icon_size + icon_gap);
 
                         // Position based on config.
                         const grid_cols: u32 = self.cells.size.columns;
@@ -2789,23 +2789,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             const icon_scratch: f32 = toolbar_scratch + 1.0;
                             const hover_scratch: f32 = icon_scratch + 1.0;
                             const pressed_scratch: f32 = hover_scratch + 1.0;
-                            const icon_margin: u32 = @max(1, toolbar_h / 8);
-                            // Icon drawing area: ~55% of the slot for clean look inside container.
-                            const icon_area: u32 = @max(6, (toolbar_h -| icon_margin * 2) * 55 / 100);
+                            // Icon drawing area: ~55% of icon_size for clean look.
+                            const icon_area: u32 = @max(6, icon_size * 55 / 100);
                             const hovered_icon_idx: ?u32 = ts.hovered_toolbar_icon;
                             const pressed_icon_idx: ?u32 = ts.pressed_toolbar_icon;
                             var icon_i: u32 = 0;
                             while (icon_i < icon_count) : (icon_i += 1) {
-                                const slot_x = toolbar_x + icon_padding + icon_i * icon_slot_w;
+                                // Each icon positioned at: gap + i * (icon_size + gap)
+                                const icon_x = toolbar_x + icon_gap + icon_i * (icon_size + icon_gap);
+                                const icon_y = toolbar_y + icon_gap;
 
                                 // Draw hover or pressed highlight background for this icon.
                                 const is_pressed = pressed_icon_idx != null and pressed_icon_idx.? == icon_i;
                                 const is_hovered = hovered_icon_idx != null and hovered_icon_idx.? == icon_i;
                                 if (is_pressed or is_hovered) {
-                                    const hx = slot_x + icon_margin;
-                                    const hy = toolbar_y + icon_margin;
-                                    const hw = icon_slot_w -| icon_margin * 2;
-                                    const hh = toolbar_h -| icon_margin * 2;
+                                    const hx = icon_x;
+                                    const hy = icon_y;
+                                    const hw = icon_size;
+                                    const hh = icon_size;
                                     const hx_f: f32 = @floatFromInt(hx);
                                     const hy_f: f32 = @floatFromInt(hy);
                                     const hw_f: f32 = @floatFromInt(hw);
@@ -2839,8 +2840,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                     });
                                 }
 
-                                const icon_cx = slot_x + icon_slot_w / 2;
-                                const icon_cy = toolbar_y + toolbar_h / 2;
+                                const icon_cx = icon_x + icon_size / 2;
+                                const icon_cy = icon_y + icon_size / 2;
                                 const icon_r: f32 = if (self.config.command_blocks_toolbar_icon_radius > 0)
                                     @floatFromInt(self.config.command_blocks_toolbar_icon_radius)
                                 else

@@ -4635,9 +4635,9 @@ pub fn mouseButtonCallback(
                                 0;
 
                             const toolbar_h = cell_h;
-                            const icon_slot_w = toolbar_h; // square slots, same as renderer
-                            const icon_padding: u32 = @max(2, toolbar_h / 6);
-                            const toolbar_w = icon_count * icon_slot_w + icon_padding * 2;
+                            const icon_gap: u32 = @max(2, toolbar_h / 6);
+                            const icon_size: u32 = toolbar_h -| icon_gap * 2;
+                            const toolbar_w = icon_gap + icon_count * (icon_size + icon_gap);
                             const grid_cols = t.cols;
                             const grid_right = self.size.padding.left + grid_cols * cell_w;
                             const is_right = self.config.command_blocks_toolbar_position == .@"upper-right" or
@@ -4670,8 +4670,9 @@ pub fn mouseButtonCallback(
                                 click_y >= toolbar_y and click_y < toolbar_y + toolbar_h)
                             {
                                 // Determine which icon was clicked.
-                                const rel_x = click_x - toolbar_x - icon_padding;
-                                const icon_idx = @min(rel_x / icon_slot_w, icon_count - 1);
+                                const rel_x = click_x -| toolbar_x -| icon_gap;
+                                const icon_stride = icon_size + icon_gap;
+                                const icon_idx = @min(rel_x / icon_stride, icon_count - 1);
                                 const enabled = icons_cfg.enabledIcons();
                                 if (icon_idx < enabled.len) {
                                     // Set pressed state for visual feedback.
@@ -4694,7 +4695,7 @@ pub fn mouseButtonCallback(
                                                 .block_idx = info.block_list_index,
                                                 .menu_x_px = if (is_right) toolbar_x + toolbar_w else toolbar_x,
                                                 .menu_y_px = toolbar_y + toolbar_h,
-                                                .margin_px = icon_padding,
+                                                .margin_px = 0,
                                                 .align_right = is_right,
                                             };
                                         },
@@ -5476,10 +5477,9 @@ pub fn cursorPosCallback(
 
                 const cell_w: u32 = self.size.cell.width;
                 const toolbar_h = cell_h;
-                const icon_slot_w = toolbar_h; // square slots, same as renderer
-                const icon_padding_val: u32 = @max(2, toolbar_h / 6);
-                const icon_margin: u32 = @max(1, toolbar_h / 8);
-                const toolbar_w = icon_count * icon_slot_w + icon_padding_val * 2;
+                const icon_gap: u32 = @max(2, toolbar_h / 6);
+                const icon_size: u32 = toolbar_h -| icon_gap * 2;
+                const toolbar_w = icon_gap + icon_count * (icon_size + icon_gap);
                 const grid_cols = t.cols;
                 const grid_right = self.size.padding.left + grid_cols * cell_w;
                 const is_right = self.config.command_blocks_toolbar_position == .@"upper-right" or
@@ -5521,13 +5521,14 @@ pub fn cursorPosCallback(
                         if (mx >= toolbar_x and mx < toolbar_x + toolbar_w and
                             my >= toolbar_y and my < toolbar_y + toolbar_h)
                         {
-                            const rel_x = mx -| toolbar_x -| icon_padding_val;
-                            const icon_idx = @min(rel_x / icon_slot_w, icon_count - 1);
-                            // Check if within the icon's active area (excluding margins).
-                            const icon_start_x = toolbar_x + icon_padding_val + icon_idx * icon_slot_w + icon_margin;
-                            const icon_end_x = toolbar_x + icon_padding_val + (icon_idx + 1) * icon_slot_w -| icon_margin;
-                            const icon_start_y = toolbar_y + icon_margin;
-                            const icon_end_y = toolbar_y + toolbar_h -| icon_margin;
+                            const icon_stride = icon_size + icon_gap;
+                            const rel_x = mx -| toolbar_x -| icon_gap;
+                            const icon_idx = @min(rel_x / icon_stride, icon_count - 1);
+                            // Check if within the icon's active area.
+                            const icon_start_x = toolbar_x + icon_gap + icon_idx * icon_stride;
+                            const icon_end_x = icon_start_x + icon_size;
+                            const icon_start_y = toolbar_y + icon_gap;
+                            const icon_end_y = icon_start_y + icon_size;
                             if (mx >= icon_start_x and mx < icon_end_x and
                                 my >= icon_start_y and my < icon_end_y)
                             {
