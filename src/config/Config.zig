@@ -2960,11 +2960,11 @@ keybind: Keybinds = .{},
 /// menu for additional operations.
 @"command-blocks-toolbar": bool = false,
 
-/// Which icons to show in the toolbar. Each icon is a boolean flag;
-/// enabled icons appear in a fixed order: copy, filter, collapse, ellipsis.
-/// The ellipsis icon opens a dropdown menu with additional actions.
-/// By default only the ellipsis is shown.
-@"command-blocks-toolbar-icons": ToolbarIcons = .{ .ellipsis = true },
+/// Which optional icons to show in the toolbar alongside the ellipsis.
+/// The ellipsis is always present at the anchor corner end (rightmost
+/// when anchored right, leftmost when anchored left). Optional icons
+/// appear in order: copy, filter, collapse. By default none are shown.
+@"command-blocks-toolbar-icons": ToolbarIcons = .{},
 
 /// Corner the toolbar attaches to within each block.
 /// Icons grow inward from the anchor corner.
@@ -9728,25 +9728,29 @@ pub const ToolbarIcons = packed struct {
     copy: bool = false,
     filter: bool = false,
     collapse: bool = false,
-    ellipsis: bool = false,
 
-    /// Returns the total number of enabled icons.
+    /// Returns the total number of icons (optional + ellipsis).
     pub fn count(self: ToolbarIcons) u32 {
-        var n: u32 = 0;
+        var n: u32 = 1; // ellipsis always present
         if (self.copy) n += 1;
         if (self.filter) n += 1;
         if (self.collapse) n += 1;
-        if (self.ellipsis) n += 1;
         return n;
     }
 
-    /// Icon identifiers in display order (left-to-right for upper-right position).
+    /// Icon identifiers in display order.
     pub const Icon = enum { copy, filter, collapse, ellipsis };
 
-    /// Iterates enabled icons in display order, returning up to 4 icons.
-    pub fn enabledIcons(self: ToolbarIcons) struct { icons: [4]Icon, len: u32 } {
+    /// Returns icons in left-to-right display order. The ellipsis is
+    /// placed at the anchor corner end: rightmost when `anchor_right`
+    /// is true, leftmost when false.
+    pub fn enabledIcons(self: ToolbarIcons, anchor_right: bool) struct { icons: [4]Icon, len: u32 } {
         var result: [4]Icon = undefined;
         var n: u32 = 0;
+        if (!anchor_right) {
+            result[n] = .ellipsis;
+            n += 1;
+        }
         if (self.copy) {
             result[n] = .copy;
             n += 1;
@@ -9759,7 +9763,7 @@ pub const ToolbarIcons = packed struct {
             result[n] = .collapse;
             n += 1;
         }
-        if (self.ellipsis) {
+        if (anchor_right) {
             result[n] = .ellipsis;
             n += 1;
         }

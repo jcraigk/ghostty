@@ -2716,8 +2716,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         } else null;
                         const region = hovered_region orelse break :toolbar;
 
+                        const is_right = self.config.command_blocks_toolbar_position == .@"upper-right" or
+                            self.config.command_blocks_toolbar_position == .@"lower-right";
                         const icons_cfg = self.config.command_blocks_toolbar_icons;
-                        const enabled = icons_cfg.enabledIcons();
+                        const enabled = icons_cfg.enabledIcons(is_right);
                         const icon_count = enabled.len;
                         if (icon_count == 0) break :toolbar;
 
@@ -2732,8 +2734,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         // Position based on config.
                         const grid_cols: u32 = self.cells.size.columns;
                         const grid_right: u32 = self.size.padding.left + grid_cols * cell_w;
-                        const is_right = self.config.command_blocks_toolbar_position == .@"upper-right" or
-                            self.config.command_blocks_toolbar_position == .@"lower-right";
                         const is_upper = self.config.command_blocks_toolbar_position == .@"upper-right" or
                             self.config.command_blocks_toolbar_position == .@"upper-left";
                         const blk_pad_right: u32 = self.config.command_blocks_padding_right;

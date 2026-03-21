@@ -4673,7 +4673,7 @@ pub fn mouseButtonCallback(
                                 const rel_x = click_x -| toolbar_x -| icon_gap;
                                 const icon_stride = icon_size + icon_gap;
                                 const icon_idx = @min(rel_x / icon_stride, icon_count - 1);
-                                const enabled = icons_cfg.enabledIcons();
+                                const enabled = icons_cfg.enabledIcons(is_right);
                                 if (icon_idx < enabled.len) {
                                     // Set pressed state for visual feedback.
                                     t.pressed_toolbar_icon = @intCast(icon_idx);
