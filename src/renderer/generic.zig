@@ -249,7 +249,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Cursor blink state for the filter bar cursor.
         filter_cursor_blink_visible: bool = true,
 
-
         const BlockRegion = struct {
             first_row: u16,
             row_count: u16,
@@ -1970,8 +1969,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             }
                             break :blk 0;
                         } else
-                        // First visible block with no block above: extend tint/stripe
-                        // to screen top so the window padding area is filled.
+                            // First visible block with no block above: extend tint/stripe
+                            // to screen top so the window padding area is filled.
                             0;
 
                         const vis_bottom: u32 = if (ri + 1 < self.block_regions.items.len) blk: {
@@ -4103,7 +4102,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .output_row_offset = info.output_row_offset,
                         }) catch {};
                     }
-
                 }
             }
 
